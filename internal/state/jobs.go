@@ -109,6 +109,23 @@ func (db *DB) RetryJob(ctx context.Context, j *Job, errMsg string, backoff time.
 	return err == nil, err
 }
 
+// RequeueJob resets a finished (failed/cancelled) job back to queued so the
+// worker runs it again with a fresh attempt budget. Returns true if a job was
+// requeued (i.e. it existed and was in a terminal-but-retryable state).
+func (db *DB) RequeueJob(ctx context.Context, id string) (bool, error) {
+	now := nowMillis()
+	res, err := db.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, attempts = 0, error = '', locked_by = '', locked_at = NULL,
+			run_after = ?, finished_at = NULL, updated_at = ?
+		 WHERE id = ? AND status IN (?, ?)`,
+		JobQueued, now, now, id, JobFailed, JobCancelled)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // RecoverStuckJobs requeues jobs stuck in 'running' longer than maxAge (e.g.
 // after a crash). Returns the number recovered.
 func (db *DB) RecoverStuckJobs(ctx context.Context, maxAge time.Duration) (int64, error) {
@@ -130,6 +147,42 @@ func (db *DB) ListJobs(ctx context.Context, limit int) ([]*Job, error) {
 	}
 	rows, err := db.QueryContext(ctx,
 		`SELECT `+jobColumns+` FROM jobs ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// GetLatestReviewJob returns the most recent review job for an MR (ErrNotFound
+// if none), correct regardless of how many other jobs exist.
+func (db *DB) GetLatestReviewJob(ctx context.Context, projectID, iid int64) (*Job, error) {
+	j, err := scanJob(db.QueryRowContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE type = ? AND project_id = ? AND mr_iid = ?
+		 ORDER BY created_at DESC, id DESC LIMIT 1`, JobReview, projectID, iid))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return j, err
+}
+
+// LatestReviewJobsPerMR returns the newest review job for each MR (one row per
+// project_id + mr_iid), so dashboard status is correct no matter the job volume.
+func (db *DB) LatestReviewJobsPerMR(ctx context.Context) ([]*Job, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+jobColumns+` FROM (
+		   SELECT *, ROW_NUMBER() OVER (PARTITION BY project_id, mr_iid ORDER BY created_at DESC, id DESC) AS rn
+		   FROM jobs WHERE type = ? AND project_id IS NOT NULL AND mr_iid IS NOT NULL
+		 ) WHERE rn = 1`, JobReview)
 	if err != nil {
 		return nil, err
 	}

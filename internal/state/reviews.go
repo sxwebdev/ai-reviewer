@@ -127,7 +127,7 @@ func (db *DB) InsertFinding(ctx context.Context, f *Finding) error {
 const findingColumns = `id, review_id, mr_id, head_sha, severity, category, file_path, old_path, new_path,
 	old_line, new_line, line_kind, line_range_start, line_range_end, title, body, suggestion,
 	confidence, evidence_json, fingerprint, status, rejection_reason, gitlab_position_json,
-	gitlab_draft_note_id, gitlab_discussion_id, validation_error, created_at, updated_at`
+	gitlab_draft_note_id, gitlab_discussion_id, validation_error, created_at, updated_at, edited_at`
 
 func scanFinding(s interface{ Scan(...any) error }) (*Finding, error) {
 	f := &Finding{}
@@ -135,7 +135,7 @@ func scanFinding(s interface{ Scan(...any) error }) (*Finding, error) {
 		&f.OldPath, &f.NewPath, &f.OldLine, &f.NewLine, &f.LineKind, &f.LineRangeStart, &f.LineRangeEnd,
 		&f.Title, &f.Body, &f.Suggestion, &f.Confidence, &f.EvidenceJSON, &f.Fingerprint, &f.Status,
 		&f.RejectionReason, &f.GitLabPositionJSON, &f.GitLabDraftNoteID, &f.GitLabDiscussionID,
-		&f.ValidationError, &f.CreatedAt, &f.UpdatedAt)
+		&f.ValidationError, &f.CreatedAt, &f.UpdatedAt, &f.EditedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -195,11 +195,24 @@ func (db *DB) UpdateFindingStatus(ctx context.Context, id, status, rejectionReas
 	return err
 }
 
-// SetFindingBody updates a finding's edited body.
+// SetFindingBody updates a finding's edited body, mirrors it into findings_fts
+// so search stays consistent, and stamps edited_at so the UI can mark it edited.
 func (db *DB) SetFindingBody(ctx context.Context, id, body string) error {
-	_, err := db.ExecContext(ctx,
-		`UPDATE findings SET body = ?, updated_at = ? WHERE id = ?`, body, nowMillis(), id)
-	return err
+	now := nowMillis()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE findings SET body = ?, edited_at = ?, updated_at = ? WHERE id = ?`, body, now, now, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE findings_fts SET body = ? WHERE finding_id = ?`, body, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetFindingDraftNote records the created GitLab draft note id and status.

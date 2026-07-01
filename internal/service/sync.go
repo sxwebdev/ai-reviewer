@@ -95,6 +95,7 @@ func (s *SyncService) trackMR(ctx context.Context, mr *gitlab.MergeRequest) erro
 		BaseSHA:        mr.DiffRefs.BaseSHA,
 		StartSHA:       mr.DiffRefs.StartSHA,
 		UpdatedAt:      parseTime(mr.UpdatedAt),
+		CreatedAt:      parseTime(mr.CreatedAt),
 	}
 	_, err := s.db.UpsertMergeRequest(ctx, row)
 	return err

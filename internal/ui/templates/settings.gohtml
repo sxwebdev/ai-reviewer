@@ -1,0 +1,45 @@
+{{define "title"}}Settings · ai-reviewer{{end}}
+{{define "content"}}
+<div class="page-head"><h1 class="grow">Settings</h1></div>
+
+<div class="card">
+  <div class="panel-head"><h3 class="grow">Health</h3><span class="spinner htmx-indicator" aria-hidden="true"></span></div>
+  <div hx-get="/health" hx-trigger="load" hx-swap="innerHTML" hx-indicator="closest .card" aria-live="polite" aria-busy="true">
+    <div class="skeleton skeleton-line" style="width:70%"></div>
+    <div class="skeleton skeleton-line" style="width:55%"></div>
+    <div class="skeleton skeleton-line" style="width:60%"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="panel-head"><h3 class="grow">Configuration</h3></div>
+  <p class="muted small">Read-only. Edit <code>~/.ai-reviewer/config.yaml</code> and restart to change it.</p>
+  <table class="table kv">
+    <tr><th>GitLab host</th><td>{{if .Cfg.Host}}{{.Cfg.Host}}{{else}}<span class="muted">not set — add <code>gitlab.host</code></span>{{end}}</td></tr>
+    <tr><th>LLM model</th><td class="mono">{{.Cfg.LLMModel}}</td></tr>
+    <tr><th>Comment language</th><td>{{.Cfg.CommentLanguage}}</td></tr>
+    <tr><th>Severity threshold</th><td>{{.Cfg.SeverityThreshold}}</td></tr>
+    <tr><th>Max comments</th><td>{{.Cfg.MaxComments}}</td></tr>
+    <tr><th>Agent mode</th><td>{{if .Cfg.AgentMode}}on{{else}}off{{end}}</td></tr>
+    <tr><th>Auth</th><td>{{if .Cfg.SubscriptionAuth}}subscription — reported cost is notional{{else}}API key — billed per token{{end}}</td></tr>
+  </table>
+</div>
+{{end}}
+
+{{define "health-checks"}}
+{{if not .Checks}}
+<p class="muted small">No checks available.</p>
+{{else}}
+<table class="table">
+  <tbody>
+  {{range .Checks}}
+  <tr>
+    <td class="nowrap"><span class="badge {{if eq .Status "ok"}}badge--ok{{else if eq .Status "warn"}}badge--warn{{else}}badge--failed{{end}}">{{.Status}}</span></td>
+    <td class="cell-title nowrap">{{.Name}}</td>
+    <td class="cell-sub mono">{{.Detail}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

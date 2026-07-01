@@ -38,6 +38,7 @@ type MergeRequest struct {
 	DiffRefs     DiffRefs `json:"diff_refs"`
 	Reviewers    []User   `json:"reviewers"`
 	UpdatedAt    string   `json:"updated_at"`
+	CreatedAt    string   `json:"created_at"`
 }
 
 // IsDraft reports whether the MR is a draft/WIP (field name varies by version).

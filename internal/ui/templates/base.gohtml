@@ -6,19 +6,66 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{template "title" .}}</title>
 <link rel="stylesheet" href="/static/app.css">
+<script>
+  // Apply saved theme before first paint to avoid a flash.
+  (function () {
+    try {
+      var t = localStorage.getItem('theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
 <script src="/static/htmx.min.js"></script>
 <script defer src="/static/alpine.min.js"></script>
 </head>
 <body>
-<header>
-  <h1><a href="/">ai-reviewer</a></h1>
-  <span class="muted">{{.Host}}</span>
-  <span class="spacer"></span>
-  <form method="post" action="/sync"><button class="btn">Sync assigned MRs</button></form>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="app-header">
+  <a class="brand" href="/">ai-reviewer</a>
+  <nav class="nav" aria-label="Primary">
+    <a href="/" {{if eq .Active "dashboard"}}aria-current="page"{{end}}>Dashboard</a>
+    <a href="/jobs" {{if eq .Active "jobs"}}aria-current="page"{{end}}>Jobs</a>
+    <a href="/memory" {{if eq .Active "memory"}}aria-current="page"{{end}}>Memory</a>
+    <a href="/settings" {{if eq .Active "settings"}}aria-current="page"{{end}}>Settings</a>
+  </nav>
+  <span class="header-spacer"></span>
+  <span class="host" title="GitLab host">{{.Host}}</span>
+  <button class="btn btn--ghost btn--sm" type="button" onclick="toggleTheme()" aria-label="Toggle light and dark theme">Theme</button>
+  <form method="post" action="/sync">
+    <button class="btn" aria-label="Sync assigned merge requests from GitLab"><span class="sync-label">Sync</span> MRs</button>
+  </form>
 </header>
-<main>
-{{if .Flash}}<div class="flash {{.FlashKind}}">{{.Flash}}</div>{{end}}
+<main id="main" class="page {{.PageClass}}">
+{{if .Flash}}<div class="alert alert--{{if eq .FlashKind "err"}}danger{{else if eq .FlashKind "ok"}}ok{{else if eq .FlashKind "warn"}}warn{{else}}info{{end}}" role="status"><div class="alert__body">{{.Flash}}</div></div>{{end}}
 {{template "content" .}}
 </main>
+<script>
+  function toggleTheme() {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('theme', next); } catch (e) {}
+  }
+  // Lightweight keyboard triage on any page that has .finding cards.
+  (function () {
+    var i = -1;
+    function cards() { return Array.prototype.slice.call(document.querySelectorAll('.finding')); }
+    function select(n) {
+      var cs = cards(); if (!cs.length) return;
+      cs.forEach(function (c) { c.classList.remove('is-selected'); });
+      i = Math.max(0, Math.min(n, cs.length - 1));
+      cs[i].classList.add('is-selected');
+      cs[i].scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+    document.addEventListener('keydown', function (e) {
+      var tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'j') { select(i + 1); e.preventDefault(); }
+      else if (e.key === 'k') { select(i - 1); e.preventDefault(); }
+      else if (e.key === 'a') { var c = cards()[i]; if (c) { var b = c.querySelector('[data-approve]'); if (b) b.click(); } }
+      else if (e.key === 'r') { var c2 = cards()[i]; if (c2) { var t = c2.querySelector('[name=reason]'); if (t) t.focus(); } }
+    });
+  })();
+</script>
 </body>
 </html>
