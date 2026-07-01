@@ -1,0 +1,23 @@
+{{define "title"}}Review memory · ai-reviewer{{end}}
+{{define "content"}}
+<div class="page-head"><h1 class="grow">Review memory</h1></div>
+<p class="muted">Rules and learned false-positives added to every review prompt. Reject a finding as <em>false-positive</em> to record one automatically.</p>
+{{if not .Items}}
+<div class="empty">
+  <p class="empty__title">No memory yet</p>
+  <p class="empty__hint">Reject a finding as <em>false-positive</em> to teach the reviewer what to skip.</p>
+</div>
+{{else}}
+{{range .Items}}
+<div class="card">
+  <div class="row wrap">
+    <span class="badge">{{.Type}}</span>
+    <span class="badge badge--cat">{{.Scope}}</span>
+    <strong class="grow">{{.Title}}</strong>
+    {{if not .Enabled}}<span class="badge badge--failed">disabled</span>{{end}}
+  </div>
+  {{if .Body}}<div class="finding-body">{{.Body}}</div>{{end}}
+</div>
+{{end}}
+{{end}}
+{{end}}

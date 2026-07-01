@@ -81,6 +81,9 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	if len(files) == 0 {
 		return "", fmt.Errorf("no reviewable changed files (binary/generated/vendored excluded)")
 	}
+	// Persist the full diff (incl. binary/vendored) at the review head so the web
+	// UI can render it with findings pinned inline. Best-effort — never fatal.
+	s.persistDiffs(ctx, mrID, mr.DiffRefs.HeadSHA, diffs)
 
 	discussions, _ := s.gl.ListMRDiscussions(ctx, projectKey, ref.IID)
 	pipelineStatus := s.latestPipelineStatus(ctx, projectKey, ref.IID)
@@ -260,6 +263,28 @@ func intPtrToInt64(p *int) *int64 {
 	}
 	v := int64(*p)
 	return &v
+}
+
+// persistDiffs stores every changed file's raw diff for the MR at headSHA,
+// including binary and vendored files (which parseDiffs drops before the LLM) so
+// the diff viewer can show them. Write failures are logged, not fatal.
+func (s *ReviewService) persistDiffs(ctx context.Context, mrID int64, headSHA string, diffs []gitlab.MergeRequestDiff) {
+	for _, d := range diffs {
+		path := d.NewPath
+		if path == "" {
+			path = d.OldPath
+		}
+		if err := s.db.UpsertMRDiff(ctx, &state.MRDiff{
+			MRID: mrID, HeadSHA: headSHA, OldPath: d.OldPath, NewPath: d.NewPath, Diff: d.Diff,
+			NewFile: d.NewFile, Renamed: d.RenamedFile, Deleted: d.DeletedFile,
+			IsBinary: review.IsBinaryDiff(d.Diff),
+			// Generated files collapse like vendored: visible but out of the way,
+			// consistent with parseDiffs excluding both from the LLM.
+			IsVendored: isVendored(path) || d.GeneratedFile,
+		}); err != nil {
+			s.log.Warn("persist diff failed", "path", path, "err", err)
+		}
+	}
 }
 
 // parseDiffs converts GitLab diffs into engine FileDiffs, excluding binary,

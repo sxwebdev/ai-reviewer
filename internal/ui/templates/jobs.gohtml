@@ -1,0 +1,28 @@
+{{define "title"}}Jobs · ai-reviewer{{end}}
+{{define "content"}}
+<div class="page-head"><h1 class="grow">Background jobs</h1><a class="btn btn--ghost" href="/jobs">Refresh</a></div>
+{{if not .Jobs}}
+<div class="empty">
+  <p class="empty__title">No background jobs yet</p>
+  <p class="empty__hint">A sync or a review will show up here with its status and progress.</p>
+</div>
+{{else}}
+<table class="table table--rows table--stack">
+  <thead><tr><th>When</th><th>Type</th><th>Status</th><th>MR</th><th class="num">Progress</th><th>Detail</th><th></th></tr></thead>
+  <tbody>
+  {{range .Jobs}}
+  <tr>
+    <td data-label="When" class="cell-sub nowrap">{{fmtTime .CreatedAt}}</td>
+    <td data-label="Type">{{.Type}}</td>
+    <td data-label="Status"><span class="badge st-{{.Status}}">{{.Status}}</span></td>
+    <td data-label="MR" class="muted">{{if .MRIID}}!{{.MRIID}}{{else}}—{{end}}</td>
+    <td data-label="Progress" class="num muted">{{if gt .ProgressTotal 0}}{{.ProgressCurrent}}/{{.ProgressTotal}}{{else}}—{{end}}</td>
+    <td data-label="Detail" class="mono small truncate" style="max-width:40ch" title="{{.Error}}">{{if .Error}}{{.Error}}{{else}}<span class="muted">—</span>{{end}}</td>
+    <td data-label="">{{if or (eq .Status "failed") (eq .Status "cancelled")}}
+      <form method="post" action="/jobs/{{.ID}}/retry"><button class="btn btn--sm">Retry</button></form>{{end}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

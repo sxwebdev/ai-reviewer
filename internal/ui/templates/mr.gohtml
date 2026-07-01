@@ -1,87 +1,201 @@
 {{define "title"}}{{.MR.Title}} · ai-reviewer{{end}}
 {{define "content"}}
-<div class="row">
-  <h2 class="grow">{{.MR.Title}}</h2>
-  <a class="btn" href="{{.MR.WebURL}}" target="_blank" rel="noreferrer">Open in GitLab</a>
+<div class="page-head">
+  <div class="grow">
+    <h1>{{.MR.Title}}</h1>
+    <p class="cell-sub">{{.ProjectPath}} · !{{.MR.IID}} · {{.MR.SourceBranch}} → {{.MR.TargetBranch}} · <span class="mono">head {{shortSHA .MR.HeadSHA}}</span>{{if gt .MR.CreatedAt 0}} · opened {{fmtTime .MR.CreatedAt}} ({{ago .MR.CreatedAt}} ago){{end}}</p>
+  </div>
+  <a class="btn" href="{{.MR.WebURL}}" target="_blank" rel="noreferrer">Open in GitLab ↗</a>
 </div>
-<p class="muted">{{.ProjectPath}} · !{{.MR.IID}} · {{.MR.SourceBranch}} → {{.MR.TargetBranch}} · head {{shortSHA .MR.HeadSHA}}</p>
 
 <div class="card">
   <form method="post" action="/mr/{{.MR.ID}}/review" class="row">
-    <button class="btn btn-primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
-    <span class="muted">Creates a local report. Nothing is posted to GitLab.</span>
+    <button class="btn btn--primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
+    <span class="muted small">Runs locally against the current head. Nothing is posted to GitLab until you publish.</span>
   </form>
 </div>
 
-{{if .Review}}
-<div class="card">
-  <div class="row">
-    <span class="badge">risk: {{.Review.RiskLevel}}</span>
-    <span class="badge">{{.Review.OverallRecommendation}}</span>
-    {{if gt .Review.CostUSD 0.0}}<span class="badge muted">${{printf "%.4f" .Review.CostUSD}}</span>{{end}}
-    <span class="grow"></span>
-    {{if gt .ApprovedCount 0}}
-    <form method="post" action="/review/{{.Review.ID}}/drafts">
-      <button class="btn">Create GitLab draft notes ({{.ApprovedCount}})</button>
-    </form>
-    {{end}}
-  </div>
-  {{if .Review.Summary}}<p>{{.Review.Summary}}</p>{{end}}
-
-  {{if not .Findings}}<p class="muted">No findings.</p>{{end}}
-  {{range .Findings}}
-  <div class="finding {{.Status}}">
-    <div class="row">
-      <span class="badge sev-{{.Severity}}">{{.Severity}}</span>
-      <span class="badge">{{.Category}}</span>
-      <strong class="grow">{{.Title}}</strong>
-      <span class="muted">{{.FilePath}}{{if .NewLine}}:{{.NewLine}}{{end}}</span>
-    </div>
-    <pre>{{.Body}}</pre>
-    {{if .ValidationError}}<p class="muted">⚠ {{.ValidationError}}</p>{{end}}
-    <div class="row">
-      {{if eq .Status "proposed"}}
-        <form method="post" action="/finding/{{.ID}}/approve"><button class="btn">Approve</button></form>
-        <form method="post" action="/finding/{{.ID}}/reject" class="row">
-          <input type="text" name="reason" placeholder="reason (optional)" style="width:auto">
-          <label class="muted"><input type="checkbox" name="fp"> false-positive</label>
-          <button class="btn btn-bad">Reject</button>
-        </form>
-      {{else}}
-        <span class="badge">{{.Status}}</span>
-      {{end}}
-    </div>
-  </div>
-  {{end}}
-
-  {{if gt .DraftedCount 0}}
-  <form method="post" action="/review/{{.Review.ID}}/publish" class="row"
-        onsubmit="return confirm('Publish {{.DraftedCount}} approved draft note(s) to GitLab?')">
-    <input type="text" name="confirm" placeholder="{{.PublishPhrase}}" style="width:auto">
-    <button class="btn btn-bad">Publish {{.DraftedCount}} comment(s)</button>
-    <span class="muted">Type exactly <code>{{.PublishPhrase}}</code> to confirm.</span>
-  </form>
-  {{end}}
+<div class="review-workspace">
+  <div class="col-left">{{template "review-section" .}}</div>
+  <aside class="diff-pane" aria-label="Diff">{{template "diff-pane" .Diff}}</aside>
 </div>
-{{else}}
-<p class="muted">No review yet. Run one above.</p>
-{{end}}
 
 {{if .PastReviews}}
 <div class="card">
-  <h3>Review history</h3>
-  <table>
-  <tr><th>When</th><th>Head</th><th>Risk</th><th>Status</th><th>Findings</th></tr>
-  {{range .PastReviews}}
-  <tr>
-    <td class="muted">{{.When}}</td>
-    <td class="muted">{{shortSHA .HeadSHA}}</td>
-    <td>{{.RiskLevel}}</td>
-    <td>{{.Status}}</td>
-    <td>{{.Findings}}</td>
-  </tr>
-  {{end}}
+  <div class="panel-head"><h3 class="grow">Previous reviews</h3></div>
+  <table class="table table--rows table--stack">
+    <thead><tr><th>When</th><th>Head</th><th>Risk</th><th class="num">Findings</th><th></th></tr></thead>
+    <tbody>
+    {{range .PastReviews}}
+    <tr>
+      <td data-label="When" class="cell-sub nowrap">{{.When}}</td>
+      <td data-label="Head" class="mono muted">{{shortSHA .HeadSHA}}</td>
+      <td data-label="Risk">{{if .RiskLevel}}<span class="badge risk-{{.RiskLevel}}">{{.RiskLevel}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+      <td data-label="Findings" class="num muted">{{.Findings}}</td>
+      <td data-label=""><a class="btn btn--sm" href="/mr/{{$.MR.ID}}?review={{.ID}}">View</a></td>
+    </tr>
+    {{end}}
+    </tbody>
   </table>
 </div>
 {{end}}
+{{end}}
+
+{{define "review-section"}}
+<section id="review-section" aria-busy="{{if .Running}}true{{else}}false{{end}}"
+  {{if .Running}}hx-get="/mr/{{.MR.ID}}/review-section" hx-trigger="every 3s" hx-target="#review-section" hx-swap="outerHTML"{{end}}>
+  <p class="sr-only" aria-live="polite">{{if .Running}}Review in progress{{else if .Review}}Review complete: {{.FindingCount}} findings, risk {{.Review.RiskLevel}}{{end}}</p>
+
+  {{if .ActionError}}<div class="alert alert--danger" role="alert"><div class="alert__body">{{.ActionError}}</div></div>{{end}}
+  {{if .Historical}}<div class="alert alert--warn"><div class="alert__body">Viewing an earlier review (head {{shortSHA .Review.HeadSHA}}). <a href="/mr/{{.MR.ID}}">View the latest review →</a></div></div>{{end}}
+
+  {{if .Running}}
+  <div class="card" role="status">
+    <div class="row"><span class="spinner" aria-hidden="true"></span> <strong>Reviewing…</strong>{{if .Progress}} <span class="muted">{{.Progress}}</span>{{end}}</div>
+    <p class="muted small" style="margin:0">This panel updates on its own.</p>
+  </div>
+  {{else if and (eq .JobStatus "failed") (not .Review)}}
+  <div class="card">
+    <div class="row"><span class="badge st-failed">review failed</span></div>
+    <pre class="err-box">{{.JobError}}</pre>
+    <form method="post" action="/mr/{{.MR.ID}}/review"><button class="btn">Retry review</button></form>
+  </div>
+  {{end}}
+
+  {{if and .Review (not .Running)}}
+  <div class="card">
+    <div class="review-head">
+      <span class="badge risk-{{.Review.RiskLevel}}">risk: {{.Review.RiskLevel}}</span>
+      <span class="badge">{{.Review.OverallRecommendation}}</span>
+      {{if .CostLabel}}<span class="muted small">{{.CostLabel}}</span>{{end}}
+      {{if .Review.LLMModel}}<span class="muted small mono">{{.Review.LLMModel}}</span>{{end}}
+      <span class="grow"></span>
+      {{if not .Historical}}
+        {{if gt .ProposedCount 0}}<form method="post" action="/review/{{.Review.ID}}/approve-all"><button class="btn">Approve all ({{.ProposedCount}})</button></form>{{end}}
+        {{if gt .ApprovedCount 0}}<form method="post" action="/review/{{.Review.ID}}/drafts"><button class="btn btn--primary">Create draft notes ({{.ApprovedCount}})</button></form>{{end}}
+      {{end}}
+    </div>
+    {{if .Review.Summary}}<p class="summary">{{.Review.Summary}}</p>{{end}}
+
+    {{if not .Groups}}<p class="muted">No findings.</p>{{end}}
+    {{range .Groups}}
+    <h4 class="sev-group-head sev-{{.Severity}}">{{.Severity}} <span class="count">· {{len .Items}}</span></h4>
+    {{range .Items}}
+    <div class="finding sev-l-{{.Severity}} st-{{.Status}}{{if gt .EditedAt 0}} is-edited{{end}}" x-data="{ edit: false }" data-finding="{{.ID}}">
+      <div class="finding-head">
+        <span class="badge sev-{{.Severity}}">{{.Severity}}</span>
+        <span class="badge badge--cat">{{.Category}}</span>
+        <strong class="finding-title">{{.Title}}</strong>
+        {{if gt .EditedAt 0}}<span class="badge st-edited">edited</span>{{end}}
+        {{if .FilePath}}<a class="finding-loc" href="{{$.MR.WebURL}}/diffs" target="_blank" rel="noreferrer">{{.FilePath}}{{if .NewLine}}:{{.NewLine}}{{else if .OldLine}}:{{.OldLine}}{{end}}</a>{{end}}
+      </div>
+      <div class="finding-body" x-show="!edit">{{.Body}}</div>
+      {{if .ValidationError}}<p class="hint">⚠ {{.ValidationError}}</p>{{end}}
+
+      {{if not $.Historical}}
+      <form x-show="edit" style="display:none" hx-post="/finding/{{.ID}}/edit" hx-target="#review-section" hx-swap="outerHTML" hx-disabled-elt="find button">
+        <label class="sr-only" for="edit-{{.ID}}">Edit finding comment</label>
+        <textarea class="textarea" id="edit-{{.ID}}" name="body" rows="6">{{.Body}}</textarea>
+        <div class="finding-actions"><button class="btn" type="submit">Save</button><button class="btn btn--ghost" type="button" @click="edit=false">Cancel</button></div>
+      </form>
+      {{if eq .Status "proposed"}}
+      <div class="finding-actions" x-show="!edit">
+        <form hx-post="/finding/{{.ID}}/approve" hx-target="#review-section" hx-swap="outerHTML" hx-disabled-elt="find button">
+          <button class="btn btn--good" data-approve>Approve</button>
+        </form>
+        <button class="btn btn--ghost" type="button" @click="edit=true">Edit</button>
+        <form class="reject" hx-post="/finding/{{.ID}}/reject" hx-target="#review-section" hx-swap="outerHTML" hx-disabled-elt="find button">
+          <label class="sr-only" for="reason-{{.ID}}">Rejection reason</label>
+          <input class="input" id="reason-{{.ID}}" type="text" name="reason" placeholder="reason (optional)">
+          <label class="check"><input type="checkbox" name="fp"> false-positive</label>
+          <button class="btn btn--danger">Reject</button>
+        </form>
+      </div>
+      {{else}}
+      <div class="row wrap"><span class="badge st-{{.Status}}">{{.Status}}</span>{{if .RejectionReason}}<span class="muted small">— {{.RejectionReason}}</span>{{end}}</div>
+      {{end}}
+      {{else}}
+      <div class="row"><span class="badge st-{{.Status}}">{{.Status}}</span></div>
+      {{end}}
+    </div>
+    {{end}}
+    {{end}}
+
+    {{if and (not .Historical) (gt .DraftedCount 0)}}
+    {{/* SAFETY: this UI gate is additive. The server independently re-checks the
+         typed phrase against service.ConfirmPhrase in PublishService.PublishDrafts
+         before any GitLab write — the :disabled binding is only a guardrail. */}}
+    <section class="danger-zone" aria-labelledby="publish-h" x-data="{ typed: '' }">
+      <div class="danger-zone__head">
+        <span class="badge badge--bad">Publish to GitLab</span>
+        <h3 id="publish-h" class="danger-zone__title">Post {{.DraftedCount}} approved comment{{if ne .DraftedCount 1}}s{{end}}</h3>
+      </div>
+      <p class="danger-zone__copy">This publishes your {{.DraftedCount}} approved draft note{{if ne .DraftedCount 1}}s{{end}} to the merge request on GitLab, where the author will see {{if eq .DraftedCount 1}}it{{else}}them{{end}}. Rejected and unreviewed findings stay local. Nothing is posted automatically — this is the only action that writes to GitLab.</p>
+      <form class="danger-zone__form" method="post" action="/review/{{.Review.ID}}/publish">
+        <div class="field">
+          <label class="label" for="publish-confirm">Type <code>{{.PublishPhrase}}</code> to confirm</label>
+          <input class="input input--mono" id="publish-confirm" name="confirm" x-model="typed"
+                 autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="publish-hint" placeholder="{{.PublishPhrase}}">
+          <p class="hint" id="publish-hint">Case-sensitive; the count must match.</p>
+        </div>
+        <button class="btn btn--danger-solid" type="submit" disabled
+                :disabled="typed !== '{{.PublishPhrase}}'" :aria-disabled="typed !== '{{.PublishPhrase}}'">
+          Publish {{.DraftedCount}} comment{{if ne .DraftedCount 1}}s{{end}}
+        </button>
+      </form>
+    </section>
+    {{end}}
+  </div>
+  {{else if not .Running}}
+  <div class="empty">
+    <p class="empty__title">No review yet</p>
+    <p class="empty__hint">Run a review to analyze this MR locally. Nothing is posted to GitLab until you publish.</p>
+  </div>
+  {{end}}
+</section>
+{{end}}
+
+{{define "diff-pane"}}
+<div id="diff-pane">
+  {{if not .Captured}}
+  <div class="diff-pane-empty">Diff not captured for this head yet. Run a review to store it, then it appears here with findings pinned inline.</div>
+  {{else}}
+    {{if .Unanchored}}
+    <div class="diff-unanchored">
+      <strong>Not anchored to a diff line</strong>
+      <p class="small" style="margin:.25rem 0 0">These map to an overview note rather than one line:</p>
+      {{range .Unanchored}}<div class="small">· <span class="badge sev-{{.Severity}}">{{.Severity}}</span> {{.Title}} <span class="mono muted">{{.FilePath}}</span></div>{{end}}
+    </div>
+    {{end}}
+    {{range .Files}}{{template "diff-file" .}}{{end}}
+  {{end}}
+</div>
+{{end}}
+
+{{define "diff-file"}}
+<details class="diff-file"{{if .Expanded}} open{{end}}>
+  <summary class="diff-file__head">
+    <span class="diff-file__path">{{.DisplayPath}}</span>
+    <span class="badge badge--cat">{{.Kind}}</span>
+    {{if gt .FindingCount 0}}<span class="badge badge--info" title="findings in this file">{{.FindingCount}}</span>{{end}}
+  </summary>
+  {{if .IsBinary}}
+  <div class="diff-binary">Binary file — no preview.</div>
+  {{else}}
+    {{range .Hunks}}
+    <div class="diff-hunk-head">{{.Header}}</div>
+    {{range .Lines}}
+    <div class="diff-line is-{{.Kind}}{{if .Findings}} is-pinned{{end}}">
+      <span class="ln">{{.OldLine}}</span>
+      <span class="ln">{{.NewLine}}</span>
+      <span class="mark" aria-hidden="true"></span>
+      <span class="code">{{.Content}}</span>
+      {{range .Findings}}
+      <div class="diff-pin"><span class="diff-pin__title">[{{.Severity}}] {{.Title}}</span><span>{{.Body}}</span></div>
+      {{end}}
+    </div>
+    {{end}}
+    {{end}}
+  {{end}}
+</details>
 {{end}}

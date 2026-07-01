@@ -1,6 +1,8 @@
 package state
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -164,5 +166,52 @@ func TestJobNoDoubleClaimUnderConcurrency(t *testing.T) {
 		if c != 1 {
 			t.Errorf("job %s claimed %d times (double-claim)", id, c)
 		}
+	}
+}
+
+// TestLatestReviewJobs proves the targeted latest-review-job queries pick the
+// newest job per MR (regardless of volume), exclude non-review jobs, and report
+// ErrNotFound for an MR with no review job.
+func TestLatestReviewJobs(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	pid, iid := int64(3), int64(9)
+
+	enqueue := func(id, typ, status string, p, i, createdAt int64) {
+		t.Helper()
+		if err := db.EnqueueJob(ctx, &Job{ID: id, Type: typ, Status: status, ProjectID: &p, MRIID: &i}); err != nil {
+			t.Fatal(err)
+		}
+		// EnqueueJob stamps now(); override created_at to make ordering deterministic.
+		if _, err := db.ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`, createdAt, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue("old", JobReview, JobFailed, pid, iid, 100)
+	enqueue("new", JobReview, JobRunning, pid, iid, 200) // newest for (3,9)
+	enqueue("other", JobReview, JobSuccess, 4, iid, 150) // different MR
+	enqueue("sync", JobSync, JobRunning, pid, iid, 300)  // not a review job
+
+	latest, err := db.GetLatestReviewJob(ctx, pid, iid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.ID != "new" || latest.Status != JobRunning {
+		t.Errorf("GetLatestReviewJob = %s/%s, want new/running", latest.ID, latest.Status)
+	}
+	if _, err := db.GetLatestReviewJob(ctx, 999, 999); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetLatestReviewJob(unknown) = %v, want ErrNotFound", err)
+	}
+
+	perMR, err := db.LatestReviewJobsPerMR(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, j := range perMR {
+		got[fmt.Sprintf("%d/%d", *j.ProjectID, *j.MRIID)] = j.ID
+	}
+	if len(got) != 2 || got["3/9"] != "new" || got["4/9"] != "other" {
+		t.Errorf("LatestReviewJobsPerMR = %v, want {3/9:new, 4/9:other}", got)
 	}
 }

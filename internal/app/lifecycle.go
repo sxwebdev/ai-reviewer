@@ -33,7 +33,26 @@ func (a *App) Serve(ctx context.Context, opts ServeOptions) error {
 	if err != nil {
 		return err
 	}
-	srv, err := server.New(bundle, a.Cfg.GitLab.Host, a.Log)
+	uiCfg := server.UIConfig{
+		Host:              a.Cfg.GitLab.Host,
+		LLMModel:          a.Cfg.LLM.Model,
+		CommentLanguage:   a.Cfg.Review.PreferredCommentLanguage,
+		SeverityThreshold: a.Cfg.Review.SeverityThreshold,
+		MaxComments:       a.Cfg.Review.MaxComments,
+		AgentMode:         a.Cfg.Review.AgentMode,
+		SubscriptionAuth:  a.Cfg.LLM.Claude.AuthMode != "api-key",
+	}
+	// Adapt the doctor checks into the server's health type so the web UI can
+	// surface them without importing internal/app (which would be a cycle).
+	health := func(ctx context.Context) []server.HealthCheck {
+		checks := a.Doctor(ctx)
+		out := make([]server.HealthCheck, 0, len(checks))
+		for _, c := range checks {
+			out = append(out, server.HealthCheck{Name: c.Name, Status: string(c.Status), Detail: c.Detail})
+		}
+		return out
+	}
+	srv, err := server.New(bundle, uiCfg, health, a.Log)
 	if err != nil {
 		return err
 	}

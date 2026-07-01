@@ -35,6 +35,7 @@ type MergeRequest struct {
 	BaseSHA        string
 	StartSHA       string
 	UpdatedAt      int64
+	CreatedAt      int64
 	LastSeenAt     int64
 	ReviewStatus   string
 }
@@ -140,6 +141,7 @@ type Finding struct {
 	ValidationError    string
 	CreatedAt          int64
 	UpdatedAt          int64
+	EditedAt           int64 // when the reviewer last edited the body (0 = never)
 }
 
 // Job type + status values.

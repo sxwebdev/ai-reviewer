@@ -1,25 +1,49 @@
 {{define "title"}}Dashboard · ai-reviewer{{end}}
 {{define "content"}}
-<h2>Assigned merge requests</h2>
+<div class="page-head"><h1 class="grow">Assigned merge requests</h1></div>
 {{if not .MRs}}
-<p class="muted">No merge requests tracked yet. Click <strong>Sync assigned MRs</strong> above.</p>
+<div class="empty">
+  <p class="empty__title">No merge requests tracked yet</p>
+  <p class="empty__hint">Run <strong>Sync MRs</strong> to pull the open MRs where you're a reviewer. Nothing is fetched until you ask.</p>
+  <form method="post" action="/sync"><button class="btn btn--primary">Sync assigned MRs</button></form>
+</div>
+{{else}}
+<div x-data="{ f: 'all' }">
+  <div class="chips" role="group" aria-label="Filter merge requests">
+    <button type="button" class="chip" :aria-pressed="f==='all'" @click="f='all'">All</button>
+    <button type="button" class="chip" :aria-pressed="f==='todo'" @click="f='todo'">Not reviewed</button>
+    <button type="button" class="chip" :aria-pressed="f==='done'" @click="f='done'">Reviewed</button>
+    <button type="button" class="chip" :aria-pressed="f==='stale'" @click="f='stale'">Head changed</button>
+    <button type="button" class="chip" :aria-pressed="f==='active'" @click="f='active'">Running / failed</button>
+    <button type="button" class="chip" :aria-pressed="f==='drafts'" @click="f='drafts'">Has drafts</button>
+    <button type="button" class="chip" :aria-pressed="f==='pub'" @click="f='pub'">Published</button>
+  </div>
+  <table class="table table--rows table--stack">
+    <thead>
+      <tr><th>Project</th><th>Merge request</th><th>Status</th><th class="num">Open</th><th class="num">Findings</th><th></th></tr>
+    </thead>
+    <tbody>
+    {{range .MRs}}
+    <tr data-f="{{.StatusClass}}" data-drafts="{{if gt .Drafted 0}}1{{else}}0{{end}}" data-pub="{{if gt .Published 0}}1{{else}}0{{end}}"
+        x-show="f==='all' || (f==='todo' && $el.dataset.f==='none') || (f==='done' && $el.dataset.f==='ok') || (f==='stale' && $el.dataset.f==='warn') || (f==='active' && ($el.dataset.f==='running' || $el.dataset.f==='failed')) || (f==='drafts' && $el.dataset.drafts==='1') || (f==='pub' && $el.dataset.pub==='1')">
+      <td data-label="Project" class="cell-sub mono">{{.ProjectPath}}</td>
+      <td data-label="Merge request">
+        <a class="cell-title" href="/mr/{{.ID}}">{{.Title}}</a>
+        <div class="cell-sub">!{{.IID}}{{if .Author}} · {{.Author}}{{end}} · {{.Source}} → {{.Target}}</div>
+      </td>
+      <td data-label="Status" class="nowrap">
+        <span class="badge badge--{{.StatusClass}}">{{.Status}}</span>
+        {{if and .Reviewed .RiskLevel}} <span class="badge risk-{{.RiskLevel}}">risk {{.RiskLevel}}</span>{{end}}
+        {{if gt .Drafted 0}} <span class="badge badge--info" title="draft notes awaiting publish">{{.Drafted}} draft</span>{{end}}
+        {{if gt .Published 0}} <span class="badge badge--good" title="published to GitLab">{{.Published}} published</span>{{end}}
+      </td>
+      <td data-label="Open" class="num nowrap" title="opened {{fmtTime .CreatedAt}}">{{if gt .CreatedAt 0}}{{ago .CreatedAt}}{{else}}—{{end}}</td>
+      <td data-label="Findings" class="num">{{if .Reviewed}}{{.Findings}}{{else}}<span class="muted">—</span>{{end}}</td>
+      <td data-label=""><a class="btn btn--sm" href="/mr/{{.ID}}">Open</a></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
 {{end}}
-<table>
-<thead>
-<tr><th>Project</th><th>Title</th><th>Author</th><th>Branch</th><th>Review</th><th>Findings</th><th></th></tr>
-</thead>
-<tbody>
-{{range .MRs}}
-<tr>
-  <td class="muted">{{.ProjectPath}}</td>
-  <td><a href="/mr/{{.ID}}">{{.Title}}</a></td>
-  <td>{{.Author}}</td>
-  <td class="muted">{{.Source}} → {{.Target}}</td>
-  <td>{{if .ReviewStatus}}<span class="badge">{{.ReviewStatus}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
-  <td>{{if .Findings}}{{.Findings}}{{else}}<span class="muted">0</span>{{end}}</td>
-  <td><a class="btn" href="/mr/{{.ID}}">Open</a></td>
-</tr>
-{{end}}
-</tbody>
-</table>
 {{end}}

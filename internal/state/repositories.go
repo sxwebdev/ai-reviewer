@@ -117,8 +117,8 @@ func (db *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, 
 		`INSERT INTO merge_requests
 			(gitlab_host, project_id, iid, web_url, title, description, author_username,
 			 source_branch, target_branch, state, draft, head_sha, base_sha, start_sha,
-			 updated_at, last_seen_at, review_status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 created_at, updated_at, last_seen_at, review_status)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(gitlab_host, project_id, iid) DO UPDATE SET
 			web_url         = excluded.web_url,
 			title           = excluded.title,
@@ -131,11 +131,12 @@ func (db *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, 
 			head_sha        = excluded.head_sha,
 			base_sha        = excluded.base_sha,
 			start_sha       = excluded.start_sha,
+			created_at      = excluded.created_at,
 			updated_at      = excluded.updated_at,
 			last_seen_at    = excluded.last_seen_at`,
 		mr.GitLabHost, mr.ProjectID, mr.IID, mr.WebURL, mr.Title, mr.Description, mr.AuthorUsername,
 		mr.SourceBranch, mr.TargetBranch, mr.State, b2i(mr.Draft), mr.HeadSHA, mr.BaseSHA, mr.StartSHA,
-		mr.UpdatedAt, now, mr.ReviewStatus)
+		mr.CreatedAt, mr.UpdatedAt, now, mr.ReviewStatus)
 	if err != nil {
 		return 0, err
 	}
@@ -148,14 +149,14 @@ func (db *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, 
 
 const mrColumns = `id, gitlab_host, project_id, iid, web_url, title, description, author_username,
 	source_branch, target_branch, state, draft, head_sha, base_sha, start_sha,
-	updated_at, last_seen_at, review_status`
+	created_at, updated_at, last_seen_at, review_status`
 
 func scanMR(s interface{ Scan(...any) error }) (*MergeRequest, error) {
 	mr := &MergeRequest{}
 	var draft int64
 	err := s.Scan(&mr.ID, &mr.GitLabHost, &mr.ProjectID, &mr.IID, &mr.WebURL, &mr.Title,
 		&mr.Description, &mr.AuthorUsername, &mr.SourceBranch, &mr.TargetBranch, &mr.State,
-		&draft, &mr.HeadSHA, &mr.BaseSHA, &mr.StartSHA, &mr.UpdatedAt, &mr.LastSeenAt, &mr.ReviewStatus)
+		&draft, &mr.HeadSHA, &mr.BaseSHA, &mr.StartSHA, &mr.CreatedAt, &mr.UpdatedAt, &mr.LastSeenAt, &mr.ReviewStatus)
 	if err != nil {
 		return nil, err
 	}
