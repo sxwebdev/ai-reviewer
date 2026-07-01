@@ -1,0 +1,25 @@
+{{define "title"}}Dashboard · ai-reviewer{{end}}
+{{define "content"}}
+<h2>Assigned merge requests</h2>
+{{if not .MRs}}
+<p class="muted">No merge requests tracked yet. Click <strong>Sync assigned MRs</strong> above.</p>
+{{end}}
+<table>
+<thead>
+<tr><th>Project</th><th>Title</th><th>Author</th><th>Branch</th><th>Review</th><th>Findings</th><th></th></tr>
+</thead>
+<tbody>
+{{range .MRs}}
+<tr>
+  <td class="muted">{{.ProjectPath}}</td>
+  <td><a href="/mr/{{.ID}}">{{.Title}}</a></td>
+  <td>{{.Author}}</td>
+  <td class="muted">{{.Source}} → {{.Target}}</td>
+  <td>{{if .ReviewStatus}}<span class="badge">{{.ReviewStatus}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+  <td>{{if .Findings}}{{.Findings}}{{else}}<span class="muted">0</span>{{end}}</td>
+  <td><a class="btn" href="/mr/{{.ID}}">Open</a></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}

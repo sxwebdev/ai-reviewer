@@ -1,0 +1,24 @@
+{{define "title"}}ai-reviewer{{end}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{template "title" .}}</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js"></script>
+<script defer src="/static/alpine.min.js"></script>
+</head>
+<body>
+<header>
+  <h1><a href="/">ai-reviewer</a></h1>
+  <span class="muted">{{.Host}}</span>
+  <span class="spacer"></span>
+  <form method="post" action="/sync"><button class="btn">Sync assigned MRs</button></form>
+</header>
+<main>
+{{if .Flash}}<div class="flash {{.FlashKind}}">{{.Flash}}</div>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>

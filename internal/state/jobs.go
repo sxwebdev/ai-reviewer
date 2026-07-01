@@ -1,0 +1,165 @@
+package state
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// EnqueueJob inserts a queued job. It fills id, timestamps, and run_after.
+func (db *DB) EnqueueJob(ctx context.Context, j *Job) error {
+	if j.ID == "" {
+		j.ID = uuid.NewString()
+	}
+	now := nowMillis()
+	j.CreatedAt = now
+	j.UpdatedAt = now
+	if j.Status == "" {
+		j.Status = JobQueued
+	}
+	if j.RunAfter == 0 {
+		j.RunAfter = now
+	}
+	if j.MaxAttempts == 0 {
+		j.MaxAttempts = 3
+	}
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO jobs (id, type, status, payload_json, project_id, mr_iid, review_id,
+			priority, attempts, max_attempts, run_after, progress_current, progress_total,
+			created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?)`,
+		j.ID, j.Type, j.Status, j.PayloadJSON, j.ProjectID, j.MRIID, j.ReviewID,
+		j.Priority, j.MaxAttempts, j.RunAfter, j.CreatedAt, j.UpdatedAt)
+	return err
+}
+
+const jobColumns = `id, type, status, payload_json, project_id, mr_iid, review_id, priority,
+	attempts, max_attempts, run_after, locked_at, locked_by, error, progress_current, progress_total,
+	created_at, started_at, finished_at, updated_at`
+
+func scanJob(s interface{ Scan(...any) error }) (*Job, error) {
+	j := &Job{}
+	err := s.Scan(&j.ID, &j.Type, &j.Status, &j.PayloadJSON, &j.ProjectID, &j.MRIID, &j.ReviewID,
+		&j.Priority, &j.Attempts, &j.MaxAttempts, &j.RunAfter, &j.LockedAt, &j.LockedBy, &j.Error,
+		&j.ProgressCurrent, &j.ProgressTotal, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// ClaimJob atomically claims the next runnable queued job. Because the pool is
+// capped at one connection, the SELECT+UPDATE is effectively serialized; the
+// IMMEDIATE transaction guards against races if that ever changes. Returns
+// ErrNotFound when nothing is runnable.
+func (db *DB) ClaimJob(ctx context.Context, workerID string) (*Job, error) {
+	now := nowMillis()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	j, err := scanJob(tx.QueryRowContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs
+		 WHERE status = ? AND run_after <= ?
+		 ORDER BY priority DESC, run_after ASC, id ASC LIMIT 1`, JobQueued, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, locked_at = ?, locked_by = ?, started_at = COALESCE(started_at, ?),
+			attempts = attempts + 1, updated_at = ? WHERE id = ?`,
+		JobRunning, now, workerID, now, now, j.ID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	j.Status = JobRunning
+	j.Attempts++
+	return j, nil
+}
+
+// CompleteJob marks a job finished with the given terminal status.
+func (db *DB) CompleteJob(ctx context.Context, id, status, errMsg string) error {
+	now := nowMillis()
+	_, err := db.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, error = ?, finished_at = ?, locked_by = '', updated_at = ? WHERE id = ?`,
+		status, errMsg, now, now, id)
+	return err
+}
+
+// RetryJob requeues a job with a delay, or marks it failed if attempts are
+// exhausted. Returns true if the job will be retried.
+func (db *DB) RetryJob(ctx context.Context, j *Job, errMsg string, backoff time.Duration) (bool, error) {
+	if j.Attempts >= j.MaxAttempts {
+		return false, db.CompleteJob(ctx, j.ID, JobFailed, errMsg)
+	}
+	now := nowMillis()
+	_, err := db.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, error = ?, run_after = ?, locked_by = '', updated_at = ? WHERE id = ?`,
+		JobQueued, errMsg, now+backoff.Milliseconds(), now, j.ID)
+	return err == nil, err
+}
+
+// RecoverStuckJobs requeues jobs stuck in 'running' longer than maxAge (e.g.
+// after a crash). Returns the number recovered.
+func (db *DB) RecoverStuckJobs(ctx context.Context, maxAge time.Duration) (int64, error) {
+	cutoff := nowMillis() - maxAge.Milliseconds()
+	res, err := db.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, locked_by = '', updated_at = ?
+		 WHERE status = ? AND locked_at IS NOT NULL AND locked_at < ?`,
+		JobQueued, nowMillis(), JobRunning, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ListJobs returns recent jobs, newest first.
+func (db *DB) ListJobs(ctx context.Context, limit int) ([]*Job, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+jobColumns+` FROM jobs ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// HasActiveJob reports whether a queued/running job of the given type exists
+// for a project+MR, used to avoid enqueuing duplicate reviews.
+func (db *DB) HasActiveJob(ctx context.Context, jobType string, projectID, mrIID int64) (bool, error) {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs
+		 WHERE type = ? AND status IN (?, ?) AND project_id = ? AND mr_iid = ?`,
+		jobType, JobQueued, JobRunning, projectID, mrIID).Scan(&n)
+	return n > 0, err
+}
+
+// AppendJobLog records a redacted log line for a job.
+func (db *DB) AppendJobLog(ctx context.Context, jobID, level, message string) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO job_logs (job_id, level, message, created_at) VALUES (?, ?, ?, ?)`,
+		jobID, level, message, nowMillis())
+	return err
+}

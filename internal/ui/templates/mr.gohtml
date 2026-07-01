@@ -1,0 +1,87 @@
+{{define "title"}}{{.MR.Title}} · ai-reviewer{{end}}
+{{define "content"}}
+<div class="row">
+  <h2 class="grow">{{.MR.Title}}</h2>
+  <a class="btn" href="{{.MR.WebURL}}" target="_blank" rel="noreferrer">Open in GitLab</a>
+</div>
+<p class="muted">{{.ProjectPath}} · !{{.MR.IID}} · {{.MR.SourceBranch}} → {{.MR.TargetBranch}} · head {{shortSHA .MR.HeadSHA}}</p>
+
+<div class="card">
+  <form method="post" action="/mr/{{.MR.ID}}/review" class="row">
+    <button class="btn btn-primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
+    <span class="muted">Creates a local report. Nothing is posted to GitLab.</span>
+  </form>
+</div>
+
+{{if .Review}}
+<div class="card">
+  <div class="row">
+    <span class="badge">risk: {{.Review.RiskLevel}}</span>
+    <span class="badge">{{.Review.OverallRecommendation}}</span>
+    {{if gt .Review.CostUSD 0.0}}<span class="badge muted">${{printf "%.4f" .Review.CostUSD}}</span>{{end}}
+    <span class="grow"></span>
+    {{if gt .ApprovedCount 0}}
+    <form method="post" action="/review/{{.Review.ID}}/drafts">
+      <button class="btn">Create GitLab draft notes ({{.ApprovedCount}})</button>
+    </form>
+    {{end}}
+  </div>
+  {{if .Review.Summary}}<p>{{.Review.Summary}}</p>{{end}}
+
+  {{if not .Findings}}<p class="muted">No findings.</p>{{end}}
+  {{range .Findings}}
+  <div class="finding {{.Status}}">
+    <div class="row">
+      <span class="badge sev-{{.Severity}}">{{.Severity}}</span>
+      <span class="badge">{{.Category}}</span>
+      <strong class="grow">{{.Title}}</strong>
+      <span class="muted">{{.FilePath}}{{if .NewLine}}:{{.NewLine}}{{end}}</span>
+    </div>
+    <pre>{{.Body}}</pre>
+    {{if .ValidationError}}<p class="muted">⚠ {{.ValidationError}}</p>{{end}}
+    <div class="row">
+      {{if eq .Status "proposed"}}
+        <form method="post" action="/finding/{{.ID}}/approve"><button class="btn">Approve</button></form>
+        <form method="post" action="/finding/{{.ID}}/reject" class="row">
+          <input type="text" name="reason" placeholder="reason (optional)" style="width:auto">
+          <label class="muted"><input type="checkbox" name="fp"> false-positive</label>
+          <button class="btn btn-bad">Reject</button>
+        </form>
+      {{else}}
+        <span class="badge">{{.Status}}</span>
+      {{end}}
+    </div>
+  </div>
+  {{end}}
+
+  {{if gt .DraftedCount 0}}
+  <form method="post" action="/review/{{.Review.ID}}/publish" class="row"
+        onsubmit="return confirm('Publish {{.DraftedCount}} approved draft note(s) to GitLab?')">
+    <input type="text" name="confirm" placeholder="{{.PublishPhrase}}" style="width:auto">
+    <button class="btn btn-bad">Publish {{.DraftedCount}} comment(s)</button>
+    <span class="muted">Type exactly <code>{{.PublishPhrase}}</code> to confirm.</span>
+  </form>
+  {{end}}
+</div>
+{{else}}
+<p class="muted">No review yet. Run one above.</p>
+{{end}}
+
+{{if .PastReviews}}
+<div class="card">
+  <h3>Review history</h3>
+  <table>
+  <tr><th>When</th><th>Head</th><th>Risk</th><th>Status</th><th>Findings</th></tr>
+  {{range .PastReviews}}
+  <tr>
+    <td class="muted">{{.When}}</td>
+    <td class="muted">{{shortSHA .HeadSHA}}</td>
+    <td>{{.RiskLevel}}</td>
+    <td>{{.Status}}</td>
+    <td>{{.Findings}}</td>
+  </tr>
+  {{end}}
+  </table>
+</div>
+{{end}}
+{{end}}
