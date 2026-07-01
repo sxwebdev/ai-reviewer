@@ -58,14 +58,39 @@ type claudeEnvelope struct {
 	StructuredOutput json.RawMessage `json:"structured_output"`
 }
 
-// invoke runs the CLI and returns the parsed envelope.
+// errMaxStructuredOutputRetries is claude's envelope subtype when it cannot
+// produce output satisfying --json-schema within its internal retry budget
+// (common on long agent runs that keep wanting to call tools).
+const errMaxStructuredOutputRetries = "error_max_structured_output_retries"
+
+// invoke runs the CLI with one graceful fallback: if a schema-constrained call
+// fails because claude could not satisfy --json-schema within its retry budget
+// (errMaxStructuredOutputRetries), it retries once WITHOUT --json-schema and
+// relies on our own extraction (pickJSON → ExtractJSONObject). The system prompt
+// already demands strict JSON, so this drops enforcement, not correctness, and
+// turns a hard failure into a recoverable one without a full job retry.
 func (c *ClaudeCLI) invoke(ctx context.Context, req Request) (*claudeEnvelope, error) {
+	env, err := c.runOnce(ctx, req)
+	if err != nil && req.JSONSchema != "" && strings.Contains(err.Error(), errMaxStructuredOutputRetries) {
+		c.log.Warn("claude could not satisfy --json-schema; retrying once without it and extracting JSON ourselves", "err", err)
+		req.JSONSchema = ""
+		return c.runOnce(ctx, req)
+	}
+	return env, err
+}
+
+// runOnce runs the CLI once and returns the parsed envelope.
+func (c *ClaudeCLI) runOnce(ctx context.Context, req Request) (*claudeEnvelope, error) {
 	model := req.Model
 	if model == "" {
 		model = c.opts.Model
 	}
 
-	args := []string{"-p", "--output-format", "json", "--bare", "--permission-mode", c.opts.PermissionMode}
+	// NOTE: do NOT add --bare here. It puts claude in "minimal mode" which skips
+	// keychain reads, so a subscription/existing-login (stored in the macOS
+	// keychain) resolves as "Not logged in". --output-format json already gives a
+	// clean envelope, so --bare buys us nothing but broken auth.
+	args := []string{"-p", "--output-format", "json", "--permission-mode", c.opts.PermissionMode}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -98,11 +123,17 @@ func (c *ClaudeCLI) invoke(ctx context.Context, req Request) (*claudeEnvelope, e
 
 	c.log.Debug("running claude", "bin", c.opts.Bin, "model", model, "workdir", req.WorkDir, "agent", req.AgentMode)
 	if err := cmd.Run(); err != nil {
-		errText := security.Mask(strings.TrimSpace(stderr.String()))
 		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("claude timed out after %s: %s", c.opts.Timeout, errText)
+			return nil, fmt.Errorf("claude timed out after %s", c.opts.Timeout)
 		}
-		return nil, fmt.Errorf("claude failed: %w: %s", err, errText)
+		// On non-zero exit claude prints its error as a JSON envelope on stdout
+		// (e.g. "Not logged in · Please run /login", invalid model, overload) and
+		// leaves stderr empty, so surface stdout's result — not just stderr.
+		detail := security.Mask(claudeErrDetail(stdout.Bytes(), stderr.String()))
+		if hint := claudeErrHint(detail); hint != "" {
+			return nil, fmt.Errorf("claude failed (%w): %s — %s", err, detail, hint)
+		}
+		return nil, fmt.Errorf("claude failed (%w): %s", err, detail)
 	}
 
 	var env claudeEnvelope
@@ -116,6 +147,44 @@ func (c *ClaudeCLI) invoke(ctx context.Context, req Request) (*claudeEnvelope, e
 		return nil, fmt.Errorf("claude returned an error result: %s", security.Mask(env.Result))
 	}
 	return &env, nil
+}
+
+// claudeErrDetail extracts the most useful human-readable text from a failed
+// claude run: the envelope's result field if stdout parsed as JSON (claude puts
+// its error there), otherwise raw stdout, then stderr.
+func claudeErrDetail(stdout []byte, stderr string) string {
+	var env claudeEnvelope
+	if json.Unmarshal(stdout, &env) == nil {
+		if s := strings.TrimSpace(env.Result); s != "" {
+			return truncate(s, 500)
+		}
+		// is_error with no result text (e.g. error_max_structured_output_retries):
+		// surface the subtype rather than dumping the whole JSON envelope.
+		if env.IsError && env.Subtype != "" {
+			return "error: " + env.Subtype
+		}
+	}
+	if s := strings.TrimSpace(string(stdout)); s != "" {
+		return truncate(s, 500)
+	}
+	if s := strings.TrimSpace(stderr); s != "" {
+		return truncate(s, 500)
+	}
+	return "no output on stdout/stderr"
+}
+
+// claudeErrHint maps a known claude error message to an actionable hint, or "".
+func claudeErrHint(detail string) string {
+	switch {
+	case strings.Contains(detail, "Not logged in"), strings.Contains(detail, "/login"):
+		return "run `claude` once and `/login`, or set an auth token (claude setup-token → CLAUDE_CODE_OAUTH_TOKEN)"
+	case strings.Contains(detail, errMaxStructuredOutputRetries):
+		return "the model couldn't produce schema-valid output; the wrapper retries once without --json-schema — if it persists, try review.agent_mode: false"
+	case strings.Contains(detail, "model"):
+		return "check llm.model (use an alias like `opus`/`sonnet` or a full ID like `claude-opus-4-8`)"
+	default:
+		return ""
+	}
 }
 
 // truncate shortens s to at most n bytes (rune-safe) for error messages.

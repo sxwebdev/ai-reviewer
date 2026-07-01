@@ -58,11 +58,11 @@ func initCommand() *cli.Command {
 			fmt.Printf("DB path:   %s (migrated)\n", cfg.Storage.DBPath)
 
 			fmt.Println("\nNext steps:")
-			fmt.Printf("  1. Edit %s: set gitlab.host and gitlab.username\n", path)
-			fmt.Printf("  2. export %s=<your GitLab PAT (scope: api)>\n", cfg.GitLab.TokenEnv)
-			fmt.Println("  3. Ensure the `claude` CLI is installed and logged in")
-			fmt.Println("  4. Run: ai-reviewer doctor")
-			fmt.Println("  5. Run: ai-reviewer serve")
+			fmt.Printf("  1. Edit %s: set gitlab.host, gitlab.username, and gitlab.token (your PAT, scope: api)\n", path)
+			fmt.Println("     The config file is created with 0600 perms; the token stays on this machine.")
+			fmt.Println("  2. Ensure the `claude` CLI is installed and logged in")
+			fmt.Println("  3. Run: ai-reviewer doctor")
+			fmt.Println("  4. Run: ai-reviewer serve")
 			return nil
 		},
 	}

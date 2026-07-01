@@ -42,11 +42,14 @@ type AppConfig struct {
 	UI          string `yaml:"ui" usage:"Primary UI: web"`
 }
 
-// GitLabConfig holds GitLab connection settings. The token itself is read from
-// the environment variable named by TokenEnv — never stored here.
+// GitLabConfig holds GitLab connection settings. The token is read from the
+// Token field, stored in config.yaml (which `init` writes with 0600 perms). If
+// Token is empty it falls back to the environment variable named by TokenEnv
+// (default GITLAB_TOKEN), so the older env-only workflow keeps working.
 type GitLabConfig struct {
 	Host               string        `yaml:"host" env:"GITLAB_HOST" usage:"GitLab base URL, e.g. https://gitlab.example.com"`
-	TokenEnv           string        `yaml:"token_env" usage:"Name of env var holding the GitLab personal access token"`
+	Token              string        `yaml:"token" usage:"GitLab personal access token (scope: api), stored locally in config.yaml"`
+	TokenEnv           string        `yaml:"token_env" usage:"Optional: read the token from this env var when 'token' is empty (default GITLAB_TOKEN)"`
 	Username           string        `yaml:"username" env:"GITLAB_USERNAME" usage:"Your GitLab username (reviewer identity)"`
 	Timeout            time.Duration `yaml:"timeout" usage:"Per-request timeout"`
 	InsecureSkipVerify bool          `yaml:"insecure_skip_verify" usage:"Skip TLS verification (self-managed only, explicit opt-in)"`
@@ -192,13 +195,38 @@ func DefaultConfig() *Config {
 	}
 }
 
-// GitLabToken resolves the GitLab token from the configured environment
-// variable. It is read fresh each call and never persisted.
+// GitLabToken resolves the GitLab token. It prefers the token stored in the
+// config file (GitLab.Token); if that is empty it falls back to the environment
+// variable named by TokenEnv (default GITLAB_TOKEN).
 func (c *Config) GitLabToken() string {
-	if c.GitLab.TokenEnv == "" {
-		return os.Getenv("GITLAB_TOKEN")
+	if c.GitLab.Token != "" {
+		return c.GitLab.Token
 	}
-	return os.Getenv(c.GitLab.TokenEnv)
+	env := c.GitLab.TokenEnv
+	if env == "" {
+		env = "GITLAB_TOKEN"
+	}
+	return os.Getenv(env)
+}
+
+// IsValidEnvName reports whether s is a syntactically valid POSIX environment
+// variable name ([A-Za-z_][A-Za-z0-9_]*). It is used to detect when token_env
+// was mistakenly set to a literal token (which contains '-'/'.') instead of an
+// env var name.
+func IsValidEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ExpandPaths resolves ~ and makes storage paths absolute. Called after load.
@@ -232,6 +260,11 @@ func (c *Config) Validate() error {
 	case "blocking", "high", "medium", "low", "nit":
 	default:
 		return fmt.Errorf("review.severity_threshold invalid: %q", c.Review.SeverityThreshold)
+	}
+	switch c.Review.PreferredCommentLanguage {
+	case "", "en", "ru", "auto":
+	default:
+		return fmt.Errorf("review.preferred_comment_language must be en, ru, or auto, got %q", c.Review.PreferredCommentLanguage)
 	}
 	if c.Storage.DBPath == "" {
 		return fmt.Errorf("storage.db_path must not be empty")

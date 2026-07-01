@@ -101,6 +101,31 @@ func TestGitLabToken(t *testing.T) {
 	}
 }
 
+func TestGitLabTokenPrefersConfigOverEnv(t *testing.T) {
+	c := DefaultConfig()
+	c.GitLab.Token = "glpat-fromconfig"
+	c.GitLab.TokenEnv = "MY_TEST_TOKEN"
+	t.Setenv("MY_TEST_TOKEN", "glpat-fromenv")
+	if got := c.GitLabToken(); got != "glpat-fromconfig" {
+		t.Errorf("GitLabToken() = %q, want config value to win", got)
+	}
+}
+
+func TestIsValidEnvName(t *testing.T) {
+	valid := []string{"GITLAB_TOKEN", "_x", "A1", "my_var2"}
+	invalid := []string{"", "glpat-abc.def", "1ABC", "has space", "with-dash", "tok.en"}
+	for _, s := range valid {
+		if !IsValidEnvName(s) {
+			t.Errorf("IsValidEnvName(%q) = false, want true", s)
+		}
+	}
+	for _, s := range invalid {
+		if IsValidEnvName(s) {
+			t.Errorf("IsValidEnvName(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestExpandPaths(t *testing.T) {
 	c := DefaultConfig()
 	if err := c.ExpandPaths(); err != nil {

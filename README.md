@@ -48,8 +48,7 @@ go install github.com/sxwebdev/ai-reviewer/cmd/ai-reviewer@latest
 
 ```bash
 ai-reviewer init      # writes ~/.ai-reviewer/{config.yaml, state.db, cache}
-# edit ~/.ai-reviewer/config.yaml: set gitlab.host and gitlab.username
-export GITLAB_TOKEN=<your GitLab personal access token>   # scope: api
+# edit ~/.ai-reviewer/config.yaml: set gitlab.host, gitlab.username, gitlab.token (scope: api)
 ai-reviewer doctor    # verifies GitLab auth, Claude, git, DB, FTS5
 ai-reviewer serve     # opens the local web UI
 ```
@@ -79,9 +78,11 @@ Global flags: `--config <path>`, `--debug`. `serve` adds `--host`, `--port`,
 
 Create a **Personal Access Token** with the **`api`** scope and Developer+ role
 on the projects you review (needed to create/publish draft notes; drafts are
-per-user). Expose it via the env var named by `gitlab.token_env` (default
-`GITLAB_TOKEN`). The token is read from the environment only — never written to
-the config file or logs.
+per-user). Put it in `gitlab.token` in `~/.ai-reviewer/config.yaml` — the file
+is created with `0600` permissions and stays on your machine. Alternatively,
+leave `gitlab.token` empty and expose the token via the env var named by
+`gitlab.token_env` (default `GITLAB_TOKEN`). Either way the token is masked in
+all logs.
 
 ## Claude auth modes
 
@@ -121,7 +122,9 @@ changes. Cost shows as "unavailable" on subscription/OAuth auth.
 4. **LLM review** — a strict-JSON review (`claude --output-format json
 --json-schema …`), then optional self-reflection to prune weak findings.
 5. **Validate (Go owns this)** — schema, file-in-diff, line→position mapping,
-   severity threshold, dedupe, secret scrub, max-comments cap, ranking.
+   severity threshold, dedupe, secret scrub, max-comments cap, ranking, and
+   compile-claim verification (a finding that says the code doesn't build is
+   dropped if `go build` shows the package actually compiles).
 6. **Approve → draft → publish** — your decisions, then GitLab draft notes, then
    an explicitly-confirmed publish.
 
@@ -137,8 +140,10 @@ changes. Cost shows as "unavailable" on subscription/OAuth auth.
   prompt (e.g. "Handlers must pass context to the DB layer", "New endpoints
   require integration tests"). Rejecting a finding can save it as a
   _false-positive_ memory so similar findings are suppressed.
-- **Reviewer profile** — tone, strictness, language (`ru`/`en`/`auto`), max
-  comments, severity threshold, enabled categories, prefer-questions, allow-nits.
+- **Reviewer profile** — tone, strictness, comment language, max comments,
+  severity threshold, enabled categories, prefer-questions, allow-nits. Comment
+  language is `review.preferred_comment_language`: `auto` (default, matches the
+  MR description's language), `en`, or `ru`.
   The default is a careful senior engineer: high-signal, correctness/security/
   tests/architecture first, questions when uncertain.
 

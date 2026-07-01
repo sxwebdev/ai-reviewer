@@ -32,7 +32,7 @@ func (a *App) Services() (*service.Bundle, error) {
 		LLMProvider:      a.Cfg.LLM.Provider,
 		AgentMode:        a.Cfg.Review.AgentMode && a.Cfg.LLM.Claude.AgentMode,
 		AllowedTools:     a.Cfg.LLM.Claude.AllowedTools,
-		Profile:          review.DefaultProfile(),
+		Profile:          profileFromConfig(a.Cfg.Review),
 		Token:            a.Cfg.GitLabToken(),
 		CacheDir:         a.Cfg.Storage.CacheDir,
 		IgnoreGlobs:      a.Cfg.Review.IgnoreGlobs,

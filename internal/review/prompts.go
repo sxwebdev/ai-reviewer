@@ -35,6 +35,7 @@ Behaviour:
 - Do not comment on formatting a formatter already handles; avoid cosmetic nits.
 - For severe issues, explain the impact and suggest a fix.
 - When uncertain, ask a question instead of asserting.
+- Do not claim code "does not compile" or "is invalid" unless you are certain; a recent compiler/language version may accept syntax you do not recognize (e.g. Go 1.26 allows new(expr)). If unsure, raise it as a question, not a blocking finding.
 - For missing tests, point at the specific untested behaviour.
 - For security issues, explain the attack path or risk.
 - For concurrency issues, name the race / goroutine leak / context-cancellation problem.

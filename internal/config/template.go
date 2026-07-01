@@ -19,10 +19,11 @@ app:
 
 gitlab:
   host: ""                 # e.g. https://gitlab.example.com
-  token_env: "GITLAB_TOKEN"  # env var holding your PAT (scope: api)
+  token: ""                # your GitLab PAT (scope: api); stored in this file (kept at chmod 600)
   username: ""             # your GitLab username (reviewer identity)
   timeout: "30s"
   insecure_skip_verify: false
+  # token_env: "GITLAB_TOKEN"  # optional fallback: read the token from this env var when 'token' is empty
 
 llm:
   provider: "claude-cli"
@@ -58,7 +59,7 @@ review:
   include_performance: true
   include_observability: true
   include_style: false
-  preferred_comment_language: "auto"
+  preferred_comment_language: "auto"   # auto (match the MR description language) | en | ru
   ignore_globs:
     - "vendor/**"
     - "node_modules/**"

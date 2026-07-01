@@ -101,6 +101,13 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	})
 	findings := v.Validate(resp, in.Files, in.Refs, in.ProjectID, in.MRIID, in.ExistingFingerprints)
 
+	// Deterministically refute "does not compile" claims: if a worktree is
+	// available, drop any finding asserting a build failure whose package
+	// actually compiles (guards against the model missing recent Go features).
+	if in.WorkDir != "" {
+		findings = e.verifyBuildClaims(ctx, in.WorkDir, findings)
+	}
+
 	e.log.Info("review complete",
 		"raw_findings", len(resp.Findings), "validated", len(findings),
 		"risk", resp.RiskLevel, "cost_usd", resp.CostUSD)

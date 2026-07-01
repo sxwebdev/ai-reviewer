@@ -121,7 +121,7 @@ func (a *App) ReviewOnce(ctx context.Context, ref string) error {
 		LLMProvider:      a.Cfg.LLM.Provider,
 		AgentMode:        false, // repo worktree not yet wired (build step 7)
 		AllowedTools:     a.Cfg.LLM.Claude.AllowedTools,
-		Profile:          review.DefaultProfile(),
+		Profile:          profileFromConfig(a.Cfg.Review),
 	}, a.Log)
 
 	reviewID, err := svc.RunReview(ctx, mrRef)

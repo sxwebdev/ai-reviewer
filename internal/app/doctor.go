@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/sxwebdev/ai-reviewer/internal/config"
 )
 
 // CheckStatus is the outcome of a single doctor check.
@@ -76,9 +78,15 @@ func (a *App) Doctor(ctx context.Context) []DoctorCheck {
 		add("gitlab username", StatusOK, a.Cfg.GitLab.Username)
 	}
 	if a.Cfg.GitLabToken() == "" {
-		add("gitlab token", StatusFail, fmt.Sprintf("%s is not set", a.Cfg.GitLab.TokenEnv))
+		if te := a.Cfg.GitLab.TokenEnv; te != "" && !config.IsValidEnvName(te) {
+			// token_env holds something that is not a valid env var name — almost
+			// certainly the token itself was pasted here. Do not echo the value.
+			add("gitlab token", StatusFail, "gitlab.token is empty and gitlab.token_env is not a valid env var name — did you paste the token into token_env? Put it in gitlab.token instead")
+		} else {
+			add("gitlab token", StatusFail, "gitlab.token is not set (add it to your config file, or export the token_env variable)")
+		}
 	} else {
-		add("gitlab token", StatusOK, fmt.Sprintf("%s present", a.Cfg.GitLab.TokenEnv))
+		add("gitlab token", StatusOK, "present") // never echo the token value
 	}
 
 	// GitLab API reachability (only if host + token are present)
