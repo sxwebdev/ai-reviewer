@@ -36,6 +36,12 @@ func (unconfigured) ListMRDiscussions(context.Context, string, int64) ([]Discuss
 func (unconfigured) ListMRPipelines(context.Context, string, int64) ([]Pipeline, error) {
 	return nil, ErrNotConfigured
 }
+func (unconfigured) ListMRCommits(context.Context, string, int64) ([]Commit, error) {
+	return nil, ErrNotConfigured
+}
+func (unconfigured) GetRawFile(context.Context, string, string, string) ([]byte, error) {
+	return nil, ErrNotConfigured
+}
 func (unconfigured) CreateDraftNote(context.Context, string, int64, string, *Position) (*DraftNote, error) {
 	return nil, ErrNotConfigured
 }

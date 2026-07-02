@@ -96,6 +96,10 @@ type Review struct {
 	ReviewerProfileID     string
 	Summary               string
 	RawReportJSON         string
+	PipelineJSON          string // serialized []review.PassReport (per-pass cost/duration)
+	RiskJSON              string // serialized review.RiskReport (deterministic risk)
+	CompletenessJSON      string // serialized review.CompletenessReport
+	CoverageJSON          string // serialized coverage.Report (changed-line coverage)
 	CostUSD               float64
 	CreatedAt             int64
 	UpdatedAt             int64
@@ -139,6 +143,8 @@ type Finding struct {
 	GitLabDraftNoteID  *int64
 	GitLabDiscussionID string
 	ValidationError    string
+	Pass               string // pipeline pass that produced the finding
+	Verification       string // skeptic outcome: confirmed|uncertain|unverified|""
 	CreatedAt          int64
 	UpdatedAt          int64
 	EditedAt           int64 // when the reviewer last edited the body (0 = never)

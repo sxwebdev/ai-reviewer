@@ -33,6 +33,10 @@ type Finding struct {
 	Evidence           []string `json:"evidence"`
 	Blocking           bool     `json:"blocking"`
 	RequiresHumanCheck bool     `json:"requires_human_check"`
+
+	// PassName tags which pipeline pass produced the finding. Set client-side
+	// by the engine's merge stage; never sent to or from the model.
+	PassName string `json:"-"`
 }
 
 // MissingTest describes an untested behaviour.
@@ -50,6 +54,78 @@ type Question struct {
 	FilePath     string `json:"file_path"`
 	Line         int    `json:"line"`
 }
+
+// CompletenessCriterion is one acceptance criterion extracted from the MR's
+// stated intent, with the model's verdict on whether the diff fulfils it.
+type CompletenessCriterion struct {
+	Criterion string `json:"criterion"`
+	Status    string `json:"status"`   // done|partial|missing|unclear
+	Evidence  string `json:"evidence"` // code references / quotes backing the verdict
+}
+
+// CompletenessResponse is the strict JSON contract for the completeness pass.
+type CompletenessResponse struct {
+	Criteria []CompletenessCriterion `json:"criteria"`
+	Note     string                  `json:"note"` // e.g. "description has no actionable criteria"
+}
+
+// CompletenessJSONSchema coerces the completeness pass output.
+const CompletenessJSONSchema = `{
+  "type": "object",
+  "required": ["criteria"],
+  "properties": {
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion", "status", "evidence"],
+        "properties": {
+          "criterion": {"type": "string"},
+          "status": {"type": "string", "enum": ["done", "partial", "missing", "unclear"]},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "note": {"type": "string"}
+  }
+}`
+
+// FindingVerdict is the skeptic pass's judgement of one draft finding. The
+// skeptic can only judge findings by index — it cannot rewrite them.
+type FindingVerdict struct {
+	Index       int     `json:"index"`        // 1-based index from the numbered list
+	Verdict     string  `json:"verdict"`      // confirmed|refuted|uncertain
+	Reason      string  `json:"reason"`       // for refuted: quoted-code evidence
+	Confidence  float64 `json:"confidence"`   // 0.0-1.0
+	DuplicateOf int     `json:"duplicate_of"` // 1-based index of the finding this duplicates; 0/-1 when none
+}
+
+// VerdictResponse is the strict JSON contract for the skeptic pass.
+type VerdictResponse struct {
+	Verdicts []FindingVerdict `json:"verdicts"`
+}
+
+// VerdictJSONSchema coerces the skeptic pass output.
+const VerdictJSONSchema = `{
+  "type": "object",
+  "required": ["verdicts"],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "verdict", "reason", "confidence"],
+        "properties": {
+          "index": {"type": "integer"},
+          "verdict": {"type": "string", "enum": ["confirmed", "refuted", "uncertain"]},
+          "reason": {"type": "string"},
+          "confidence": {"type": "number"},
+          "duplicate_of": {"type": "integer"}
+        }
+      }
+    }
+  }
+}`
 
 // ReviewJSONSchema is passed to `claude --json-schema` to coerce strict output.
 // Kept intentionally permissive (types only) so model creativity in content is

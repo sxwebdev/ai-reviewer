@@ -36,6 +36,13 @@ func NormalizeSeverity(sev string) string {
 	return "medium"
 }
 
+// Verification states for ValidatedFinding.Verification.
+const (
+	VerificationConfirmed  = "confirmed"  // skeptic confirmed with evidence
+	VerificationUncertain  = "uncertain"  // skeptic could not confirm nor refute
+	VerificationUnverified = "unverified" // verification skipped or failed
+)
+
 // ValidatedFinding is an LLM finding after deterministic validation and GitLab
 // position mapping. Position is nil for overview-only findings.
 type ValidatedFinding struct {
@@ -51,6 +58,11 @@ type ValidatedFinding struct {
 	Outcome         MapOutcome
 	Fingerprint     string
 	ValidationError string
+
+	// Pass names the pipeline pass that produced the finding; Verification is
+	// the skeptic outcome ("" when no verification ran).
+	Pass         string
+	Verification string
 }
 
 // IsOverview reports whether the finding has no inline anchor.

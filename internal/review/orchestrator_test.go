@@ -30,11 +30,10 @@ func TestEngineReviewPipeline(t *testing.T) {
 		ProjectPath: "group/repo", ProjectID: 1, MRIID: 5,
 		Title: "Add imports", AuthorUsername: "bob", ReviewerUsername: "me",
 		SourceBranch: "feat", TargetBranch: "main",
-		Files:    files,
-		RawDiffs: map[string]string{"main.go": mapDiff},
-		Refs:     testRefs,
-		Memory:   []MemoryRule{{Type: "repo_rule", Title: "Context", Body: "Pass ctx to DB."}},
-		Profile:  DefaultProfile(),
+		Files:   files,
+		Refs:    testRefs,
+		Memory:  []MemoryRule{{Type: "repo_rule", Title: "Context", Body: "Pass ctx to DB."}},
+		Profile: DefaultProfile(),
 	}
 	res, err := eng.Review(t.Context(), in)
 	if err != nil {

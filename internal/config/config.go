@@ -95,6 +95,58 @@ type ReviewConfig struct {
 	IncludeStyle             bool     `yaml:"include_style"`
 	PreferredCommentLanguage string   `yaml:"preferred_comment_language" usage:"ru | en | auto"`
 	IgnoreGlobs              []string `yaml:"ignore_globs" usage:"Globs excluded from context/LLM"`
+
+	Context  ContextConfig  `yaml:"context"`
+	Pipeline PipelineConfig `yaml:"pipeline"`
+	Risk     RiskConfig     `yaml:"risk"`
+	Coverage CoverageConfig `yaml:"coverage"`
+}
+
+// PipelineConfig controls the multi-pass review pipeline.
+type PipelineConfig struct {
+	Mode              string   `yaml:"mode" usage:"cheap | standard | deep | custom"`
+	Passes            []string `yaml:"passes" usage:"custom mode: pass names (general, correctness, concurrency, security, contracts)"`
+	MaxParallel       int      `yaml:"max_parallel" usage:"Concurrent LLM review passes"`
+	VerifyMode        string   `yaml:"verify_mode" usage:"skeptic | reflect | off"`
+	VerifyMaxFindings int      `yaml:"verify_max_findings" usage:"Max findings sent to the skeptic pass"`
+	Verifiers         []string `yaml:"verifiers" usage:"Deterministic checks: go_build, go_vet, py_syntax, tsc, go_test"`
+	Completeness      string   `yaml:"completeness" usage:"on | off | auto (auto: on except cheap mode)"`
+}
+
+// RiskConfig controls the deterministic risk score.
+type RiskConfig struct {
+	Enabled        bool     `yaml:"enabled" usage:"Compute the deterministic risk score"`
+	HistoryCommits int      `yaml:"history_commits" usage:"Mirror commits scanned for churn/bug-fix factors"`
+	SensitiveGlobs []string `yaml:"sensitive_globs" usage:"Paths whose changes raise risk"`
+}
+
+// CoverageConfig controls changed-line test coverage measurement. Running it
+// executes the repository's test code — explicit opt-in.
+type CoverageConfig struct {
+	Enabled   bool          `yaml:"enabled" usage:"Run repo tests to measure changed-line coverage (executes repository code)"`
+	Providers []string      `yaml:"providers" usage:"Coverage providers: go, node"`
+	Timeout   time.Duration `yaml:"timeout" usage:"Per-provider test run timeout"`
+	Node      NodeCoverage  `yaml:"node"`
+}
+
+// NodeCoverage holds node-specific coverage settings.
+type NodeCoverage struct {
+	Install bool `yaml:"install" usage:"Allow dependency install (npm ci / pnpm / yarn) when node_modules is missing (runs lifecycle scripts)"`
+}
+
+// ContextConfig bounds the enrichment context added to review prompts beyond
+// the diffs themselves.
+type ContextConfig struct {
+	IncludeFullFiles   bool `yaml:"include_full_files" usage:"Include changed files' content (full or windowed) in the prompt"`
+	MaxFileLines       int  `yaml:"max_file_lines" usage:"Files longer than this fall back to windows around hunks"`
+	HunkWindowLines    int  `yaml:"hunk_window_lines" usage:"Context lines around each hunk when windowing"`
+	MaxTotalKB         int  `yaml:"max_total_kb" usage:"Total budget (KB) for all enrichment sections"`
+	IncludeCommits     bool `yaml:"include_commits" usage:"Include the MR's commit messages in the prompt"`
+	IncludeDiscussions bool `yaml:"include_discussions" usage:"Include existing discussion content in the prompt"`
+	MaxDiscussionKB    int  `yaml:"max_discussion_kb" usage:"Budget (KB) for the discussions section"`
+	PriorReview        bool `yaml:"prior_review" usage:"On re-review, include the previous review + interdiff"`
+	InterdiffMaxKB     int  `yaml:"interdiff_max_kb" usage:"Budget (KB) for the interdiff section"`
+	RelatedFiles       int  `yaml:"related_files" usage:"Max FTS-suggested related files listed as investigation leads (0 = off)"`
 }
 
 // WatchConfig controls the background daemon.
@@ -175,6 +227,45 @@ func DefaultConfig() *Config {
 			IgnoreGlobs: []string{
 				"vendor/**", "node_modules/**", "dist/**", "build/**",
 				"*.generated.*", "*.pb.go", "*.min.js",
+			},
+			Context: ContextConfig{
+				IncludeFullFiles:   true,
+				MaxFileLines:       500,
+				HunkWindowLines:    60,
+				MaxTotalKB:         256,
+				IncludeCommits:     true,
+				IncludeDiscussions: true,
+				MaxDiscussionKB:    4,
+				PriorReview:        true,
+				InterdiffMaxKB:     32,
+				RelatedFiles:       5,
+			},
+			Pipeline: PipelineConfig{
+				Mode:              "standard",
+				MaxParallel:       2,
+				VerifyMode:        "skeptic",
+				VerifyMaxFindings: 24,
+				Verifiers:         []string{"go_build", "go_vet", "py_syntax"},
+				Completeness:      "auto",
+			},
+			Risk: RiskConfig{
+				Enabled:        true,
+				HistoryCommits: 500,
+				SensitiveGlobs: []string{
+					"**/auth/**", "**/crypto/**", "**/security/**",
+					"**/migrations/**", "**/*.sql",
+					".gitlab-ci.yml", ".github/**", "Dockerfile*",
+					"go.mod", "go.sum", "package.json", "requirements*.txt", "pyproject.toml",
+					// Explicit lockfile names — a "*lock*" glob would also match
+					// ordinary files like block.go or clock.ts.
+					"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+					"Cargo.lock", "Gemfile.lock", "poetry.lock", "composer.lock",
+				},
+			},
+			Coverage: CoverageConfig{
+				Enabled:   false, // executes repository test code — explicit opt-in
+				Providers: []string{"go", "node"},
+				Timeout:   5 * time.Minute,
 			},
 		},
 		Watch: WatchConfig{
@@ -265,6 +356,30 @@ func (c *Config) Validate() error {
 	case "", "en", "ru", "auto":
 	default:
 		return fmt.Errorf("review.preferred_comment_language must be en, ru, or auto, got %q", c.Review.PreferredCommentLanguage)
+	}
+	if c.Review.Context.MaxFileLines < 0 || c.Review.Context.HunkWindowLines < 0 || c.Review.Context.MaxTotalKB < 0 {
+		return fmt.Errorf("review.context sizes must not be negative")
+	}
+	switch c.Review.Pipeline.Mode {
+	case "", "cheap", "standard", "deep", "custom":
+	default:
+		return fmt.Errorf("review.pipeline.mode must be cheap, standard, deep, or custom, got %q", c.Review.Pipeline.Mode)
+	}
+	switch c.Review.Pipeline.VerifyMode {
+	case "", "skeptic", "reflect", "off":
+	default:
+		return fmt.Errorf("review.pipeline.verify_mode must be skeptic, reflect, or off, got %q", c.Review.Pipeline.VerifyMode)
+	}
+	switch c.Review.Pipeline.Completeness {
+	case "", "on", "off", "auto":
+	default:
+		return fmt.Errorf("review.pipeline.completeness must be on, off, or auto, got %q", c.Review.Pipeline.Completeness)
+	}
+	if c.Review.Risk.HistoryCommits < 0 {
+		return fmt.Errorf("review.risk.history_commits must not be negative")
+	}
+	if c.Review.Coverage.Timeout < 0 {
+		return fmt.Errorf("review.coverage.timeout must not be negative")
 	}
 	if c.Storage.DBPath == "" {
 		return fmt.Errorf("storage.db_path must not be empty")

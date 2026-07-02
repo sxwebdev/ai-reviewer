@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 )
@@ -187,17 +186,8 @@ func claudeErrHint(detail string) string {
 	}
 }
 
-// truncate shortens s to at most n bytes (rune-safe) for error messages.
-func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n] + "…"
-}
+// truncate shortens s for error messages (single shared implementation).
+func truncate(s string, n int) string { return security.Truncate(s, n) }
 
 // pickJSON returns the strict JSON payload: structured_output if present, else
 // the first balanced object extracted from the result text.
@@ -208,20 +198,21 @@ func pickJSON(env *claudeEnvelope) (string, error) {
 	return ExtractJSONObject(env.Result)
 }
 
-// CompleteJSON runs the request and unmarshals strict JSON into out.
-func (c *ClaudeCLI) CompleteJSON(ctx context.Context, req Request, out any) error {
+// CompleteJSON runs the request, unmarshals strict JSON into out, and returns
+// the call's cost in USD so callers can account for verification/audit spend.
+func (c *ClaudeCLI) CompleteJSON(ctx context.Context, req Request, out any) (float64, error) {
 	env, err := c.invoke(ctx, req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	jsonStr, err := pickJSON(env)
 	if err != nil {
-		return fmt.Errorf("extract JSON from claude output: %w", err)
+		return env.TotalCostUSD, fmt.Errorf("extract JSON from claude output: %w", err)
 	}
 	if err := json.Unmarshal([]byte(jsonStr), out); err != nil {
-		return fmt.Errorf("unmarshal claude JSON: %w", err)
+		return env.TotalCostUSD, fmt.Errorf("unmarshal claude JSON: %w", err)
 	}
-	return nil
+	return env.TotalCostUSD, nil
 }
 
 // Review runs a review with the strict schema and returns the parsed response.

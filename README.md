@@ -114,25 +114,50 @@ changes. Cost shows as "unavailable" on subscription/OAuth auth.
 ## How it works
 
 1. **Sync** — `GET /merge_requests?scope=reviews_for_me&state=opened` → SQLite.
-2. **Context** — fetch MR metadata, diffs, versions (base/head/start SHAs),
-   discussions, pipeline; parse unified diffs; load relevant review memory.
+2. **Context** — fetch MR metadata, diffs (rendered with explicit line numbers),
+   commit messages, discussion content, pipeline status; include changed files'
+   full content (budgeted), review memory, and — on re-review — the previous
+   review's findings, their dispositions, and the interdiff since the last
+   reviewed head.
 3. **Agent mode (optional)** — mirror-clone the repo and check out a read-only
    worktree at the head sha (indexed into SQLite FTS5) so the LLM can inspect
-   surrounding code. Falls back to diff-only on any failure.
-4. **LLM review** — a strict-JSON review (`claude --output-format json
---json-schema …`), then optional self-reflection to prune weak findings.
-5. **Validate (Go owns this)** — schema, file-in-diff, line→position mapping,
-   severity threshold, dedupe, secret scrub, max-comments cap, ranking, and
-   compile-claim verification (a finding that says the code doesn't build is
-   dropped if `go build` shows the package actually compiles).
-6. **Approve → draft → publish** — your decisions, then GitLab draft notes, then
+   surrounding code; the prompt mandates an investigation protocol (read full
+   files, grep callers of changed symbols) and lists FTS-suggested related
+   files. Falls back to diff-only on any failure.
+4. **Multi-pass LLM review** — configurable pipeline (`review.pipeline.mode`:
+   `cheap`/`standard`/`deep`/`custom`): specialist passes (general,
+   correctness, concurrency, security, cross-file contracts) run concurrently
+   as strict-JSON reviews (`claude --output-format json --json-schema …`) and
+   merge with cross-pass dedupe.
+5. **Verify** — a skeptic pass re-reads the actual code and tries to REFUTE
+   each finding (refuted → dropped, uncertain → demoted; blocking findings are
+   never silently dropped), then deterministic verifiers run: `go build`
+   refutes false "does not compile" claims, `go vet` corroborates
+   correctness/concurrency findings, `go test` (opt-in) flags already-failing
+   packages.
+6. **Validate (Go owns this)** — schema, file-in-diff, line→position mapping,
+   severity threshold, dedupe, secret scrub, max-comments cap, ranking.
+7. **Quality reports** (alongside findings): a deterministic risk score
+   computed from git history and diff stats (churn, bug-magnet files,
+   sensitive paths, no-tests-touched, new dependencies); an acceptance-criteria
+   audit comparing the MR's stated intent (description + commits) against the
+   actual diff (done/partial/missing per criterion); and — opt-in — measured
+   test coverage of the changed lines (runs the repo's own go test /
+   vitest / jest, monorepo-aware, and lists added lines no test executes).
+8. **Approve → draft → publish** — your decisions, then GitLab draft notes, then
    an explicitly-confirmed publish.
 
 ## Configuration
 
 `~/.ai-reviewer/config.yaml` (created by `init`). Any field can be overridden by
-`AI_REVIEWER_<PATH>` env vars. Key sections: `app`, `gitlab`, `llm`, `review`,
-`watch`, `index`, `storage`. See the generated file for the full, commented set.
+`AI_REVIEWER_<PATH>` env vars. Key sections: `app`, `gitlab`, `llm`, `review`
+(including `review.pipeline` for pass/verification modes and `review.context`
+for prompt-context budgets), `watch`, `index`, `storage`. See the generated
+file for the full, commented set.
+
+Cost/depth presets (`review.pipeline.mode`): `cheap` ≈ 1 LLM call, `standard`
+(default) ≈ 3, `deep` ≈ 6 — pick `deep` when catching real bugs matters more
+than tokens.
 
 ## Review memory & reviewer profile
 

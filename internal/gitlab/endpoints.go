@@ -16,7 +16,9 @@ type API interface {
 	ListMRDiffs(ctx context.Context, projectKey string, iid int64) ([]MergeRequestDiff, error)
 	ListMRVersions(ctx context.Context, projectKey string, iid int64) ([]MergeRequestVersion, error)
 	ListMRDiscussions(ctx context.Context, projectKey string, iid int64) ([]Discussion, error)
+	ListMRCommits(ctx context.Context, projectKey string, iid int64) ([]Commit, error)
 	ListMRPipelines(ctx context.Context, projectKey string, iid int64) ([]Pipeline, error)
+	GetRawFile(ctx context.Context, projectKey, filePath, ref string) ([]byte, error)
 	CreateDraftNote(ctx context.Context, projectKey string, iid int64, note string, pos *Position) (*DraftNote, error)
 	ListDraftNotes(ctx context.Context, projectKey string, iid int64) ([]DraftNote, error)
 	PublishDraftNote(ctx context.Context, projectKey string, iid, draftID int64) error
@@ -81,7 +83,24 @@ func (c *Client) ListMRDiscussions(ctx context.Context, projectKey string, iid i
 	return getList[Discussion](ctx, c, mrPath(projectKey, iid, "/discussions"), nil)
 }
 
+// ListMRCommits lists the commits of an MR (newest first, per the API).
+func (c *Client) ListMRCommits(ctx context.Context, projectKey string, iid int64) ([]Commit, error) {
+	return getList[Commit](ctx, c, mrPath(projectKey, iid, "/commits"), nil)
+}
+
 // ListMRPipelines lists pipelines for an MR.
 func (c *Client) ListMRPipelines(ctx context.Context, projectKey string, iid int64) ([]Pipeline, error) {
 	return getList[Pipeline](ctx, c, mrPath(projectKey, iid, "/pipelines"), nil)
+}
+
+// GetRawFile fetches a repository file's raw content at ref.
+func (c *Client) GetRawFile(ctx context.Context, projectKey, filePath, ref string) ([]byte, error) {
+	q := url.Values{}
+	q.Set("ref", ref)
+	path := fmt.Sprintf("/projects/%s/repository/files/%s/raw", projectKey, url.PathEscape(filePath))
+	resp, err := c.doRaw(ctx, "GET", path, q, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.body, nil
 }

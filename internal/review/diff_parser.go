@@ -51,6 +51,29 @@ type FileDiff struct {
 	Hunks    []Hunk
 }
 
+// Path returns the file's canonical path: the new path, falling back to the
+// old one for deletions.
+func (f *FileDiff) Path() string {
+	if f.NewPath != "" {
+		return f.NewPath
+	}
+	return f.OldPath
+}
+
+// AddedLines returns the new-side line numbers of every added line in the
+// diff, in order.
+func AddedLines(f *FileDiff) []int {
+	var out []int
+	for _, h := range f.Hunks {
+		for _, l := range h.Lines {
+			if l.Kind == LineAdded {
+				out = append(out, l.NewLine)
+			}
+		}
+	}
+	return out
+}
+
 // IsBinaryDiff reports whether a raw diff body describes a binary change.
 func IsBinaryDiff(diff string) bool {
 	return strings.Contains(diff, "Binary files ") || strings.Contains(diff, "GIT binary patch")

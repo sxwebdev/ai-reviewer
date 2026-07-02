@@ -141,6 +141,9 @@ func (a *App) ReviewOnce(ctx context.Context, ref string) error {
 		AgentMode:        false, // repo worktree not yet wired (build step 7)
 		AllowedTools:     a.Cfg.LLM.Claude.AllowedTools,
 		Profile:          profileFromConfig(a.Cfg.Review),
+		Context:          contextBudgetFromConfig(a.Cfg.Review),
+		Pipeline:         pipelineFromConfig(a.Cfg.Review),
+		Risk:             riskSettingsFromConfig(a.Cfg.Review),
 	}, a.Log)
 
 	reviewID, err := svc.RunReview(ctx, mrRef)
