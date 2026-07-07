@@ -146,39 +146,158 @@ func TestApplySetupEnvTokenNotPersisted(t *testing.T) {
 	}
 }
 
-func TestApplySettingsValidatesAndSwaps(t *testing.T) {
+func TestApplyConfigValidatesAndSwaps(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	a := newTestApp(t)
 	if _, err := a.Services(); err != nil {
 		t.Fatal(err)
 	}
+	apply := func(v map[string]string) error { _, err := a.ApplyConfig(t.Context(), v); return err }
 
-	if err := a.ApplySettings(t.Context(), map[string]string{"review.pipeline.mode": "bogus"}); err == nil {
+	if apply(map[string]string{"review.pipeline.mode": "bogus"}) == nil {
 		t.Error("bogus pipeline mode accepted")
 	}
-	if err := a.ApplySettings(t.Context(), map[string]string{"llm.model": "not-a-choice"}); err == nil {
+	if apply(map[string]string{"llm.model": "not-a-choice"}) == nil {
 		t.Error("model outside modelChoices accepted")
 	}
-	if err := a.ApplySettings(t.Context(), map[string]string{"gitlab.token": "nope"}); err == nil {
-		t.Error("non-whitelisted key accepted")
+	if apply(map[string]string{"review.max_comments": "notanumber"}) == nil {
+		t.Error("non-numeric int accepted")
+	}
+	if apply(map[string]string{"totally.unknown.key": "x"}) == nil {
+		t.Error("unknown key accepted")
 	}
 
 	old := a.Bundle()
-	if err := a.ApplySettings(t.Context(), map[string]string{
+	res, err := a.ApplyConfig(t.Context(), map[string]string{
 		"review.pipeline.mode": "deep",
 		"llm.model":            "claude-opus-4-8",
-	}); err != nil {
-		t.Fatalf("ApplySettings: %v", err)
+		"review.max_comments":  "20",
+	})
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if res.RestartRequired {
+		t.Error("no restart-required field was changed")
 	}
 	cfg := a.Config()
-	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "claude-opus-4-8" {
-		t.Errorf("settings not applied: mode %q model %q", cfg.Review.Pipeline.Mode, cfg.LLM.Model)
+	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "claude-opus-4-8" || cfg.Review.MaxComments != 20 {
+		t.Errorf("settings not applied: mode %q model %q max %d", cfg.Review.Pipeline.Mode, cfg.LLM.Model, cfg.Review.MaxComments)
 	}
 	if a.Bundle() == old {
 		t.Error("bundle was not rebuilt")
 	}
 	if a.uiConfig().PipelineMode != "deep" || a.uiConfig().LLMModel != "claude-opus-4-8" {
 		t.Errorf("uiConfig stale: %+v", a.uiConfig())
+	}
+}
+
+// TestApplyConfigList applies a list-valued field and confirms it round-trips
+// through the file and reload as a real YAML sequence.
+func TestApplyConfigList(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	a := newTestApp(t)
+	if _, err := a.Services(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{
+		"review.ignore_globs": "foo/**\nbar/**\n\n  baz/**  ",
+	}); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	got := a.Config().Review.IgnoreGlobs
+	want := []string{"foo/**", "bar/**", "baz/**"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("ignore_globs = %v, want %v", got, want)
+	}
+}
+
+// TestApplyConfigDurationNoFalseShadow: a non-normalized duration input
+// ("60s") must not be mistaken for env-shadowing after it reloads as "1m0s".
+func TestApplyConfigDurationNoFalseShadow(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	a := newTestApp(t)
+	if _, err := a.Services(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.ApplyConfig(t.Context(), map[string]string{"gitlab.timeout": "60s"})
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if res.Warning != "" {
+		t.Errorf("false env-shadow warning: %q", res.Warning)
+	}
+	if a.Config().GitLab.Timeout.String() != "1m0s" {
+		t.Errorf("timeout = %s, want 1m0s", a.Config().GitLab.Timeout)
+	}
+}
+
+// TestApplyConfigCustomModeRequiresPasses: mode=custom with no passes is
+// rejected (it would silently degrade to a single general pass), but custom +
+// passes submitted together is accepted.
+func TestApplyConfigCustomModeRequiresPasses(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	a := newTestApp(t)
+	if _, err := a.Services(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{"review.pipeline.mode": "custom"}); err == nil {
+		t.Error("custom mode with no passes accepted")
+	}
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{
+		"review.pipeline.mode":   "custom",
+		"review.pipeline.passes": "general\ncorrectness",
+	}); err != nil {
+		t.Fatalf("custom + passes rejected: %v", err)
+	}
+	if got := a.Config().Review.Pipeline.Mode; got != "custom" {
+		t.Errorf("mode = %q, want custom", got)
+	}
+}
+
+// TestApplyConfigSkipsUnchangedPreservesComments: a section save resubmits every
+// field, but only changed values are written — so an unchanged field keeps its
+// inline documentation comment (regression guard for comment stripping).
+func TestApplyConfigSkipsUnchangedPreservesComments(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	a := newTestApp(t)
+	if _, err := a.Services(); err != nil {
+		t.Fatal(err)
+	}
+	// auto_publish=false is the current value (unchanged); max_comments changes.
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{
+		"review.auto_publish": "false",
+		"review.max_comments": "7",
+	}); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	raw, err := os.ReadFile(a.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "# DANGER: keep false") {
+		t.Error("inline comment on unchanged auto_publish was stripped")
+	}
+	if !strings.Contains(string(raw), "max_comments: 7") {
+		t.Error("changed max_comments not written")
+	}
+	if a.Config().Review.MaxComments != 7 {
+		t.Errorf("max_comments = %d, want 7", a.Config().Review.MaxComments)
+	}
+}
+
+// TestApplyConfigRestartFlag: changing a restart-required field reports it.
+func TestApplyConfigRestartFlag(t *testing.T) {
+	t.Setenv("GITLAB_TOKEN", "")
+	a := newTestApp(t)
+	if _, err := a.Services(); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.ApplyConfig(t.Context(), map[string]string{"app.port": "8123"})
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if !res.RestartRequired {
+		t.Error("app.port change should flag restart required")
 	}
 }
 
@@ -209,7 +328,7 @@ func TestHotApplyRace(t *testing.T) {
 	}
 	modes := []string{"cheap", "deep", "standard"}
 	for i := range 6 {
-		if err := a.ApplySettings(t.Context(), map[string]string{"review.pipeline.mode": modes[i%3]}); err != nil {
+		if _, err := a.ApplyConfig(t.Context(), map[string]string{"review.pipeline.mode": modes[i%3]}); err != nil {
 			t.Errorf("apply %d: %v", i, err)
 		}
 	}
@@ -217,10 +336,10 @@ func TestHotApplyRace(t *testing.T) {
 	wg.Wait()
 }
 
-// TestApplySettingsEnvShadow: an AI_REVIEWER_* env var overrides the value the
-// user just applied — the apply must return an error naming the variable
-// instead of reporting success for a setting that did not take effect.
-func TestApplySettingsEnvShadow(t *testing.T) {
+// TestApplyConfigEnvShadow: an AI_REVIEWER_* env var overrides the value the
+// user just applied — the apply must surface a warning naming the variable
+// (not report plain success) while still persisting the choice to the file.
+func TestApplyConfigEnvShadow(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	t.Setenv("AI_REVIEWER_LLM_MODEL", "claude-sonnet-5")
 	a := newTestApp(t)
@@ -228,12 +347,12 @@ func TestApplySettingsEnvShadow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := a.ApplySettings(t.Context(), map[string]string{"llm.model": "claude-opus-4-8"})
-	if err == nil {
-		t.Fatal("expected env-shadow error, got nil")
+	res, err := a.ApplyConfig(t.Context(), map[string]string{"llm.model": "claude-opus-4-8"})
+	if err != nil {
+		t.Fatalf("env-shadow should be a warning, not an error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "AI_REVIEWER_LLM_MODEL") {
-		t.Errorf("error does not name the shadowing env var: %v", err)
+	if !strings.Contains(res.Warning, "AI_REVIEWER_LLM_MODEL") {
+		t.Errorf("warning does not name the shadowing env var: %q", res.Warning)
 	}
 	// The runtime stays consistent with the environment, not the form value.
 	if got := a.Config().LLM.Model; got != "claude-sonnet-5" {
@@ -262,8 +381,8 @@ func TestOverridesSurviveReload(t *testing.T) {
 		t.Fatalf("override not applied immediately: port = %d", got)
 	}
 
-	if err := a.ApplySettings(t.Context(), map[string]string{"review.pipeline.mode": "deep"}); err != nil {
-		t.Fatalf("ApplySettings: %v", err)
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{"review.pipeline.mode": "deep"}); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
 	}
 	if got := a.Config().App.Port; got != 12345 {
 		t.Errorf("override lost after reload: port = %d", got)
@@ -273,9 +392,10 @@ func TestOverridesSurviveReload(t *testing.T) {
 	}
 }
 
-// TestApplySettingsFailureKeepsRuntime: when the rebuild fails nothing may be
-// swapped — old config and old bundle stay live.
-func TestApplySettingsFailureKeepsRuntime(t *testing.T) {
+// TestApplyConfigFailureKeepsRuntimeAndRollsBack: when the reload fails nothing
+// may be swapped — old config and old bundle stay live — and the config file is
+// rolled back to its prior contents so no broken value lingers on disk.
+func TestApplyConfigFailureKeepsRuntimeAndRollsBack(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
 	a := newTestApp(t)
 	if _, err := a.Services(); err != nil {
@@ -283,12 +403,15 @@ func TestApplySettingsFailureKeepsRuntime(t *testing.T) {
 	}
 	oldBundle := a.Bundle()
 	oldMode := a.Config().Review.Pipeline.Mode
+	before, err := os.ReadFile(a.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Make the reload's Validate fail: PatchFile would fix any YAML we poison,
-	// so break the merged config via an env override instead.
+	// Make the reload's Validate fail: per-field validation passes for a valid
+	// mode, so break the *merged* config via an env override the reload picks up.
 	t.Setenv("AI_REVIEWER_REVIEW_SEVERITY_THRESHOLD", "not-a-severity")
-	err := a.ApplySettings(t.Context(), map[string]string{"review.pipeline.mode": "deep"})
-	if err == nil {
+	if _, err := a.ApplyConfig(t.Context(), map[string]string{"review.pipeline.mode": "deep"}); err == nil {
 		t.Fatal("expected reload failure")
 	}
 	if a.Bundle() != oldBundle {
@@ -296,6 +419,13 @@ func TestApplySettingsFailureKeepsRuntime(t *testing.T) {
 	}
 	if got := a.Config().Review.Pipeline.Mode; got != oldMode {
 		t.Errorf("config swapped despite failed reload: mode = %q", got)
+	}
+	after, err := os.ReadFile(a.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("config file not rolled back after failed apply:\n--- before ---\n%s\n--- after ---\n%s", before, after)
 	}
 }
 

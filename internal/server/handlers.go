@@ -216,7 +216,14 @@ type memoryVM struct {
 
 type settingsVM struct {
 	baseVM
-	Cfg UIConfig
+	Settings SettingsView
+}
+
+// applyResultVM feeds the settings-apply-result fragment (htmx banner).
+type applyResultVM struct {
+	OK      bool
+	Kind    string // ok|warn|err
+	Message string
 }
 
 func (s *Server) base(w http.ResponseWriter, r *http.Request) baseVM {
@@ -741,7 +748,11 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	s.render(w, "settings", settingsVM{baseVM: s.baseActive(w, r, "settings"), Cfg: s.ui()})
+	var sv SettingsView
+	if s.deps.SettingsView != nil {
+		sv = s.deps.SettingsView()
+	}
+	s.render(w, "settings", settingsVM{baseVM: s.baseActive(w, r, "settings"), Settings: sv})
 }
 
 // ---- setup gate + header switches ----
@@ -822,31 +833,82 @@ func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// handleApplySettings persists a header switch (review depth / model) and
-// hot-applies it. Only whitelisted form fields are mapped to config keys; the
-// app layer validates the values.
+// handleApplySettings persists config changes and hot-applies them. It serves
+// two callers: the header switches (plain form POST, named pipeline_mode /
+// llm_model / agent_mode) and the Settings form (htmx POST, fields namespaced
+// "cfg:<dotted.key>"). Unknown keys are rejected by the app layer, which also
+// validates every value before writing the file.
 func (s *Server) handleApplySettings(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
 	values := map[string]string{}
-	if v := strings.TrimSpace(r.FormValue("pipeline_mode")); v != "" {
-		values["review.pipeline.mode"] = v
+	// Settings-page fields carry a "cfg:" prefix to distinguish config keys from
+	// buttons/other form state without the server needing the schema.
+	for name, vals := range r.Form {
+		if k, ok := strings.CutPrefix(name, "cfg:"); ok && len(vals) > 0 {
+			values[k] = vals[0]
+		}
 	}
-	if v := strings.TrimSpace(r.FormValue("llm_model")); v != "" {
-		values["llm.model"] = v
+	// Legacy header-switch field names → their config keys.
+	for form, key := range map[string]string{
+		"pipeline_mode": "review.pipeline.mode",
+		"llm_model":     "llm.model",
+		"agent_mode":    "review.agent_mode",
+	} {
+		if v := strings.TrimSpace(r.Form.Get(form)); v != "" {
+			values[key] = v
+		}
 	}
-	if v := strings.TrimSpace(r.FormValue("agent_mode")); v != "" {
-		values["review.agent_mode"] = v
-	}
+
+	hx := isHX(r)
 	if len(values) == 0 {
+		if hx {
+			s.renderApplyResult(w, applyResultVM{Kind: "warn", Message: "Nothing to apply."})
+			return
+		}
 		setFlash(w, "err", "Nothing to apply.")
 		redirectBack(w, r)
 		return
 	}
-	if err := s.deps.ApplySettings(r.Context(), values); err != nil {
-		setFlash(w, "err", "Could not apply settings: "+err.Error())
+
+	var (
+		res ApplyResult
+		err error
+	)
+	if s.deps.ApplyConfig != nil {
+		res, err = s.deps.ApplyConfig(r.Context(), values)
 	} else {
+		err = errors.New("configuration editing is unavailable")
+	}
+
+	if hx {
+		switch {
+		case err != nil:
+			s.renderApplyResult(w, applyResultVM{Kind: "err", Message: "Could not save: " + err.Error()})
+		case res.Warning != "":
+			s.renderApplyResult(w, applyResultVM{OK: true, Kind: "warn", Message: res.Warning})
+		case res.RestartRequired:
+			s.renderApplyResult(w, applyResultVM{OK: true, Kind: "warn", Message: "Saved. Restart ai-reviewer for these changes to take effect."})
+		default:
+			s.renderApplyResult(w, applyResultVM{OK: true, Kind: "ok", Message: "Saved."})
+		}
+		return
+	}
+
+	// Non-htmx path (header switches): flash + redirect back.
+	switch {
+	case err != nil:
+		setFlash(w, "err", "Could not apply settings: "+err.Error())
+	case res.Warning != "":
+		setFlash(w, "warn", res.Warning)
+	default:
 		setFlash(w, "ok", "Settings applied.")
 	}
 	redirectBack(w, r)
+}
+
+// renderApplyResult writes the settings-apply-result fragment (htmx banner).
+func (s *Server) renderApplyResult(w http.ResponseWriter, vm applyResultVM) {
+	s.renderPartial(w, "settings", "settings-apply-result", vm)
 }
 
 type healthVM struct{ Checks []HealthCheck }

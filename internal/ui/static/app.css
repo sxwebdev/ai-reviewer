@@ -427,3 +427,20 @@ kbd { display: inline-block; min-width: 1.2em; text-align: center; padding: 1px 
 .setup-actions { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-4); }
 .claude-check { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .claude-check__detail { font-size: var(--fs-xs); color: var(--fg-muted); overflow-wrap: anywhere; }
+
+/* ---- Settings: editable config form ---- */
+.badge--danger { color: var(--bad); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 35%, var(--border-2)); }
+.settings-section { margin-bottom: var(--sp-4); }
+.settings-grid { display: grid; gap: var(--sp-3); }
+.setting-row { display: grid; grid-template-columns: 220px 1fr; gap: var(--sp-3); align-items: start; }
+.setting-label { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 7px; font-size: var(--fs-sm); font-weight: 550; }
+.setting-name { overflow-wrap: anywhere; }
+.setting-input { min-width: 0; }
+.setting-input .input { width: 100%; }
+.setting-help { margin: 4px 0 0; }
+.settings-result:empty { display: none; }
+.settings-result { margin-top: var(--sp-3); }
+@media (max-width: 640px) {
+  .setting-row { grid-template-columns: 1fr; gap: 4px; }
+  .setting-label { padding-top: 0; }
+}

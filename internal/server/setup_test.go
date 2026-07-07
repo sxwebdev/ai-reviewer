@@ -242,27 +242,102 @@ func TestSetupSubmitEnvTokenAllowed(t *testing.T) {
 	}
 }
 
-func TestApplySettings(t *testing.T) {
+func TestApplyConfigHeaderSwitch(t *testing.T) {
 	t.Parallel()
 	var got map[string]string
 	deps := gatedDeps()
 	deps.NeedsSetup = func() bool { return false }
-	deps.ApplySettings = func(_ context.Context, values map[string]string) error {
+	deps.ApplyConfig = func(_ context.Context, values map[string]string) (ApplyResult, error) {
 		got = values
-		return nil
+		return ApplyResult{}, nil
 	}
 	_, h := newTestServer(t, deps)
 
+	// Header switch: plain form POST → redirect.
 	w := doReq(h, http.MethodPost, "/settings/apply", url.Values{"pipeline_mode": {"deep"}}, false)
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("POST /settings/apply = %d, want 303", w.Code)
 	}
 	if got["review.pipeline.mode"] != "deep" || len(got) != 1 {
-		t.Errorf("ApplySettings got %v", got)
+		t.Errorf("header-switch apply got %v", got)
 	}
 
 	w = doReq(h, http.MethodPost, "/settings/apply", url.Values{"llm_model": {"opus"}}, false)
 	if w.Code != http.StatusSeeOther || got["llm.model"] != "opus" {
 		t.Errorf("model apply: code %d, got %v", w.Code, got)
+	}
+}
+
+func TestSettingsPageRenders(t *testing.T) {
+	t.Parallel()
+	deps := gatedDeps()
+	deps.NeedsSetup = func() bool { return false }
+	deps.UI = func() UIConfig { return UIConfig{} }
+	deps.SettingsView = func() SettingsView {
+		return SettingsView{Sections: []SettingsSection{{
+			Name:      "Review",
+			HasDanger: true,
+			Fields: []SettingsFieldView{
+				{Key: "review.max_comments", Label: "Max comments", Kind: "int", Value: "12", Help: "cap"},
+				{Key: "review.severity_threshold", Label: "Severity", Kind: "select", Value: "medium", Options: []string{"low", "medium", "high"}},
+				{Key: "review.auto_publish", Label: "Auto publish", Kind: "bool", Value: "false", Danger: true},
+				{Key: "review.ignore_globs", Label: "Ignore globs", Kind: "list", Value: "a/**\nb/**"},
+				{Key: "gitlab.token", Label: "Token", Kind: "password", Secret: true},
+			},
+		}}}
+	}
+	_, h := newTestServer(t, deps)
+
+	w := doReq(h, http.MethodGet, "/settings", nil, false)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /settings = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		`name="cfg:review.max_comments"`,
+		`name="cfg:review.severity_threshold"`,
+		`name="cfg:review.auto_publish"`,
+		`name="cfg:review.ignore_globs"`,
+		`name="cfg:gitlab.token"`,
+		`badge--danger`, // danger field badge
+		"a/**\nb/**",    // list textarea value
+		`hx-confirm=`,   // danger section confirm guard (htmx-native, not a bypassable onsubmit)
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("settings page missing %q", want)
+		}
+	}
+}
+
+func TestApplyConfigSettingsFormHX(t *testing.T) {
+	t.Parallel()
+	var got map[string]string
+	deps := gatedDeps()
+	deps.NeedsSetup = func() bool { return false }
+	deps.ApplyConfig = func(_ context.Context, values map[string]string) (ApplyResult, error) {
+		got = values
+		return ApplyResult{RestartRequired: true}, nil
+	}
+	deps.SettingsView = func() SettingsView { return SettingsView{} }
+	_, h := newTestServer(t, deps)
+
+	// Settings form: cfg:-prefixed fields, htmx request → inline banner fragment.
+	form := url.Values{
+		"cfg:review.max_comments": {"20"},
+		"cfg:review.ignore_globs": {"a/**\nb/**"},
+		"ignore-me":               {"button"},
+	}
+	w := doReq(h, http.MethodPost, "/settings/apply", form, true)
+	if w.Code != http.StatusOK {
+		t.Fatalf("hx apply = %d, want 200", w.Code)
+	}
+	if got["review.max_comments"] != "20" || got["review.ignore_globs"] != "a/**\nb/**" {
+		t.Errorf("settings-form apply got %v", got)
+	}
+	if _, ok := got["ignore-me"]; ok {
+		t.Error("non cfg: field leaked into apply values")
+	}
+	if !strings.Contains(w.Body.String(), "Restart") {
+		t.Errorf("restart-required banner missing: %s", w.Body.String())
 	}
 }

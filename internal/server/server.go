@@ -47,6 +47,41 @@ type ModelChoice struct {
 	Label string
 }
 
+// SettingsView is the full editable-config form model for the Settings page:
+// sections in display order, each with its fields' current values and metadata.
+type SettingsView struct {
+	Sections []SettingsSection
+}
+
+// SettingsSection groups related config fields under one card.
+type SettingsSection struct {
+	Name      string
+	Fields    []SettingsFieldView
+	HasDanger bool // any field is safety-sensitive → confirm before saving the section
+}
+
+// SettingsFieldView is one rendered config field: its current value plus the
+// metadata the template needs to pick a widget and show badges.
+type SettingsFieldView struct {
+	Key         string
+	Label       string
+	Help        string
+	Kind        string // text|password|bool|int|duration|select|list
+	Value       string
+	Options     []string
+	Danger      bool
+	Restart     bool
+	Secret      bool
+	EnvName     string
+	EnvShadowed bool // an AI_REVIEWER_* variable overrides this key (file edits won't apply)
+}
+
+// ApplyResult reports the outcome of a settings apply for the UI banner.
+type ApplyResult struct {
+	RestartRequired bool   // at least one saved field takes effect only on restart
+	Warning         string // non-fatal notice (e.g. an env var shadows a saved value)
+}
+
 // SetupStatus feeds the setup page: current prefills and environment checks.
 type SetupStatus struct {
 	Host         string
@@ -90,9 +125,12 @@ type Deps struct {
 	// ApplySetup persists the GitLab settings and rebuilds services in-process.
 	// An empty token keeps the env-provided one (never written to disk).
 	ApplySetup func(ctx context.Context, host, username, token string) error
-	// ApplySettings persists whitelisted config keys (header switches) and
-	// rebuilds services in-process.
-	ApplySettings func(ctx context.Context, values map[string]string) error
+	// ApplyConfig persists any schema-known config keys (the header switches and
+	// the full Settings form) and rebuilds services in-process. Values are
+	// validated before the file is written.
+	ApplyConfig func(ctx context.Context, values map[string]string) (ApplyResult, error)
+	// SettingsView returns the editable-config form model for the Settings page.
+	SettingsView func() SettingsView
 }
 
 // Server is the local web UI.
