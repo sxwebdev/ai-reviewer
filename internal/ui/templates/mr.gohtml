@@ -11,7 +11,7 @@
 <div class="card" x-data="{ open: false }">
   <form method="post" action="/mr/{{.MR.ID}}/review">
     <div class="row">
-      <button class="btn btn--primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
+      <button class="btn btn--primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else if .HeadChanged}}Re-review (new commits){{else}}Run review{{end}}</button>
       <button class="btn btn--ghost btn--sm" type="button" @click="open = !open" :aria-expanded="open">
         <span x-text="open ? 'Hide context & skills' : 'Add context & skills'"></span>
       </button>
@@ -75,6 +75,32 @@
 
   {{if .ActionError}}<div class="alert alert--danger" role="alert"><div class="alert__body">{{.ActionError}}</div></div>{{end}}
   {{if .Historical}}<div class="alert alert--warn"><div class="alert__body">Viewing an earlier review (head {{shortSHA .Review.HeadSHA}}). <a href="/mr/{{.MR.ID}}">View the latest review →</a></div></div>{{end}}
+
+  {{if and .HeadChanged (not .Historical) (not .Running)}}
+  <div class="alert alert--warn" role="status">
+    <div class="alert__body">
+      {{if .HistoryRewrote}}
+      <strong>History changed since this review.</strong>
+      <p class="small" style="margin:.25rem 0 0">The reviewed head <span class="mono">{{shortSHA .Review.HeadSHA}}</span> is no longer in the MR — current head is <span class="mono">{{shortSHA .MR.HeadSHA}}</span>. Re-review to check the current state.</p>
+      {{else if .HeadAdvanced}}
+      <strong>The MR head advanced past this review.</strong>
+      <span class="muted small">reviewed <span class="mono">{{shortSHA .Review.HeadSHA}}</span> → current <span class="mono">{{shortSHA .MR.HeadSHA}}</span></span>
+      {{else}}
+      <strong>{{.NewCommitsN}} new commit{{if ne .NewCommitsN 1}}s{{end}} since this review</strong>
+      <span class="muted small">reviewed <span class="mono">{{shortSHA .Review.HeadSHA}}</span> → current <span class="mono">{{shortSHA .MR.HeadSHA}}</span></span>
+      {{if .NewCommits}}
+      <ul class="new-commits">
+        {{range .NewCommits}}<li><span class="mono muted">{{.ShortSHA}}</span> {{.Title}}</li>{{end}}
+      </ul>
+      {{if gt .NewCommitsN (len .NewCommits)}}<p class="muted small" style="margin:.25rem 0 0">showing the {{len .NewCommits}} most recent of {{.NewCommitsN}}</p>{{end}}
+      {{end}}
+      {{end}}
+      <form method="post" action="/mr/{{.MR.ID}}/review" style="margin-top:.5rem">
+        <button class="btn btn--primary">Re-review</button>
+      </form>
+    </div>
+  </div>
+  {{end}}
 
   {{if .Running}}
   <div class="card" role="status">

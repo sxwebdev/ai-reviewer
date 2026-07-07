@@ -55,7 +55,7 @@ func (d dashItem) Status() string {
 	case d.Current():
 		return "reviewed"
 	default:
-		return "head changed"
+		return "new commits"
 	}
 }
 
@@ -68,7 +68,7 @@ func (d dashItem) StatusClass() string {
 		return "running"
 	case "failed":
 		return "failed"
-	case "head changed":
+	case "new commits":
 		return "warn"
 	default:
 		return "none"
@@ -141,7 +141,26 @@ type mrVM struct {
 	AvailableSkills []skillOption    // skills offered in the run form
 	AgentMode       bool             // agentic mode on → skills are usable
 	UsedSkills      []string         // skills the shown review actually ran with
+	NewCommits      []newCommitVM    // commits pushed after the shown review's head (capped for display)
+	NewCommitsN     int              // full count of new commits (may exceed len(NewCommits))
+	HeadAdvanced    bool             // head moved but the commit list couldn't be enumerated (fetch error)
+	HistoryRewrote  bool             // reviewed head SHA absent from the commit list (force-push)
 	findings        []*state.Finding // flat findings of the selected review, for the diff pane
+}
+
+// newCommitVM is one commit pushed after the reviewed head, shown in the
+// "new commits since this review" banner on the MR detail page.
+type newCommitVM struct {
+	ShortSHA string
+	Title    string
+}
+
+// HeadChanged reports that the MR's current head has advanced past the head the
+// shown review ran against — i.e. there are new commits to re-review. False when
+// there is no review yet or the head still matches.
+func (v mrVM) HeadChanged() bool {
+	return v.Review != nil && v.MR != nil && v.MR.HeadSHA != "" &&
+		v.Review.HeadSHA != v.MR.HeadSHA
 }
 
 // skillOption is one selectable skill in the run-review form.
@@ -381,6 +400,25 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 				When:    time.UnixMilli(rv.CreatedAt).Format("2006-01-02 15:04"),
 				HeadSHA: rv.HeadSHA, RiskLevel: rv.RiskLevel, Status: rv.Status, Findings: len(fs),
 			})
+		}
+	}
+	// New commits since the shown review's head: only when the head actually moved
+	// and we're on the live (non-historical, non-running) view. Best-effort — a
+	// GitLab error just leaves the banner without a commit list. The current head
+	// comes from the last sync, so the set is "as of last sync", matching the list.
+	if vm.HeadChanged() && !vm.Historical && !vm.Running {
+		projectKey := strconv.FormatInt(mr.ProjectID, 10)
+		commits, total, found, err := s.svc().Review.NewCommitsSince(ctx, projectKey, mr.IID, vm.Review.HeadSHA)
+		switch {
+		case err != nil:
+			vm.HeadAdvanced = true // couldn't enumerate → generic "head advanced" banner
+		case !found:
+			vm.HistoryRewrote = true
+		default:
+			vm.NewCommitsN = total
+			for _, c := range commits {
+				vm.NewCommits = append(vm.NewCommits, newCommitVM{ShortSHA: c.ShortID, Title: c.Title})
+			}
 		}
 	}
 	return vm, nil

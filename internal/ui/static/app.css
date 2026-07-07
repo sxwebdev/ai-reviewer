@@ -331,6 +331,8 @@ label.skill-opt { white-space: normal; }
 .alert--warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 30%, var(--border-2)); } .alert--warn::before { content: "!"; }
 .alert--danger { color: var(--bad); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 30%, var(--border-2)); } .alert--danger::before { content: "!"; }
 .alert__body { min-width: 0; overflow-wrap: anywhere; }
+.new-commits { margin: var(--sp-2) 0 0; padding-left: var(--sp-4); }
+.new-commits li { margin: 0; }
 
 /* ---- empty ---- */
 .empty { display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); padding: var(--sp-12) var(--sp-4); text-align: center; color: var(--fg-muted); }
