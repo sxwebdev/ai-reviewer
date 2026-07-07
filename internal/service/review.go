@@ -275,6 +275,35 @@ func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *
 	})
 }
 
+// maxNewCommits bounds the "new commits since last review" list surfaced on the
+// MR detail page.
+const maxNewCommits = 30
+
+// NewCommitsSince returns the MR commits pushed after sinceSHA (newest first), by
+// walking the MR commit list until it reaches sinceSHA. total is the full count
+// of new commits even when the returned slice is capped at maxNewCommits, so the
+// caller can render an accurate "N new commits" header. found is false when
+// sinceSHA is absent from the list (e.g. history was rewritten by a force-push),
+// in which case commits is nil and total is 0 — the caller shows a countless
+// "history changed" banner rather than guessing. Any GitLab error is returned so
+// the caller can degrade to a bannerless view.
+func (s *ReviewService) NewCommitsSince(ctx context.Context, projectKey string, iid int64, sinceSHA string) (commits []gitlab.Commit, total int, found bool, err error) {
+	all, err := s.gl.ListMRCommits(ctx, projectKey, iid)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	for _, c := range all {
+		if c.ID == sinceSHA {
+			return commits, total, true, nil // boundary reached; everything above is new
+		}
+		total++
+		if len(commits) < maxNewCommits {
+			commits = append(commits, c)
+		}
+	}
+	return nil, 0, false, nil // sinceSHA never appeared → rewritten history
+}
+
 // prepareWorktree clones/fetches the project mirror, checks out a worktree at
 // headSHA, and indexes it under the same SHA (writer and readers must agree on
 // the key). It returns the worktree dir, whether agent mode is active, and a

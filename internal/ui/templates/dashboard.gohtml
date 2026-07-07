@@ -13,7 +13,7 @@
     <button type="button" class="chip" :aria-pressed="f==='all'" @click="f='all'">All</button>
     <button type="button" class="chip" :aria-pressed="f==='todo'" @click="f='todo'">Not reviewed</button>
     <button type="button" class="chip" :aria-pressed="f==='done'" @click="f='done'">Reviewed</button>
-    <button type="button" class="chip" :aria-pressed="f==='stale'" @click="f='stale'">Head changed</button>
+    <button type="button" class="chip" :aria-pressed="f==='stale'" @click="f='stale'">New commits</button>
     <button type="button" class="chip" :aria-pressed="f==='active'" @click="f='active'">Running / failed</button>
     <button type="button" class="chip" :aria-pressed="f==='drafts'" @click="f='drafts'">Has drafts</button>
     <button type="button" class="chip" :aria-pressed="f==='pub'" @click="f='pub'">Published</button>
@@ -34,7 +34,7 @@
         <div class="cell-sub">!{{.IID}}{{if .Author}} · {{.Author}}{{end}} · {{.Source}} → {{.Target}}</div>
       </td>
       <td data-label="Status" class="nowrap">
-        <span class="badge badge--{{.StatusClass}}">{{.Status}}</span>
+        <span class="badge badge--{{.StatusClass}}"{{if eq .Status "new commits"}} title="new commits pushed since the last review — open to re-review"{{end}}>{{.Status}}</span>
         {{if and .Reviewed .RiskLevel}} <span class="badge risk-{{.RiskLevel}}">risk {{.RiskLevel}}</span>{{end}}
         {{if gt .Drafted 0}} <span class="badge badge--info" title="draft notes awaiting publish">{{.Drafted}} draft</span>{{end}}
         {{if gt .Published 0}} <span class="badge badge--good" title="published to GitLab">{{.Published}} published</span>{{end}}

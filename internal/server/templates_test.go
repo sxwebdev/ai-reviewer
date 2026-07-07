@@ -91,13 +91,25 @@ func TestReviewSectionFragment(t *testing.T) {
 		t.Fatal(err)
 	}
 	mr := &state.MergeRequest{ID: 1, WebURL: "https://x"}
+	moved := &state.MergeRequest{ID: 1, WebURL: "https://x", HeadSHA: "newhead0000"}
 	hist := &state.Review{ID: "old", HeadSHA: "0badf00d", RiskLevel: "low"}
+	rev := &state.Review{ID: "cur", HeadSHA: "oldhead0000", RiskLevel: "low"}
 	find := &state.Finding{ID: "f", Severity: "low", Title: "t", Body: "b", Status: "proposed"}
 	for _, vm := range []mrVM{
 		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Running: true, Progress: "2/5"},
 		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, JobStatus: "failed", JobError: "not logged in"},
 		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Historical: true, Review: hist,
 			Groups: []findingGroup{{Severity: "low", Items: []*state.Finding{find}}}},
+		// head changed with a commit list → banner lists commits + Re-review button
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: moved, Review: rev, NewCommitsN: 2,
+			NewCommits: []newCommitVM{{ShortSHA: "abc1234", Title: "fix: nil guard"}, {ShortSHA: "def5678", Title: "add test"}}},
+		// count exceeds the displayed slice → "showing the N most recent of M" note
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: moved, Review: rev, NewCommitsN: 40,
+			NewCommits: []newCommitVM{{ShortSHA: "abc1234", Title: "one"}}},
+		// head changed but history rewritten → countless fallback banner
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: moved, Review: rev, HistoryRewrote: true},
+		// head changed but commit list couldn't be fetched → generic banner
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: moved, Review: rev, HeadAdvanced: true},
 	} {
 		var buf bytes.Buffer
 		if err := tmpl["mr"].ExecuteTemplate(&buf, "review-section", vm); err != nil {
