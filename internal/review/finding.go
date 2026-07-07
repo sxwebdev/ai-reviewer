@@ -68,6 +68,44 @@ type ValidatedFinding struct {
 // IsOverview reports whether the finding has no inline anchor.
 func (f ValidatedFinding) IsOverview() bool { return f.Position == nil }
 
+// Suppression stages: where in the pipeline a finding was dropped. Surfaced
+// read-only in the UI so a real-but-filtered concern is not silently lost.
+const (
+	SuppressThreshold = "threshold" // below the severity threshold
+	SuppressDuplicate = "duplicate" // fingerprint of a prior finding / already raised
+	SuppressSkeptic   = "skeptic"   // skeptic refuted / marked a duplicate (non-blocking)
+	SuppressVerifier  = "verifier"  // a deterministic verifier refuted it (e.g. clean build)
+)
+
+// SuppressedFinding is a finding the pipeline dropped, retained with the stage
+// and reason it was dropped so the UI can show it as informational context. It
+// never anchors to a diff line and is never publishable.
+type SuppressedFinding struct {
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	Severity string `json:"severity"`
+	Category string `json:"category"`
+	FilePath string `json:"file_path"`
+	Pass     string `json:"pass"`   // provenance pass that produced it
+	Stage    string `json:"stage"`  // one of the Suppress* constants
+	Reason   string `json:"reason"` // human-readable detail
+}
+
+// suppressedFromValidated builds a SuppressedFinding from a finding dropped after
+// validation (skeptic/verifier stages). Its body is already scrubbed and capped.
+func suppressedFromValidated(f ValidatedFinding, stage, reason string) SuppressedFinding {
+	return SuppressedFinding{
+		Title:    f.Title,
+		Body:     f.Body,
+		Severity: f.Severity,
+		Category: f.Category,
+		FilePath: f.FilePath,
+		Pass:     f.Pass,
+		Stage:    stage,
+		Reason:   reason,
+	}
+}
+
 // Fingerprint produces a stable, line-insensitive identity for a finding so
 // that the same issue dedupes across head shas and against existing
 // discussions. Intentionally excludes the line number (lines shift between

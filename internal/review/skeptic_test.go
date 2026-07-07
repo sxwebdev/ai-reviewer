@@ -38,7 +38,7 @@ func TestApplyVerdicts(t *testing.T) {
 		// index 5: no verdict
 		{Index: 6, Verdict: "refuted", Reason: "looks fine"},
 	}
-	out := applyVerdicts(batch, verdicts, discardLog())
+	out, _ := applyVerdicts(batch, verdicts, discardLog())
 
 	byTitle := map[string]ValidatedFinding{}
 	for _, f := range out {
@@ -75,7 +75,7 @@ func TestApplyVerdicts(t *testing.T) {
 
 func TestApplyVerdictsClampsConfidence(t *testing.T) {
 	batch := []ValidatedFinding{vf("high", "percent confidence", 0.6)}
-	out := applyVerdicts(batch, []llm.FindingVerdict{
+	out, _ := applyVerdicts(batch, []llm.FindingVerdict{
 		{Index: 1, Verdict: "confirmed", Confidence: 95}, // percent-style, schema not trusted
 	}, discardLog())
 	if len(out) != 1 || out[0].Confidence > 1 {
@@ -90,7 +90,7 @@ func TestApplyVerdictsDuplicateGuards(t *testing.T) {
 			{Index: 1, Verdict: "confirmed", Confidence: 0.9},
 			{Index: 2, Verdict: "confirmed", DuplicateOf: 1},
 		}
-		out := applyVerdicts(batch, verdicts, discardLog())
+		out, _ := applyVerdicts(batch, verdicts, discardLog())
 		if len(out) != 2 {
 			t.Fatalf("blocking duplicate must survive: %v", titlesOf(out))
 		}
@@ -106,7 +106,7 @@ func TestApplyVerdictsDuplicateGuards(t *testing.T) {
 			{Index: 1, Verdict: "confirmed", DuplicateOf: 2},
 			{Index: 2, Verdict: "confirmed", DuplicateOf: 1},
 		}
-		out := applyVerdicts(batch, verdicts, discardLog())
+		out, _ := applyVerdicts(batch, verdicts, discardLog())
 		if len(out) != 1 || out[0].Title != "first" {
 			t.Fatalf("mutual duplicates must keep the first: %v", titlesOf(out))
 		}
@@ -118,7 +118,7 @@ func TestApplyVerdictsDuplicateGuards(t *testing.T) {
 			{Index: 1, Verdict: "refuted", Reason: "wrong"},
 			{Index: 2, Verdict: "confirmed", DuplicateOf: 1},
 		}
-		out := applyVerdicts(batch, verdicts, discardLog())
+		out, _ := applyVerdicts(batch, verdicts, discardLog())
 		if len(out) != 1 || out[0].Title != "pointing dup" {
 			t.Fatalf("dup of a refuted target must survive (else the bug vanishes twice): %v", titlesOf(out))
 		}

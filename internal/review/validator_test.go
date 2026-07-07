@@ -21,7 +21,7 @@ func TestValidatorMapsAddedLineAndRanks(t *testing.T) {
 			Title: "blocker", Body: "serious", Confidence: 0.9},
 	}}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "medium", MaxComments: 10})
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 
 	if len(got) != 1 {
 		t.Fatalf("want 1 finding (low dropped by threshold), got %d", len(got))
@@ -40,7 +40,7 @@ func TestValidatorDropsFileNotInDiff(t *testing.T) {
 			Title: "elsewhere", Body: "x", Confidence: 0.9},
 	}}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "low"})
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 0 {
 		t.Errorf("finding on file not in diff must be dropped, got %d", len(got))
 	}
@@ -54,14 +54,14 @@ func TestValidatorDedupesWithinAndAgainstExisting(t *testing.T) {
 	resp := &llm.ReviewResponse{Findings: []llm.Finding{mk(), mk()}} // duplicate within response
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "low"})
 
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 1 {
 		t.Fatalf("intra-response dedupe failed: got %d", len(got))
 	}
 
 	// Now pre-seed the fingerprint as existing → should drop entirely.
 	existing := map[string]bool{got[0].Fingerprint: true}
-	got2 := v.Validate(&llm.ReviewResponse{Findings: []llm.Finding{mk()}}, testFiles(t), testRefs, 1, 5, existing)
+	got2, _ := v.Validate(&llm.ReviewResponse{Findings: []llm.Finding{mk()}}, testFiles(t), testRefs, 1, 5, existing)
 	if len(got2) != 0 {
 		t.Errorf("existing-fingerprint dedupe failed: got %d", len(got2))
 	}
@@ -76,7 +76,7 @@ func TestValidatorMaxComments(t *testing.T) {
 		})
 	}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "low", MaxComments: 2})
-	got := v.Validate(&llm.ReviewResponse{Findings: findings}, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(&llm.ReviewResponse{Findings: findings}, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 2 {
 		t.Errorf("max_comments cap failed: got %d, want 2", len(got))
 	}
@@ -89,7 +89,7 @@ func TestValidatorScrubsSecretsInBody(t *testing.T) {
 			Title: "leak", Body: "token glpat-scrubbedinbody12345 here", Confidence: 0.9},
 	}}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "low"})
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 1 {
 		t.Fatal("want 1 finding")
 	}
@@ -104,7 +104,7 @@ func TestValidatorOverviewWhenLineFar(t *testing.T) {
 			Title: "far", Body: "b", Confidence: 0.9},
 	}}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "low"})
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 1 {
 		t.Fatal("want 1 finding (kept as overview, not dropped)")
 	}
@@ -127,7 +127,7 @@ func TestValidatorKeepsCriticalAndBlocking(t *testing.T) {
 			Title: "blk", Body: "y", Confidence: 0.9, Blocking: true},
 	}}
 	v := NewValidator(ValidatorConfig{SeverityThreshold: "high"}) // high threshold
-	got := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
+	got, _ := v.Validate(resp, testFiles(t), testRefs, 1, 5, nil)
 	if len(got) != 2 {
 		t.Fatalf("critical + blocking must survive a high threshold, got %d", len(got))
 	}

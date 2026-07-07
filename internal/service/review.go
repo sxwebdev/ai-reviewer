@@ -423,6 +423,11 @@ func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.Merg
 			rv.CoverageJSON = string(vj)
 		}
 	}
+	if len(result.Suppressed) > 0 {
+		if sj, err := json.Marshal(result.Suppressed); err == nil {
+			rv.SuppressedJSON = string(sj)
+		}
+	}
 	if err := s.db.CreateReview(ctx, rv); err != nil {
 		return "", fmt.Errorf("create review: %w", err)
 	}

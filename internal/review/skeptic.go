@@ -35,7 +35,7 @@ You MUST return a single strict JSON object matching the provided schema.`
 // — or any batch whose LLM call fails — are kept and marked unverified. The
 // skeptic can only drop or demote, never add. Returns the surviving findings
 // and the stage's total LLM cost.
-func (e *Engine) skepticStage(ctx context.Context, in ReviewInput, pc PipelineConfig, findings []ValidatedFinding) ([]ValidatedFinding, float64) {
+func (e *Engine) skepticStage(ctx context.Context, in ReviewInput, pc PipelineConfig, findings []ValidatedFinding) ([]ValidatedFinding, []SuppressedFinding, float64) {
 	limit := min(pc.VerifyMaxFindings, len(findings))
 	verified := findings[:limit]
 	rest := findings[limit:]
@@ -45,6 +45,7 @@ func (e *Engine) skepticStage(ctx context.Context, in ReviewInput, pc PipelineCo
 
 	nBatches := (len(verified) + skepticBatchSize - 1) / skepticBatchSize
 	results := make([][]ValidatedFinding, nBatches)
+	dropped := make([][]SuppressedFinding, nBatches)
 	costs := make([]float64, nBatches)
 	sem := make(chan struct{}, max(pc.MaxParallel, 1))
 	var wg sync.WaitGroup
@@ -68,18 +69,20 @@ func (e *Engine) skepticStage(ctx context.Context, in ReviewInput, pc PipelineCo
 				results[b] = batch
 				return
 			}
-			results[b] = applyVerdicts(batch, verdicts, e.log)
+			results[b], dropped[b] = applyVerdicts(batch, verdicts, e.log)
 		}(b)
 	}
 	wg.Wait()
 
 	var out []ValidatedFinding
+	var suppressed []SuppressedFinding
 	var cost float64
 	for b := range results {
 		out = append(out, results[b]...)
+		suppressed = append(suppressed, dropped[b]...)
 		cost += costs[b]
 	}
-	return append(out, rest...), cost
+	return append(out, rest...), suppressed, cost
 }
 
 // skepticVerify runs one skeptic LLM call over a batch of findings and returns
@@ -154,7 +157,7 @@ func annotatedHunkFor(files []*FileDiff, f ValidatedFinding) string {
 //     finding is not blocking/critical (blockers are demoted, never dropped);
 //     mutual duplicates (A→B, B→A) keep the smaller index
 //   - no verdict for an index → kept, marked unverified
-func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log *slog.Logger) []ValidatedFinding {
+func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log *slog.Logger) ([]ValidatedFinding, []SuppressedFinding) {
 	byIndex := map[int]llm.FindingVerdict{}
 	for _, v := range verdicts {
 		if v.Index >= 1 && v.Index <= len(batch) {
@@ -195,6 +198,7 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 	}
 
 	var out []ValidatedFinding
+	var suppressed []SuppressedFinding
 	for i, f := range batch {
 		v, ok := byIndex[i+1]
 		if !ok {
@@ -214,6 +218,8 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 					continue
 				}
 				log.Info("skeptic dropped duplicate finding", "title", f.Title, "duplicate_of", d)
+				suppressed = append(suppressed, suppressedFromValidated(f, SuppressSkeptic,
+					"skeptic judged it a duplicate of another finding"))
 				continue
 			}
 		}
@@ -225,6 +231,8 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 				continue
 			}
 			log.Info("skeptic refuted finding", "title", f.Title, "reason", v.Reason)
+			suppressed = append(suppressed, suppressedFromValidated(f, SuppressSkeptic,
+				"skeptic disputed it: "+v.Reason))
 		case "uncertain":
 			demote(&f, "unverified: "+v.Reason)
 			out = append(out, f)
@@ -237,7 +245,7 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, suppressed
 }
 
 func appendNote(existing, note string) string {

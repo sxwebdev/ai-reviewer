@@ -64,11 +64,12 @@ func BuiltinVerifiers(names []string, log *slog.Logger) []Verifier {
 // runVerifiers applies each verifier to each finding it covers. A VerdictDrop
 // removes the finding immediately; VerdictAnnotate appends the note to the
 // finding's validation error trail.
-func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings []ValidatedFinding, log *slog.Logger) []ValidatedFinding {
+func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings []ValidatedFinding, log *slog.Logger) ([]ValidatedFinding, []SuppressedFinding) {
 	if workDir == "" || len(vs) == 0 || len(findings) == 0 {
-		return findings
+		return findings, nil
 	}
 	out := make([]ValidatedFinding, 0, len(findings))
+	var suppressed []SuppressedFinding
 	for _, f := range findings {
 		dropped := false
 		for _, v := range vs {
@@ -80,6 +81,11 @@ func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings [
 			case VerdictDrop:
 				log.Warn("verifier refuted finding",
 					"verifier", v.Name(), "file", f.FilePath, "title", f.Title, "note", res.Note)
+				reason := v.Name() + " refuted it"
+				if res.Note != "" {
+					reason += ": " + res.Note
+				}
+				suppressed = append(suppressed, suppressedFromValidated(f, SuppressVerifier, reason))
 				dropped = true
 			case VerdictAnnotate:
 				f.ValidationError = appendNote(f.ValidationError, v.Name()+": "+res.Note)
@@ -92,5 +98,5 @@ func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings [
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, suppressed
 }

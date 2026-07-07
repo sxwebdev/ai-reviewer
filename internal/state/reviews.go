@@ -20,12 +20,12 @@ func (db *DB) CreateReview(ctx context.Context, r *Review) error {
 			(id, mr_id, project_id, mr_iid, head_sha, base_sha, start_sha, mode, status,
 			 risk_level, overall_recommendation, llm_provider, llm_model, reviewer_profile_id,
 			 summary, raw_report_json, pipeline_json, risk_json, completeness_json, coverage_json,
-			 cost_usd, duration_ms, user_context, skills_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 suppressed_json, cost_usd, duration_ms, user_context, skills_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.MRID, r.ProjectID, r.MRIID, r.HeadSHA, r.BaseSHA, r.StartSHA, r.Mode, r.Status,
 		r.RiskLevel, r.OverallRecommendation, r.LLMProvider, r.LLMModel, r.ReviewerProfileID,
 		r.Summary, r.RawReportJSON, r.PipelineJSON, r.RiskJSON, r.CompletenessJSON, r.CoverageJSON,
-		r.CostUSD, r.DurationMS, r.UserContext, r.SkillsJSON, r.CreatedAt, r.UpdatedAt)
+		r.SuppressedJSON, r.CostUSD, r.DurationMS, r.UserContext, r.SkillsJSON, r.CreatedAt, r.UpdatedAt)
 	return err
 }
 
@@ -40,14 +40,14 @@ func (db *DB) UpdateReviewStatus(ctx context.Context, id, status string) error {
 const reviewColumns = `id, mr_id, project_id, mr_iid, head_sha, base_sha, start_sha, mode, status,
 	risk_level, overall_recommendation, llm_provider, llm_model, reviewer_profile_id,
 	summary, raw_report_json, pipeline_json, risk_json, completeness_json, coverage_json,
-	cost_usd, duration_ms, user_context, skills_json, created_at, updated_at`
+	suppressed_json, cost_usd, duration_ms, user_context, skills_json, created_at, updated_at`
 
 func scanReview(s interface{ Scan(...any) error }) (*Review, error) {
 	r := &Review{}
 	err := s.Scan(&r.ID, &r.MRID, &r.ProjectID, &r.MRIID, &r.HeadSHA, &r.BaseSHA, &r.StartSHA,
 		&r.Mode, &r.Status, &r.RiskLevel, &r.OverallRecommendation, &r.LLMProvider, &r.LLMModel,
 		&r.ReviewerProfileID, &r.Summary, &r.RawReportJSON, &r.PipelineJSON,
-		&r.RiskJSON, &r.CompletenessJSON, &r.CoverageJSON, &r.CostUSD,
+		&r.RiskJSON, &r.CompletenessJSON, &r.CoverageJSON, &r.SuppressedJSON, &r.CostUSD,
 		&r.DurationMS, &r.UserContext, &r.SkillsJSON, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
