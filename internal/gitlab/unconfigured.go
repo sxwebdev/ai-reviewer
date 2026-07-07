@@ -7,7 +7,7 @@ import (
 
 // ErrNotConfigured is returned by the unconfigured client until a GitLab host
 // and token are set. It lets the web UI start and render before setup.
-var ErrNotConfigured = errors.New("GitLab is not configured: set gitlab.host and the token env var")
+var ErrNotConfigured = errors.New("GitLab is not configured: complete setup in the web UI (ai-reviewer serve)")
 
 type unconfigured struct{}
 

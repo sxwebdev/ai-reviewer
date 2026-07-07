@@ -174,19 +174,17 @@ func basePosition(fd *FileDiff, refs gitlab.DiffRefs) gitlab.Position {
 }
 
 func withNew(p gitlab.Position, newLine int) *gitlab.Position {
-	p.NewLine = intPtr(newLine)
+	p.NewLine = new(newLine)
 	return &p
 }
 
 func withOld(p gitlab.Position, oldLine int) *gitlab.Position {
-	p.OldLine = intPtr(oldLine)
+	p.OldLine = new(oldLine)
 	return &p
 }
 
 func withBoth(p gitlab.Position, oldLine, newLine int) *gitlab.Position {
-	p.OldLine = intPtr(oldLine)
-	p.NewLine = intPtr(newLine)
+	p.OldLine = new(oldLine)
+	p.NewLine = new(newLine)
 	return &p
 }
-
-func intPtr(v int) *int { return &v }

@@ -89,39 +89,51 @@ func contextBudgetFromConfig(rc config.ReviewConfig) review.ContextBudget {
 }
 
 // Services opens state and wires the full service bundle used by the web UI and
-// CLI actions. When GitLab is not yet configured the bundle uses a stub client
-// so the web UI still starts; sync/review then surface a clear error.
+// CLI actions, storing it as the App's current bundle (see Bundle). When GitLab
+// is not yet configured the bundle uses a stub client so the web UI still
+// starts; the setup gate then walks the user through configuration.
 func (a *App) Services() (*service.Bundle, error) {
+	b, err := a.buildBundle(a.Config())
+	if err != nil {
+		return nil, err
+	}
+	a.bundle.Store(b)
+	return b, nil
+}
+
+// buildBundle wires a service bundle from an explicit config snapshot without
+// storing it — the hot-apply path builds first and swaps only on success.
+func (a *App) buildBundle(cfg *config.Config) (*service.Bundle, error) {
 	db, err := a.OpenState()
 	if err != nil {
 		return nil, err
 	}
 	var gl gitlab.API
-	if a.Cfg.GitLab.Host == "" {
+	if cfg.GitLab.Host == "" {
 		gl = gitlab.Unconfigured()
 	} else {
-		c, err := a.GitLabClient()
+		c, err := gitlabClientFor(cfg)
 		if err != nil {
 			return nil, err
 		}
 		gl = c
 	}
-	eng := review.NewEngine(a.LLMClient(), a.Log)
+	eng := review.NewEngine(a.llmClientFor(cfg), a.Log)
 	rc := service.ReviewConfig{
-		Host:             a.Cfg.GitLab.Host,
-		ReviewerUsername: a.Cfg.GitLab.Username,
-		Model:            a.Cfg.LLM.Model,
-		LLMProvider:      a.Cfg.LLM.Provider,
-		AgentMode:        a.Cfg.Review.AgentMode && a.Cfg.LLM.Claude.AgentMode,
-		AllowedTools:     a.Cfg.LLM.Claude.AllowedTools,
-		Profile:          profileFromConfig(a.Cfg.Review),
-		Token:            a.Cfg.GitLabToken(),
-		CacheDir:         a.Cfg.Storage.CacheDir,
-		IgnoreGlobs:      a.Cfg.Review.IgnoreGlobs,
-		Context:          contextBudgetFromConfig(a.Cfg.Review),
-		Pipeline:         pipelineFromConfig(a.Cfg.Review),
-		Risk:             riskSettingsFromConfig(a.Cfg.Review),
-		Coverage:         coverageSettingsFromConfig(a.Cfg.Review),
+		Host:             cfg.GitLab.Host,
+		ReviewerUsername: cfg.GitLab.Username,
+		Model:            cfg.LLM.Model,
+		LLMProvider:      cfg.LLM.Provider,
+		AgentMode:        cfg.Review.AgentMode && cfg.LLM.Claude.AgentMode,
+		AllowedTools:     cfg.LLM.Claude.AllowedTools,
+		Profile:          profileFromConfig(cfg.Review),
+		Token:            cfg.GitLabToken(),
+		CacheDir:         cfg.Storage.CacheDir,
+		IgnoreGlobs:      cfg.Review.IgnoreGlobs,
+		Context:          contextBudgetFromConfig(cfg.Review),
+		Pipeline:         pipelineFromConfig(cfg.Review),
+		Risk:             riskSettingsFromConfig(cfg.Review),
+		Coverage:         coverageSettingsFromConfig(cfg.Review),
 	}
 	return service.NewBundle(gl, db, eng, rc, a.Log), nil
 }

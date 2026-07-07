@@ -402,3 +402,21 @@ kbd { display: inline-block; min-width: 1.2em; text-align: center; padding: 1px 
   .page-head, .row.head { flex-direction: column; gap: var(--sp-2); align-items: stretch; }
   .sync-label { display: none; }
 }
+
+/* ---- header settings selects (review depth / model) ---- */
+.header-select { display: inline-flex; align-items: center; gap: var(--sp-1); }
+.header-select__label { font-size: var(--fs-xs); color: var(--fg-muted); }
+.header-select select { padding: 3px var(--sp-2); font-size: var(--fs-xs); border-radius: var(--r-sm); }
+@media (max-width: 640px) { .header-select__label { display: none; } }
+
+/* ---- setup page ---- */
+.setup-page { max-width: 40rem; margin-inline: auto; }
+.setup-page h1 { margin-bottom: var(--sp-2); }
+.setup-page > .muted { margin-bottom: var(--sp-4); }
+.setup-page .card h2 { font-size: var(--fs-lg); margin-bottom: var(--sp-2); }
+.form-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--sp-3); }
+.form-row label { font-size: var(--fs-sm); font-weight: 550; }
+.req { color: var(--bad); }
+.setup-actions { display: flex; flex-direction: column; gap: var(--sp-2); margin-top: var(--sp-4); }
+.claude-check { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.claude-check__detail { font-size: var(--fs-xs); color: var(--fg-muted); overflow-wrap: anywhere; }

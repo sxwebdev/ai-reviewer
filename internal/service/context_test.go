@@ -154,7 +154,7 @@ func TestBuildDiscussionNotesFiltersAndFlags(t *testing.T) {
 
 func TestBuildDiscussionNotesBudgetDropsOldest(t *testing.T) {
 	var discussions []gitlab.Discussion
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		discussions = append(discussions, gitlab.Discussion{Notes: []gitlab.Note{
 			{Body: strings.Repeat("x", 200), Author: gitlab.User{Username: "alice"}},
 		}})

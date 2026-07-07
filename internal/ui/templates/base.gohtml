@@ -29,7 +29,21 @@
     <a href="/settings" {{if eq .Active "settings"}}aria-current="page"{{end}}>Settings</a>
   </nav>
   <span class="header-spacer"></span>
-  <span class="host" title="GitLab host">{{.Host}}</span>
+  {{if .UI.PipelineModes}}
+  <form method="post" action="/settings/apply" class="header-select" title="Review depth: cheap = 1 pass, standard = 2 passes + skeptic, deep = 5 passes + skeptic">
+    <label class="header-select__label" for="hdr-mode">Depth</label>
+    <select id="hdr-mode" name="pipeline_mode" onchange="this.form.submit()" aria-label="Review depth">
+      {{range .UI.PipelineModes}}<option value="{{.}}" {{if eq . $.UI.PipelineMode}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+  </form>
+  <form method="post" action="/settings/apply" class="header-select" title="LLM model used for reviews">
+    <label class="header-select__label" for="hdr-model">Model</label>
+    <select id="hdr-model" name="llm_model" onchange="this.form.submit()" aria-label="LLM model">
+      {{range .UI.Models}}<option value="{{.}}" {{if eq . $.UI.LLMModel}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+  </form>
+  {{end}}
+  <span class="host" title="GitLab host">{{.UI.Host}}</span>
   <button class="btn btn--ghost btn--sm" type="button" onclick="toggleTheme()" aria-label="Toggle light and dark theme">Theme</button>
   <form method="post" action="/sync">
     <button class="btn" aria-label="Sync assigned merge requests from GitLab"><span class="sync-label">Sync</span> MRs</button>

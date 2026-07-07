@@ -19,7 +19,7 @@ import (
 )
 
 type baseVM struct {
-	Host      string
+	UI        UIConfig // header switches (pipeline mode / model) + display bits incl. Host
 	Flash     string
 	FlashKind string
 	Active    string // nav highlight: dashboard|jobs|memory|settings
@@ -194,7 +194,7 @@ type settingsVM struct {
 
 func (s *Server) base(w http.ResponseWriter, r *http.Request) baseVM {
 	kind, msg := takeFlash(w, r)
-	return baseVM{Host: s.host, Flash: msg, FlashKind: kind}
+	return baseVM{UI: s.ui(), Flash: msg, FlashKind: kind}
 }
 
 func (s *Server) baseActive(w http.ResponseWriter, r *http.Request, active string) baseVM {
@@ -205,7 +205,7 @@ func (s *Server) baseActive(w http.ResponseWriter, r *http.Request, active strin
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rows, err := s.svc.DB.DashboardRows(ctx)
+	rows, err := s.svc().DB.DashboardRows(ctx)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -225,7 +225,7 @@ type mrKey struct{ projectID, iid int64 }
 // (queued/running) and whether that latest job failed.
 func (s *Server) reviewJobState(ctx context.Context) (running, failed map[mrKey]bool) {
 	running, failed = map[mrKey]bool{}, map[mrKey]bool{}
-	list, err := s.svc.DB.LatestReviewJobsPerMR(ctx) // one latest review job per MR
+	list, err := s.svc().DB.LatestReviewJobsPerMR(ctx) // one latest review job per MR
 	if err != nil {
 		return
 	}
@@ -245,7 +245,7 @@ func (s *Server) reviewJobState(ctx context.Context) (running, failed map[mrKey]
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	res, err := s.svc.Sync.SyncAssignedMRs(r.Context())
+	res, err := s.svc().Sync.SyncAssignedMRs(r.Context())
 	if err != nil {
 		setFlash(w, "err", "Sync failed: "+err.Error())
 	} else {
@@ -258,20 +258,20 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 // the caller fills). It is shared by the full page, the htmx review-section
 // fragment, and finding-action responses.
 func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID string) (mrVM, error) {
-	mr, err := s.svc.DB.GetMergeRequest(ctx, id)
+	mr, err := s.svc().DB.GetMergeRequest(ctx, id)
 	if err != nil {
 		return mrVM{}, err
 	}
 	vm := mrVM{MR: mr}
-	if p, err := s.svc.DB.GetProjectByGitLabID(ctx, mr.GitLabHost, mr.ProjectID); err == nil {
+	if p, err := s.svc().DB.GetProjectByGitLabID(ctx, mr.GitLabHost, mr.ProjectID); err == nil {
 		vm.ProjectPath = p.PathWithNamespace
 	}
-	if active, _ := s.svc.DB.HasActiveJob(ctx, state.JobReview, mr.ProjectID, mr.IID); active {
+	if active, _ := s.svc().DB.HasActiveJob(ctx, state.JobReview, mr.ProjectID, mr.IID); active {
 		vm.Running = true
 	}
 	// Latest review job for this MR → status / error / progress. Targeted query,
 	// correct regardless of overall job volume.
-	if j, err := s.svc.DB.GetLatestReviewJob(ctx, mr.ProjectID, mr.IID); err == nil {
+	if j, err := s.svc().DB.GetLatestReviewJob(ctx, mr.ProjectID, mr.IID); err == nil {
 		vm.JobStatus = j.Status
 		if j.Status == state.JobFailed {
 			vm.JobError = j.Error
@@ -280,7 +280,7 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 			vm.Progress = fmt.Sprintf("%d/%d", j.ProgressCurrent, j.ProgressTotal)
 		}
 	}
-	reviews, _ := s.svc.DB.ListReviewsByMR(ctx, id)
+	reviews, _ := s.svc().DB.ListReviewsByMR(ctx, id)
 	if len(reviews) > 0 {
 		sel := reviews[0] // newest by default
 		if selectedReviewID != "" {
@@ -293,7 +293,7 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 		}
 		vm.Historical = sel.ID != reviews[0].ID
 		vm.Review = sel
-		findings, _ := s.svc.DB.ListFindingsByReview(ctx, sel.ID)
+		findings, _ := s.svc().DB.ListFindingsByReview(ctx, sel.ID)
 		vm.findings = findings
 		vm.FindingCount = len(findings)
 		for _, f := range findings {
@@ -338,7 +338,7 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 			if rv.ID == sel.ID {
 				continue // the one being shown is not listed under history
 			}
-			fs, _ := s.svc.DB.ListFindingsByReview(ctx, rv.ID)
+			fs, _ := s.svc().DB.ListFindingsByReview(ctx, rv.ID)
 			vm.PastReviews = append(vm.PastReviews, pastReviewVM{
 				ID:      rv.ID,
 				When:    time.UnixMilli(rv.CreatedAt).Format("2006-01-02 15:04"),
@@ -354,7 +354,7 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 // not resolve to a line land in Unanchored. Display-only: it reads persisted
 // positions and never computes new ones (positions are owned by the engine).
 func (s *Server) buildDiffVM(ctx context.Context, mrID int64, headSHA string, findings []*state.Finding) diffVM {
-	rows, err := s.svc.DB.ListMRDiffFiles(ctx, mrID, headSHA)
+	rows, err := s.svc().DB.ListMRDiffFiles(ctx, mrID, headSHA)
 	if err != nil {
 		s.log.Warn("list diffs failed", "mr", mrID, "err", err)
 		return diffVM{}
@@ -511,7 +511,7 @@ func (s *Server) handleReviewSection(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	vm.baseVM = baseVM{Host: s.host}
+	vm.baseVM = baseVM{} // fragment: header not re-rendered, base fields unused
 	// The poll only fires while a review runs. When it comes back not-running,
 	// the review just finished — reload the whole page so the sibling diff pane
 	// rebuilds with findings pinned inline (it is not part of this fragment).
@@ -527,12 +527,12 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	mr, err := s.svc.DB.GetMergeRequest(r.Context(), id)
+	mr, err := s.svc().DB.GetMergeRequest(r.Context(), id)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	jobID, err := jobs.EnqueueReview(r.Context(), s.svc.DB, mr.ID, mr.ProjectID, mr.IID)
+	jobID, err := jobs.EnqueueReview(r.Context(), s.svc().DB, mr.ID, mr.ProjectID, mr.IID)
 	switch {
 	case err != nil:
 		setFlash(w, "err", "Could not queue review: "+err.Error())
@@ -553,7 +553,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	s.finishFindingAction(w, r, mrID, s.svc.Finding.Approve(r.Context(), fid))
+	s.finishFindingAction(w, r, mrID, s.svc().Finding.Approve(r.Context(), fid))
 }
 
 func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
@@ -565,7 +565,7 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 	}
 	reason := r.FormValue("reason")
 	fp := r.FormValue("fp") != ""
-	s.finishFindingAction(w, r, mrID, s.svc.Finding.Reject(r.Context(), fid, reason, fp))
+	s.finishFindingAction(w, r, mrID, s.svc().Finding.Reject(r.Context(), fid, reason, fp))
 }
 
 func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
@@ -581,7 +581,7 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 		s.finishFindingAction(w, r, mrID, fmt.Errorf("comment cannot be empty"))
 		return
 	}
-	s.finishFindingAction(w, r, mrID, s.svc.Finding.Edit(r.Context(), fid, body))
+	s.finishFindingAction(w, r, mrID, s.svc().Finding.Edit(r.Context(), fid, body))
 }
 
 // handleApproveAll approves every still-proposed finding in a review (optionally
@@ -589,7 +589,7 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleApproveAll(w http.ResponseWriter, r *http.Request) {
 	reviewID := r.PathValue("id")
 	sev := r.FormValue("severity")
-	findings, err := s.svc.DB.ListFindingsByReview(r.Context(), reviewID)
+	findings, err := s.svc().DB.ListFindingsByReview(r.Context(), reviewID)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -602,7 +602,7 @@ func (s *Server) handleApproveAll(w http.ResponseWriter, r *http.Request) {
 		if sev != "" && !strings.EqualFold(f.Severity, sev) {
 			continue
 		}
-		if e := s.svc.Finding.Approve(r.Context(), f.ID); e != nil {
+		if e := s.svc().Finding.Approve(r.Context(), f.ID); e != nil {
 			err = e
 		} else {
 			n++
@@ -618,7 +618,7 @@ func (s *Server) handleApproveAll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateDrafts(w http.ResponseWriter, r *http.Request) {
 	reviewID := r.PathValue("id")
-	n, err := s.svc.Publish.CreateDrafts(r.Context(), reviewID)
+	n, err := s.svc().Publish.CreateDrafts(r.Context(), reviewID)
 	if err != nil {
 		setFlash(w, "err", "Create drafts failed: "+err.Error())
 	} else {
@@ -630,7 +630,7 @@ func (s *Server) handleCreateDrafts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	reviewID := r.PathValue("id")
 	confirm := r.FormValue("confirm")
-	n, err := s.svc.Publish.PublishDrafts(r.Context(), reviewID, confirm)
+	n, err := s.svc().Publish.PublishDrafts(r.Context(), reviewID, confirm)
 	if err != nil {
 		setFlash(w, "err", err.Error())
 	} else {
@@ -642,7 +642,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 // ---- jobs ----
 
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
-	list, err := s.svc.DB.ListJobs(r.Context(), 100)
+	list, err := s.svc().DB.ListJobs(r.Context(), 100)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -651,7 +651,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
-	ok, err := s.svc.DB.RequeueJob(r.Context(), r.PathValue("id"))
+	ok, err := s.svc().DB.RequeueJob(r.Context(), r.PathValue("id"))
 	switch {
 	case err != nil:
 		setFlash(w, "err", err.Error())
@@ -666,7 +666,7 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 // ---- memory + settings ----
 
 func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
-	items, err := s.svc.DB.ListReviewMemory(r.Context())
+	items, err := s.svc().DB.ListReviewMemory(r.Context())
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -675,7 +675,109 @@ func (s *Server) handleMemory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	s.render(w, "settings", settingsVM{baseVM: s.baseActive(w, r, "settings"), Cfg: s.cfg})
+	s.render(w, "settings", settingsVM{baseVM: s.baseActive(w, r, "settings"), Cfg: s.ui()})
+}
+
+// ---- setup gate + header switches ----
+
+// setupVM feeds the standalone setup page. The token is never echoed back:
+// on a validation error the token field renders empty.
+type setupVM struct {
+	Status    SetupStatus
+	Error     string // inline validation error
+	Flash     string // flash carried across the redirect back to /setup
+	FlashKind string
+	Host      string // sticky form values on error
+	Username  string
+}
+
+func (s *Server) setupStatus() SetupStatus {
+	if s.deps.SetupStatus == nil {
+		return SetupStatus{}
+	}
+	return s.deps.SetupStatus()
+}
+
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	st := s.setupStatus()
+	kind, msg := takeFlash(w, r)
+	s.renderSetup(w, setupVM{Status: st, Flash: msg, FlashKind: kind, Host: st.Host, Username: st.Username})
+}
+
+// handleSetupCheck re-runs the environment checks (htmx "Re-check" button).
+func (s *Server) handleSetupCheck(w http.ResponseWriter, r *http.Request) {
+	s.renderPartial(w, "setup", "setup-claude-check", setupVM{Status: s.setupStatus()})
+}
+
+func (s *Server) handleSetupSubmit(w http.ResponseWriter, r *http.Request) {
+	st := s.setupStatus()
+	host := strings.TrimSpace(r.FormValue("host"))
+	username := strings.TrimSpace(r.FormValue("username"))
+	token := strings.TrimSpace(r.FormValue("token"))
+
+	failWith := func(msg string) {
+		s.renderSetup(w, setupVM{Status: st, Error: msg, Host: host, Username: username})
+	}
+	if host == "" {
+		failWith("GitLab host is required.")
+		return
+	}
+	if token == "" && !st.TokenFromEnv {
+		failWith("GitLab token is required (or export it via " + st.TokenEnvName + " and restart).")
+		return
+	}
+	apiUser, err := s.deps.ValidateGitLab(r.Context(), host, token)
+	if err != nil {
+		failWith("GitLab validation failed: " + err.Error())
+		return
+	}
+	if username == "" {
+		username = apiUser
+	}
+	// An empty token means "keep using the env-provided one" — it is validated
+	// above but never written to disk.
+	if err := s.deps.ApplySetup(r.Context(), host, username, token); err != nil {
+		failWith("Could not save configuration: " + err.Error())
+		return
+	}
+	// GitLab is saved, but the gate may still be closed (claude CLI missing).
+	// Redirect back to /setup explicitly with a message — a silent bounce off
+	// the gate would look like the Save button did nothing.
+	if s.deps.NeedsSetup != nil && s.deps.NeedsSetup() {
+		setFlash(w, "warn", "GitLab settings saved. Install the claude CLI and press Re-check to continue.")
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	}
+	if username != apiUser {
+		setFlash(w, "warn", "Setup complete, but the token belongs to "+apiUser+" while the configured username is "+username+".")
+	} else {
+		setFlash(w, "ok", "Setup complete. Authenticated as "+apiUser+".")
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// handleApplySettings persists a header switch (review depth / model) and
+// hot-applies it. Only whitelisted form fields are mapped to config keys; the
+// app layer validates the values.
+func (s *Server) handleApplySettings(w http.ResponseWriter, r *http.Request) {
+	values := map[string]string{}
+	if v := strings.TrimSpace(r.FormValue("pipeline_mode")); v != "" {
+		values["review.pipeline.mode"] = v
+	}
+	if v := strings.TrimSpace(r.FormValue("llm_model")); v != "" {
+		values["llm.model"] = v
+	}
+	if len(values) == 0 {
+		setFlash(w, "err", "Nothing to apply.")
+		redirectBack(w, r)
+		return
+	}
+	if err := s.deps.ApplySettings(r.Context(), values); err != nil {
+		setFlash(w, "err", "Could not apply settings: "+err.Error())
+	} else {
+		setFlash(w, "ok", "Settings applied.")
+	}
+	redirectBack(w, r)
 }
 
 type healthVM struct{ Checks []HealthCheck }
@@ -685,8 +787,8 @@ type healthVM struct{ Checks []HealthCheck }
 // never block the page.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	var checks []HealthCheck
-	if s.health != nil {
-		checks = s.health(r.Context())
+	if s.deps.Health != nil {
+		checks = s.deps.Health(r.Context())
 	}
 	s.renderPartial(w, "settings", "health-checks", healthVM{Checks: checks})
 }
@@ -712,7 +814,7 @@ func (s *Server) finishFindingAction(w http.ResponseWriter, r *http.Request, mrI
 		s.fail(w, err)
 		return
 	}
-	vm.baseVM = baseVM{Host: s.host}
+	vm.baseVM = baseVM{} // fragment: header not re-rendered, base fields unused
 	if actionErr != nil {
 		vm.ActionError = actionErr.Error()
 	}
@@ -720,7 +822,7 @@ func (s *Server) finishFindingAction(w http.ResponseWriter, r *http.Request, mrI
 }
 
 func (s *Server) findingMRID(ctx context.Context, fid string) (int64, error) {
-	f, err := s.svc.DB.GetFinding(ctx, fid)
+	f, err := s.svc().DB.GetFinding(ctx, fid)
 	if err != nil {
 		return 0, err
 	}
@@ -731,7 +833,7 @@ func (s *Server) costLabel(cost float64) string {
 	if cost <= 0 {
 		return ""
 	}
-	if s.cfg.SubscriptionAuth {
+	if s.ui().SubscriptionAuth {
 		return fmt.Sprintf("≈$%.4f (covered by subscription)", cost)
 	}
 	return fmt.Sprintf("$%.4f", cost)

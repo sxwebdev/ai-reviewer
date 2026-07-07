@@ -6,6 +6,7 @@ package security
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -50,10 +51,8 @@ func (r *Redactor) AddSecret(secret string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, existing := range r.literals {
-		if existing == secret {
-			return
-		}
+	if slices.Contains(r.literals, secret) {
+		return
 	}
 	r.literals = append(r.literals, secret)
 }

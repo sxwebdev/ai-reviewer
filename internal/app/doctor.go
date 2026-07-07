@@ -29,6 +29,7 @@ type DoctorCheck struct {
 // Doctor runs environment and configuration checks and returns their results.
 // It never fails the process; the CLI decides the exit code from the results.
 func (a *App) Doctor(ctx context.Context) []DoctorCheck {
+	cfg := a.Config()
 	var checks []DoctorCheck
 	add := func(name string, status CheckStatus, detail string) {
 		checks = append(checks, DoctorCheck{Name: name, Status: status, Detail: detail})
@@ -42,23 +43,23 @@ func (a *App) Doctor(ctx context.Context) []DoctorCheck {
 	}
 
 	// claude CLI
-	if p, err := exec.LookPath(a.Cfg.LLM.Claude.Bin); err == nil {
+	if p, err := exec.LookPath(cfg.LLM.Claude.Bin); err == nil {
 		add("claude CLI", StatusOK, p)
 	} else {
-		add("claude CLI", StatusFail, fmt.Sprintf("%q not found in PATH", a.Cfg.LLM.Claude.Bin))
+		add("claude CLI", StatusFail, fmt.Sprintf("%q not found in PATH", cfg.LLM.Claude.Bin))
 	}
 
 	// Claude auth hint (do not print token values)
-	switch a.Cfg.LLM.Claude.AuthMode {
+	switch cfg.LLM.Claude.AuthMode {
 	case "oauth-token":
-		if os.Getenv(a.Cfg.LLM.Claude.OAuthTokenEnv) == "" {
-			add("claude auth", StatusWarn, fmt.Sprintf("%s not set", a.Cfg.LLM.Claude.OAuthTokenEnv))
+		if os.Getenv(cfg.LLM.Claude.OAuthTokenEnv) == "" {
+			add("claude auth", StatusWarn, fmt.Sprintf("%s not set", cfg.LLM.Claude.OAuthTokenEnv))
 		} else {
 			add("claude auth", StatusOK, "oauth token present")
 		}
 	case "api-key":
-		if os.Getenv(a.Cfg.LLM.Claude.APIKeyEnv) == "" {
-			add("claude auth", StatusWarn, fmt.Sprintf("%s not set", a.Cfg.LLM.Claude.APIKeyEnv))
+		if os.Getenv(cfg.LLM.Claude.APIKeyEnv) == "" {
+			add("claude auth", StatusWarn, fmt.Sprintf("%s not set", cfg.LLM.Claude.APIKeyEnv))
 		} else {
 			add("claude auth", StatusOK, "api key present")
 		}
@@ -67,30 +68,30 @@ func (a *App) Doctor(ctx context.Context) []DoctorCheck {
 	}
 
 	// GitLab config
-	if a.Cfg.GitLab.Host == "" {
+	if cfg.GitLab.Host == "" {
 		add("gitlab host", StatusFail, "gitlab.host is empty")
 	} else {
-		add("gitlab host", StatusOK, a.Cfg.GitLab.Host)
+		add("gitlab host", StatusOK, cfg.GitLab.Host)
 	}
-	if a.Cfg.GitLab.Username == "" {
+	if cfg.GitLab.Username == "" {
 		add("gitlab username", StatusWarn, "gitlab.username is empty")
 	} else {
-		add("gitlab username", StatusOK, a.Cfg.GitLab.Username)
+		add("gitlab username", StatusOK, cfg.GitLab.Username)
 	}
-	if a.Cfg.GitLabToken() == "" {
-		if te := a.Cfg.GitLab.TokenEnv; te != "" && !config.IsValidEnvName(te) {
+	if cfg.GitLabToken() == "" {
+		if te := cfg.GitLab.TokenEnv; te != "" && !config.IsValidEnvName(te) {
 			// token_env holds something that is not a valid env var name — almost
 			// certainly the token itself was pasted here. Do not echo the value.
 			add("gitlab token", StatusFail, "gitlab.token is empty and gitlab.token_env is not a valid env var name — did you paste the token into token_env? Put it in gitlab.token instead")
 		} else {
-			add("gitlab token", StatusFail, "gitlab.token is not set (add it to your config file, or export the token_env variable)")
+			add("gitlab token", StatusFail, "gitlab.token is not set (complete setup in the web UI, or export the token_env variable)")
 		}
 	} else {
 		add("gitlab token", StatusOK, "present") // never echo the token value
 	}
 
 	// GitLab API reachability (only if host + token are present)
-	if a.Cfg.GitLab.Host != "" && a.Cfg.GitLabToken() != "" {
+	if cfg.GitLab.Host != "" && cfg.GitLabToken() != "" {
 		if gl, err := a.GitLabClient(); err != nil {
 			add("gitlab api", StatusFail, err.Error())
 		} else {
@@ -100,8 +101,8 @@ func (a *App) Doctor(ctx context.Context) []DoctorCheck {
 			switch {
 			case err != nil:
 				add("gitlab api", StatusFail, err.Error())
-			case a.Cfg.GitLab.Username != "" && user.Username != a.Cfg.GitLab.Username:
-				add("gitlab api", StatusWarn, fmt.Sprintf("token user %q != config username %q", user.Username, a.Cfg.GitLab.Username))
+			case cfg.GitLab.Username != "" && user.Username != cfg.GitLab.Username:
+				add("gitlab api", StatusWarn, fmt.Sprintf("token user %q != config username %q", user.Username, cfg.GitLab.Username))
 			default:
 				add("gitlab api", StatusOK, "authenticated as "+user.Username)
 			}
@@ -109,16 +110,16 @@ func (a *App) Doctor(ctx context.Context) []DoctorCheck {
 	}
 
 	// directories
-	dataStatus, dataDetail := dirStatus(a.Cfg.App.DataDir)
+	dataStatus, dataDetail := dirStatus(cfg.App.DataDir)
 	add("data dir", dataStatus, dataDetail)
-	cacheStatus, cacheDetail := dirStatus(a.Cfg.Storage.CacheDir)
+	cacheStatus, cacheDetail := dirStatus(cfg.Storage.CacheDir)
 	add("cache dir", cacheStatus, cacheDetail)
 
 	// database + migrations + FTS5
 	if db, err := a.OpenState(); err != nil {
 		add("database", StatusFail, err.Error())
 	} else {
-		add("database", StatusOK, a.Cfg.Storage.DBPath)
+		add("database", StatusOK, cfg.Storage.DBPath)
 		if err := db.FTS5Available(); err != nil {
 			add("sqlite fts5", StatusFail, err.Error())
 		} else {
@@ -140,7 +141,7 @@ func dirStatus(dir string) (CheckStatus, string) {
 	info, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return StatusWarn, dir + " (missing — run `ai-reviewer init`)"
+			return StatusWarn, dir + " (missing — created automatically on first run)"
 		}
 		return StatusFail, err.Error()
 	}

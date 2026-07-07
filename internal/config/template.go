@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 )
 
-// defaultYAML is the documented starter config written by `ai-reviewer init`.
+// defaultYAML is the documented starter config, written automatically the
+// first time settings are persisted (web UI setup) via PatchFile.
 const defaultYAML = `# ai-reviewer configuration
 # Docs: https://github.com/sxwebdev/ai-reviewer
 

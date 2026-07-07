@@ -69,7 +69,7 @@ func TestValidatorDedupesWithinAndAgainstExisting(t *testing.T) {
 
 func TestValidatorMaxComments(t *testing.T) {
 	var findings []llm.Finding
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		findings = append(findings, llm.Finding{
 			Severity: "high", Category: "correctness", FilePath: "main.go", LineKind: "new", Line: 2,
 			Title: "issue " + string(rune('A'+i)), Body: "b", Confidence: 0.8,

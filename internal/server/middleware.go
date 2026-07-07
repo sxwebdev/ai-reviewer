@@ -3,7 +3,39 @@ package server
 import (
 	"net"
 	"net/http"
+	"strings"
 )
+
+// setupGate hides the whole interface behind the setup screen until the
+// required config exists (GitLab host + token, claude CLI). Only the setup
+// page itself, static assets, and the health fragment pass while gated. It
+// runs inside auth: the setup form carries the GitLab token, so it stays
+// behind the loopback + session-token check.
+func (s *Server) setupGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.deps.NeedsSetup == nil || !s.deps.NeedsSetup() {
+			// Gate open: the setup page itself redirects home.
+			if r.URL.Path == "/setup" && r.Method == http.MethodGet {
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		switch {
+		case r.URL.Path == "/setup" || strings.HasPrefix(r.URL.Path, "/setup/"),
+			strings.HasPrefix(r.URL.Path, "/static/"),
+			r.URL.Path == "/health":
+			next.ServeHTTP(w, r)
+		case isHX(r):
+			// htmx fragments must navigate the whole page, not swap in a redirect.
+			w.Header().Set("HX-Redirect", "/setup")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		}
+	})
+}
 
 // auth enforces localhost-only access and a per-launch session token. The token
 // arrives once via ?token=, is stored in a cookie, then stripped from the URL.

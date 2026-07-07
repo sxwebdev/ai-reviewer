@@ -130,7 +130,7 @@ func TestJobNoDoubleClaimUnderConcurrency(t *testing.T) {
 	db := openTestDB(t)
 	ctx := t.Context()
 	const total = 30
-	for i := 0; i < total; i++ {
+	for range total {
 		if err := db.EnqueueJob(ctx, &Job{Type: JobSync}); err != nil {
 			t.Fatal(err)
 		}
@@ -139,10 +139,8 @@ func TestJobNoDoubleClaimUnderConcurrency(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]int{}
 	var wg sync.WaitGroup
-	for w := 0; w < 8; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			for {
 				j, err := db.ClaimJob(ctx, "w")
 				if err == ErrNotFound {
@@ -155,7 +153,7 @@ func TestJobNoDoubleClaimUnderConcurrency(t *testing.T) {
 				seen[j.ID]++
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
