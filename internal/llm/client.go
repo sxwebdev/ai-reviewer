@@ -10,6 +10,7 @@ type Request struct {
 	WorkDir      string   // process working directory (agent mode reads the repo here)
 	AgentMode    bool     // allow read-only repo inspection via tools
 	AllowedTools []string // tool permission rules (agent mode)
+	Skills       []string // Claude skills to enable for this call (agent mode)
 	JSONSchema   string   // optional strict-output JSON schema
 }
 

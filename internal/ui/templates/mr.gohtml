@@ -8,10 +8,37 @@
   <a class="btn" href="{{.MR.WebURL}}" target="_blank" rel="noreferrer">Open in GitLab ↗</a>
 </div>
 
-<div class="card">
-  <form method="post" action="/mr/{{.MR.ID}}/review" class="row">
-    <button class="btn btn--primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
-    <span class="muted small">Runs locally against the current head. Nothing is posted to GitLab until you publish.</span>
+<div class="card" x-data="{ open: false }">
+  <form method="post" action="/mr/{{.MR.ID}}/review">
+    <div class="row">
+      <button class="btn btn--primary" {{if .Running}}disabled{{end}}>{{if .Running}}Review running…{{else}}Run review{{end}}</button>
+      <button class="btn btn--ghost btn--sm" type="button" @click="open = !open" :aria-expanded="open">
+        <span x-text="open ? 'Hide context & skills' : 'Add context & skills'"></span>
+      </button>
+      <span class="muted small">Runs locally against the current head. Nothing is posted to GitLab until you publish.</span>
+    </div>
+
+    <div x-show="open" x-cloak class="run-extra">
+      <label class="label" for="run-context">Extra context for this review (optional)</label>
+      <textarea class="textarea" id="run-context" name="context" rows="4"
+                placeholder="Anything the reviewer should weigh: intent, risky areas, conventions, what to focus on…"></textarea>
+      <label class="check"><input type="checkbox" name="remember"> Remember this context for future reviews of this project</label>
+
+      {{if .AvailableSkills}}
+      <fieldset class="run-skills" {{if not .AgentMode}}disabled{{end}}>
+        <legend class="label">Skills to apply</legend>
+        {{if not .AgentMode}}
+        <p class="hint">⚠ Skills need agentic mode. Turn on <strong>Agentic</strong> in the header, then reload this page.</p>
+        {{end}}
+        {{range .AvailableSkills}}
+        <label class="check skill-opt" title="{{.Description}}">
+          <input type="checkbox" name="skills" value="{{.Name}}">
+          <span class="mono">{{.Name}}</span>{{if .Description}} <span class="muted small">— {{.Description}}</span>{{end}}
+        </label>
+        {{end}}
+      </fieldset>
+      {{end}}
+    </div>
   </form>
 </div>
 
@@ -69,7 +96,9 @@
       {{if .Risk}}<span class="badge risk-{{.Risk.Level}}" title="deterministic score from git history and diff stats">computed: {{.Risk.Score}}/100</span>{{end}}
       <span class="badge">{{.Review.OverallRecommendation}}</span>
       {{if .CostLabel}}<span class="muted small">{{.CostLabel}}</span>{{end}}
+      {{if .DurationLabel}}<span class="muted small" title="wall-clock time this review took">⏱ {{.DurationLabel}}</span>{{end}}
       {{if .Review.LLMModel}}<span class="muted small mono">{{.Review.LLMModel}}</span>{{end}}
+      {{range .UsedSkills}}<span class="badge badge--pass" title="skill used in this review">/{{.}}</span>{{end}}
       <span class="grow"></span>
       {{if not .Historical}}
         {{if gt .ProposedCount 0}}<form method="post" action="/review/{{.Review.ID}}/approve-all"><button class="btn">Approve all ({{.ProposedCount}})</button></form>{{end}}

@@ -62,7 +62,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		if s.reviewedCurrentHead(ctx, mr) {
 			continue
 		}
-		id, err := EnqueueReview(ctx, s.db, mr.ID, mr.ProjectID, mr.IID)
+		id, err := EnqueueReview(ctx, s.db, mr.ID, mr.ProjectID, mr.IID, ReviewRequest{})
 		if err != nil {
 			s.log.Warn("enqueue review failed", "mr", mr.IID, "err", err)
 			continue

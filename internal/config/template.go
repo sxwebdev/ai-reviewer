@@ -28,7 +28,7 @@ gitlab:
 
 llm:
   provider: "claude-cli"
-  model: "sonnet"
+  model: "claude-sonnet-5"   # claude-opus-4-8 | claude-sonnet-5 | claude-haiku-4-5-20251001 | claude-fable-5
   timeout: "15m"
   claude:
     bin: "claude"
@@ -44,6 +44,13 @@ llm:
       - "Glob"
       - "Bash(git diff *)"
       - "Bash(git log *)"
+    # Granted only when a review selects skills (skills may run Bash, etc.):
+    skill_tools:
+      - "Skill"
+      - "Read"
+      - "Grep"
+      - "Glob"
+      - "Bash"
 
 review:
   default_mode: "full"

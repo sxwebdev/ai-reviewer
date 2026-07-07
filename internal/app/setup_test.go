@@ -166,18 +166,18 @@ func TestApplySettingsValidatesAndSwaps(t *testing.T) {
 	old := a.Bundle()
 	if err := a.ApplySettings(t.Context(), map[string]string{
 		"review.pipeline.mode": "deep",
-		"llm.model":            "opus",
+		"llm.model":            "claude-opus-4-8",
 	}); err != nil {
 		t.Fatalf("ApplySettings: %v", err)
 	}
 	cfg := a.Config()
-	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "opus" {
+	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "claude-opus-4-8" {
 		t.Errorf("settings not applied: mode %q model %q", cfg.Review.Pipeline.Mode, cfg.LLM.Model)
 	}
 	if a.Bundle() == old {
 		t.Error("bundle was not rebuilt")
 	}
-	if a.uiConfig().PipelineMode != "deep" || a.uiConfig().LLMModel != "opus" {
+	if a.uiConfig().PipelineMode != "deep" || a.uiConfig().LLMModel != "claude-opus-4-8" {
 		t.Errorf("uiConfig stale: %+v", a.uiConfig())
 	}
 }
@@ -222,13 +222,13 @@ func TestHotApplyRace(t *testing.T) {
 // instead of reporting success for a setting that did not take effect.
 func TestApplySettingsEnvShadow(t *testing.T) {
 	t.Setenv("GITLAB_TOKEN", "")
-	t.Setenv("AI_REVIEWER_LLM_MODEL", "sonnet")
+	t.Setenv("AI_REVIEWER_LLM_MODEL", "claude-sonnet-5")
 	a := newTestApp(t)
 	if _, err := a.Services(); err != nil {
 		t.Fatal(err)
 	}
 
-	err := a.ApplySettings(t.Context(), map[string]string{"llm.model": "opus"})
+	err := a.ApplySettings(t.Context(), map[string]string{"llm.model": "claude-opus-4-8"})
 	if err == nil {
 		t.Fatal("expected env-shadow error, got nil")
 	}
@@ -236,7 +236,7 @@ func TestApplySettingsEnvShadow(t *testing.T) {
 		t.Errorf("error does not name the shadowing env var: %v", err)
 	}
 	// The runtime stays consistent with the environment, not the form value.
-	if got := a.Config().LLM.Model; got != "sonnet" {
+	if got := a.Config().LLM.Model; got != "claude-sonnet-5" {
 		t.Errorf("effective model = %q, want sonnet (env)", got)
 	}
 	// The file still records the user's choice for when the env var is unset.
@@ -244,7 +244,7 @@ func TestApplySettingsEnvShadow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `model: "opus"`) {
+	if !strings.Contains(string(raw), `model: "claude-opus-4-8"`) {
 		t.Error("chosen model not persisted to the file")
 	}
 }

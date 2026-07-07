@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -99,8 +100,20 @@ func (c *ClaudeCLI) runOnce(ctx context.Context, req Request) (*claudeEnvelope, 
 	if req.JSONSchema != "" {
 		args = append(args, "--json-schema", req.JSONSchema)
 	}
-	if req.AgentMode && len(req.AllowedTools) > 0 {
-		args = append(args, "--allowedTools", strings.Join(req.AllowedTools, ","))
+	if req.AgentMode {
+		// Clone before appending: req.AllowedTools is shared across concurrent
+		// review passes (pipeline fan-out), and it may carry spare capacity, so an
+		// in-place append would race and corrupt the other passes' tool lists.
+		tools := slices.Clone(req.AllowedTools)
+		// Named skills selected for this run get an explicit Skill(name) allow
+		// rule so they can be invoked under the pre-approve (dontAsk) permission
+		// mode. The service also adds the tools the skills themselves need.
+		for _, sk := range req.Skills {
+			tools = append(tools, "Skill("+sk+")")
+		}
+		if len(tools) > 0 {
+			args = append(args, "--allowedTools", strings.Join(tools, ","))
+		}
 	}
 	args = append(args, c.opts.ExtraArgs...)
 
