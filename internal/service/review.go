@@ -132,11 +132,9 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	)
 	var enrich sync.WaitGroup
 	runEnrich := func(fn func()) {
-		enrich.Add(1)
-		go func() {
-			defer enrich.Done()
+		enrich.Go(func() {
 			fn()
-		}()
+		})
 	}
 	runEnrich(func() { fileContexts = s.buildFileContexts(ctx, projectKey, mr, files, workDir) })
 	runEnrich(func() { coverageReport = s.buildCoverageReport(ctx, workDir, files) })

@@ -138,11 +138,11 @@ func ParseHunks(diff string) ([]Hunk, error) {
 func parseHunkHeader(line string) (Hunk, error) {
 	// Trim to the section between the two @@ markers.
 	rest := strings.TrimPrefix(line, "@@")
-	end := strings.Index(rest, "@@")
-	if end < 0 {
+	before, _, ok := strings.Cut(rest, "@@")
+	if !ok {
 		return Hunk{}, fmt.Errorf("malformed hunk header: %q", line)
 	}
-	spec := strings.TrimSpace(rest[:end])
+	spec := strings.TrimSpace(before)
 	fields := strings.Fields(spec)
 	if len(fields) < 2 {
 		return Hunk{}, fmt.Errorf("malformed hunk header: %q", line)
@@ -165,12 +165,12 @@ func parseRange(field string, sign byte) (start, count int, err error) {
 	}
 	body := field[1:]
 	count = 1
-	if comma := strings.IndexByte(body, ','); comma >= 0 {
-		start, err = strconv.Atoi(body[:comma])
+	if before, after, ok := strings.Cut(body, ","); ok {
+		start, err = strconv.Atoi(before)
 		if err != nil {
 			return 0, 0, fmt.Errorf("bad range start %q: %w", field, err)
 		}
-		count, err = strconv.Atoi(body[comma+1:])
+		count, err = strconv.Atoi(after)
 		if err != nil {
 			return 0, 0, fmt.Errorf("bad range count %q: %w", field, err)
 		}

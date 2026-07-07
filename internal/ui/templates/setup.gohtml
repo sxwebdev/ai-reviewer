@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — ai-reviewer</title>
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('theme');
+      if (t) document.documentElement.setAttribute('data-theme', t);
+    } catch (e) {}
+  })();
+</script>
+<script src="/static/htmx.min.js"></script>
+</head>
+<body>
+<main id="main" class="page setup-page">
+  <h1>Welcome to ai-reviewer</h1>
+  <p class="muted">A few settings are required before the interface opens. Everything is stored locally in <code>~/.ai-reviewer/config.yaml</code> (mode 600).</p>
+
+  {{if .Flash}}<div class="alert alert--{{if eq .FlashKind "err"}}danger{{else if eq .FlashKind "ok"}}ok{{else if eq .FlashKind "warn"}}warn{{else}}info{{end}}" role="status"><div class="alert__body">{{.Flash}}</div></div>{{end}}
+  {{if .Error}}<div class="alert alert--danger" role="alert"><div class="alert__body">{{.Error}}</div></div>{{end}}
+
+  <form method="post" action="/setup">
+    <section class="card">
+      <h2>GitLab</h2>
+      <p class="muted">The token is verified against the API before anything is saved.</p>
+      <div class="form-row">
+        <label for="host">Host <span class="req">*</span></label>
+        <input class="input" id="host" name="host" type="url" placeholder="https://gitlab.example.com" value="{{.Host}}" required autofocus>
+      </div>
+      <div class="form-row">
+        <label for="token">Personal access token {{if not .Status.TokenFromEnv}}<span class="req">*</span>{{end}}</label>
+        <input class="input input--mono" id="token" name="token" type="password" autocomplete="off" placeholder="glpat-… (scope: api)">
+        {{if .Status.TokenFromEnv}}<p class="hint">A token was found in ${{.Status.TokenEnvName}} — leave this blank to keep using it (nothing is written to disk).</p>
+        {{else}}<p class="hint">Stored in the config file, which is kept at chmod 600.</p>{{end}}
+      </div>
+      <div class="form-row">
+        <label for="username">Username</label>
+        <input class="input" id="username" name="username" placeholder="auto-detected from the token" value="{{.Username}}">
+        <p class="hint">Your reviewer identity. Leave blank to use the token's account.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Environment</h2>
+      {{template "setup-claude-check" .}}
+    </section>
+
+    <div class="setup-actions">
+      <button class="btn btn--primary btn--lg" type="submit">Save and open ai-reviewer</button>
+      {{if not .Status.ClaudeFound}}<p class="hint">The claude CLI must be installed before the interface opens — install it, then Re-check.</p>{{end}}
+    </div>
+  </form>
+</main>
+</body>
+</html>
+
+{{define "setup-claude-check"}}
+<div id="claude-check" class="claude-check">
+  {{if .Status.ClaudeFound}}
+  <span class="badge badge--ok">claude CLI found</span>
+  <code class="claude-check__detail">{{.Status.ClaudeDetail}}</code>
+  {{else}}
+  <span class="badge badge--bad">claude CLI missing</span>
+  <span class="claude-check__detail">{{.Status.ClaudeDetail}} — install from <code>https://claude.com/claude-code</code> and make sure it is on PATH.</span>
+  {{end}}
+  <button class="btn btn--sm" type="button" hx-get="/setup/check" hx-target="#claude-check" hx-swap="outerHTML">Re-check</button>
+</div>
+{{end}}

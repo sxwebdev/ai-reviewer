@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -92,12 +93,7 @@ func LooksBinary(content []byte) bool {
 	if len(head) > 8000 {
 		head = head[:8000]
 	}
-	for _, b := range head {
-		if b == 0 {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(head, 0)
 }
 
 // MatchGlob reports whether rel matches any glob, supporting the "dir/**"

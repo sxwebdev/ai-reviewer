@@ -137,7 +137,7 @@ func (c *Cache) RecentHistory(ctx context.Context, host, projectPath string, max
 		return nil, err
 	}
 	var commits []CommitTouch
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if rest, ok := strings.CutPrefix(line, "\x00"); ok {
 			commits = append(commits, CommitTouch{Subject: rest})
 			continue

@@ -6,6 +6,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/sxwebdev/ai-reviewer/internal/app"
 	"github.com/sxwebdev/ai-reviewer/internal/config"
@@ -37,25 +38,34 @@ func NewApp() *cli.Command {
 			syncCommand(),
 			reviewCommand(),
 			doctorCommand(),
-			initCommand(),
 		},
 	}
 }
 
 // bootstrap loads config (with CLI overrides) and constructs the App + logger.
+// There is no init step: directories and the database are created on first
+// use, and the web UI walks the user through the required settings.
 func bootstrap(cmd *cli.Command) (*app.App, error) {
-	cfg, err := config.Load(cmd.String("config"))
+	path := cmd.String("config")
+	cfg, err := config.Load(path)
 	if err != nil {
-		return nil, err
+		shown := path
+		if shown == "" {
+			shown = config.DefaultConfigPath()
+		}
+		// With `init --force` gone this is the only recovery hint for a broken
+		// config file — without it every command dies here before any UI.
+		return nil, fmt.Errorf("%w\nfix or delete %s, then run 'ai-reviewer serve' to reconfigure via the web UI", err, shown)
 	}
 	log := app.NewLogger(cmd.Bool("debug"))
-	return app.New(cfg, log)
+	return app.New(cfg, path, log)
 }
 
 func serveCommand() *cli.Command {
 	return &cli.Command{
-		Name:  "serve",
-		Usage: "Start the local web UI and background worker",
+		Name:    "serve",
+		Usage:   "Start the local web UI and background worker",
+		Aliases: []string{"start"},
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "host", Usage: "Bind host"},
 			&cli.IntFlag{Name: "port", Usage: "Bind port (0 = random)", Value: -1},
@@ -68,13 +78,17 @@ func serveCommand() *cli.Command {
 				return err
 			}
 			defer a.Close()
-			if h := cmd.String("host"); h != "" {
-				a.Cfg.App.BindHost = h
-			}
-			if p := cmd.Int("port"); p >= 0 {
-				a.Cfg.App.Port = p
-			}
-			a.Cfg.App.OpenBrowser = cmd.Bool("open")
+			// Registered as overrides (not one-off mutations) so hot config
+			// reloads triggered from the web UI keep the flag values.
+			a.SetOverrides(func(cfg *config.Config) {
+				if h := cmd.String("host"); h != "" {
+					cfg.App.BindHost = h
+				}
+				if p := cmd.Int("port"); p >= 0 {
+					cfg.App.Port = p
+				}
+				cfg.App.OpenBrowser = cmd.Bool("open")
+			})
 			return a.Serve(ctx, app.ServeOptions{RunWorker: cmd.Bool("daemon")})
 		},
 	}
@@ -98,7 +112,7 @@ func daemonCommand() *cli.Command {
 				return err
 			}
 			defer a.Close()
-			applyDaemonFlags(a.Cfg, cmd)
+			a.SetOverrides(func(cfg *config.Config) { applyDaemonFlags(cfg, cmd) })
 			return a.RunDaemon(ctx)
 		},
 	}

@@ -139,9 +139,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	complRan := pc.Completeness == CompletenessOn ||
 		(pc.Completeness == CompletenessAuto && hasIntentText(in))
 	if complRan {
-		complWG.Add(1)
-		go func() {
-			defer complWG.Done()
+		complWG.Go(func() {
 			start := time.Now()
 			r, cost, err := e.checkCompleteness(complCtx, in)
 			complCost, complDur, complErr = cost, time.Since(start), err
@@ -150,7 +148,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 			} else {
 				completeness = r
 			}
-		}()
+		})
 	}
 	// The audit's claude subprocess must never outlive Review: on ANY exit
 	// (including the all-passes-failed early return) cancel it and wait, so

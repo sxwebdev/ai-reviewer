@@ -21,8 +21,8 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/ui"
 )
 
-// UIConfig carries the config bits the UI displays (Settings page) and uses to
-// label cost (subscription auth reports notional cost).
+// UIConfig carries the config bits the UI displays (Settings page, header
+// switches) and uses to label cost (subscription auth reports notional cost).
 type UIConfig struct {
 	Host              string
 	LLMModel          string
@@ -31,6 +31,22 @@ type UIConfig struct {
 	MaxComments       int
 	AgentMode         bool
 	SubscriptionAuth  bool // existing-login/oauth → reported cost is notional
+
+	// Header switches: current review depth (pipeline mode) and model, plus the
+	// choices offered in the selects.
+	PipelineMode  string
+	PipelineModes []string
+	Models        []string
+}
+
+// SetupStatus feeds the setup page: current prefills and environment checks.
+type SetupStatus struct {
+	Host         string
+	Username     string
+	TokenFromEnv bool   // a token is already resolvable via the token_env fallback
+	TokenEnvName string // name of that env var (never its value)
+	ClaudeFound  bool
+	ClaudeDetail string // resolved path, or a doctor-style "not found" message
 }
 
 // HealthCheck is one environment/config check result for the Health page. It
@@ -45,25 +61,58 @@ type HealthCheck struct {
 // server can surface health without importing app.
 type HealthFunc func(context.Context) []HealthCheck
 
-// Server is the local web UI.
-type Server struct {
-	svc    *service.Bundle
-	log    *slog.Logger
-	host   string // GitLab host, for display
-	cfg    UIConfig
-	tmpl   map[string]*template.Template
-	token  string
-	health HealthFunc
+// Deps carries everything the app layer injects. Function fields keep every
+// value hot-reloadable (the app can swap config and services at runtime) and
+// keep this package importable without internal/app (no cycle).
+type Deps struct {
+	// Bundle returns the current service bundle.
+	Bundle func() *service.Bundle
+	// UI returns the current display config (re-read per request so header
+	// switches reflect hot-applied changes).
+	UI func() UIConfig
+	// Health runs the doctor checks. May be nil (the panel reports nothing).
+	Health HealthFunc
+	// NeedsSetup reports whether the setup gate should hide the interface.
+	NeedsSetup func() bool
+	// SetupStatus returns prefills + environment checks for the setup page.
+	SetupStatus func() SetupStatus
+	// ValidateGitLab checks host+token against the live API and returns the
+	// authenticated username.
+	ValidateGitLab func(ctx context.Context, host, token string) (string, error)
+	// ApplySetup persists the GitLab settings and rebuilds services in-process.
+	// An empty token keeps the env-provided one (never written to disk).
+	ApplySetup func(ctx context.Context, host, username, token string) error
+	// ApplySettings persists whitelisted config keys (header switches) and
+	// rebuilds services in-process.
+	ApplySettings func(ctx context.Context, values map[string]string) error
 }
 
-// New builds the server and parses templates. health may be nil (the Health
-// panel then reports nothing).
-func New(svc *service.Bundle, cfg UIConfig, health HealthFunc, log *slog.Logger) (*Server, error) {
+// Server is the local web UI.
+type Server struct {
+	deps  Deps
+	log   *slog.Logger
+	tmpl  map[string]*template.Template
+	token string
+}
+
+// New builds the server and parses templates.
+func New(deps Deps, log *slog.Logger) (*Server, error) {
 	tmpl, err := parseTemplates()
 	if err != nil {
 		return nil, err
 	}
-	return &Server{svc: svc, log: log, host: cfg.Host, cfg: cfg, tmpl: tmpl, health: health}, nil
+	return &Server{deps: deps, log: log, tmpl: tmpl}, nil
+}
+
+// svc returns the current service bundle (hot-swappable by the app layer).
+func (s *Server) svc() *service.Bundle { return s.deps.Bundle() }
+
+// ui returns the current display config.
+func (s *Server) ui() UIConfig {
+	if s.deps.UI == nil {
+		return UIConfig{}
+	}
+	return s.deps.UI()
 }
 
 var funcMap = template.FuncMap{
@@ -107,7 +156,7 @@ var funcMap = template.FuncMap{
 // {{define "content"}} does not collide with another's.
 func parseTemplates() (map[string]*template.Template, error) {
 	pages := []string{"dashboard", "mr", "jobs", "memory", "settings"}
-	out := make(map[string]*template.Template, len(pages))
+	out := make(map[string]*template.Template, len(pages)+1)
 	for _, p := range pages {
 		t, err := template.New("base.gohtml").Funcs(funcMap).
 			ParseFS(ui.FS, "templates/base.gohtml", "templates/"+p+".gohtml")
@@ -116,18 +165,36 @@ func parseTemplates() (map[string]*template.Template, error) {
 		}
 		out[p] = t
 	}
+	// The setup page is a standalone document (no base layout: the interface
+	// stays hidden until setup completes).
+	t, err := template.New("setup.gohtml").Funcs(funcMap).ParseFS(ui.FS, "templates/setup.gohtml")
+	if err != nil {
+		return nil, fmt.Errorf("parse template setup: %w", err)
+	}
+	out["setup"] = t
 	return out, nil
 }
 
-// render executes a page template into the response.
+// renderSetup executes the standalone setup document.
+func (s *Server) renderSetup(w http.ResponseWriter, data any) {
+	s.renderRoot(w, "setup", "setup.gohtml", data)
+}
+
+// render executes a base-composed page template into the response.
 func (s *Server) render(w http.ResponseWriter, page string, data any) {
+	s.renderRoot(w, page, "base.gohtml", data)
+}
+
+// renderRoot executes a page's template set starting at the given root
+// template (base layout for normal pages, the standalone document for setup).
+func (s *Server) renderRoot(w http.ResponseWriter, page, root string, data any) {
 	t, ok := s.tmpl[page]
 	if !ok {
 		http.Error(w, "unknown page", http.StatusInternalServerError)
 		return
 	}
 	var buf bytes.Buffer
-	if err := t.ExecuteTemplate(&buf, "base.gohtml", data); err != nil {
+	if err := t.ExecuteTemplate(&buf, root, data); err != nil {
 		s.log.Error("render failed", "page", page, "err", err)
 		http.Error(w, "render error", http.StatusInternalServerError)
 		return
@@ -176,6 +243,10 @@ func (s *Server) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /memory", s.handleMemory)
 	mux.HandleFunc("GET /settings", s.handleSettings)
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /setup", s.handleSetup)
+	mux.HandleFunc("POST /setup", s.handleSetupSubmit)
+	mux.HandleFunc("GET /setup/check", s.handleSetupCheck)
+	mux.HandleFunc("POST /settings/apply", s.handleApplySettings)
 
 	staticFS, err := fs.Sub(ui.FS, "static")
 	if err != nil {
@@ -183,7 +254,7 @@ func (s *Server) routes() (http.Handler, error) {
 	}
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServerFS(staticFS)))
 
-	return s.auth(mux), nil
+	return s.auth(s.setupGate(mux)), nil
 }
 
 // Run binds to host:port (port 0 = random), prints the URL, optionally opens the

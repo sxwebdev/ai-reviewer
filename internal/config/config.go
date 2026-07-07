@@ -300,6 +300,13 @@ func (c *Config) GitLabToken() string {
 	return os.Getenv(env)
 }
 
+// GitLabConfigured reports whether the minimum GitLab settings are present: a
+// host and a resolvable token. It is the single definition of "configured"
+// shared by the web setup gate and the headless entrypoint guards.
+func (c *Config) GitLabConfigured() bool {
+	return c.GitLab.Host != "" && c.GitLabToken() != ""
+}
+
 // IsValidEnvName reports whether s is a syntactically valid POSIX environment
 // variable name ([A-Za-z_][A-Za-z0-9_]*). It is used to detect when token_env
 // was mistakenly set to a literal token (which contains '-'/'.') instead of an

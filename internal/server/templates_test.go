@@ -42,18 +42,18 @@ func TestTemplatesRender(t *testing.T) {
 		Unanchored: []*state.Finding{find}}
 
 	cases := map[string]any{
-		"dashboard": dashboardVM{baseVM: baseVM{Host: "h"}, MRs: []dashItem{
+		"dashboard": dashboardVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MRs: []dashItem{
 			{DashboardRow: state.DashboardRow{ID: 1, IID: 5, Title: "reviewed", Author: "alice", CreatedAt: 1700000000000, HeadSHA: "abc", ReviewHeadSHA: "abc", RiskLevel: "high", Findings: 2, Drafted: 1, Published: 2}},
 			{DashboardRow: state.DashboardRow{ID: 2, IID: 6, Title: "fresh", HeadSHA: "def"}},
 			{DashboardRow: state.DashboardRow{ID: 3, IID: 7, Title: "moved", HeadSHA: "new", ReviewHeadSHA: "old", RiskLevel: "low", Findings: 1}},
 		}},
-		"mr": mrVM{baseVM: baseVM{Host: "h"}, MR: mr, Review: rev, ProposedCount: 1, ApprovedCount: 1, DraftedCount: 1,
+		"mr": mrVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Review: rev, ProposedCount: 1, ApprovedCount: 1, DraftedCount: 1,
 			Groups:        []findingGroup{{Severity: "blocking", Items: []*state.Finding{find}}},
 			PublishPhrase: "PUBLISH 1 COMMENTS", CostLabel: "≈$0.9300 (covered by subscription)", Diff: diff,
 			PastReviews: []pastReviewVM{{ID: "revOld", When: "now", HeadSHA: "abc", RiskLevel: "low", Status: "done", Findings: 0}}},
-		"jobs":     jobsVM{baseVM: baseVM{Host: "h"}, Jobs: []*state.Job{{ID: "j1", Type: "review", Status: "failed", Error: "boom", MRIID: &mrIID, ProgressCurrent: 2, ProgressTotal: 5}}},
-		"memory":   memoryVM{baseVM: baseVM{Host: "h"}, Items: []*state.ReviewMemory{{ID: "m1", Type: "false_positive", Scope: "project", Title: "t", Body: "b", Enabled: true}}},
-		"settings": settingsVM{baseVM: baseVM{Host: "h"}, Cfg: UIConfig{Host: "h", LLMModel: "opus", CommentLanguage: "auto", SeverityThreshold: "medium", MaxComments: 12, AgentMode: true, SubscriptionAuth: true}},
+		"jobs":     jobsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Jobs: []*state.Job{{ID: "j1", Type: "review", Status: "failed", Error: "boom", MRIID: &mrIID, ProgressCurrent: 2, ProgressTotal: 5}}},
+		"memory":   memoryVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Items: []*state.ReviewMemory{{ID: "m1", Type: "false_positive", Scope: "project", Title: "t", Body: "b", Enabled: true}}},
+		"settings": settingsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Cfg: UIConfig{Host: "h", LLMModel: "opus", CommentLanguage: "auto", SeverityThreshold: "medium", MaxComments: 12, AgentMode: true, SubscriptionAuth: true}},
 	}
 	for page, data := range cases {
 		t.Run(page, func(t *testing.T) {
@@ -79,9 +79,9 @@ func TestReviewSectionFragment(t *testing.T) {
 	hist := &state.Review{ID: "old", HeadSHA: "0badf00d", RiskLevel: "low"}
 	find := &state.Finding{ID: "f", Severity: "low", Title: "t", Body: "b", Status: "proposed"}
 	for _, vm := range []mrVM{
-		{baseVM: baseVM{Host: "h"}, MR: mr, Running: true, Progress: "2/5"},
-		{baseVM: baseVM{Host: "h"}, MR: mr, JobStatus: "failed", JobError: "not logged in"},
-		{baseVM: baseVM{Host: "h"}, MR: mr, Historical: true, Review: hist,
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Running: true, Progress: "2/5"},
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, JobStatus: "failed", JobError: "not logged in"},
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Historical: true, Review: hist,
 			Groups: []findingGroup{{Severity: "low", Items: []*state.Finding{find}}}},
 	} {
 		var buf bytes.Buffer

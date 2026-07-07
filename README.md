@@ -47,11 +47,14 @@ go install github.com/sxwebdev/ai-reviewer/cmd/ai-reviewer@latest
 ## Quick start
 
 ```bash
-ai-reviewer init      # writes ~/.ai-reviewer/{config.yaml, state.db, cache}
-# edit ~/.ai-reviewer/config.yaml: set gitlab.host, gitlab.username, gitlab.token (scope: api)
-ai-reviewer doctor    # verifies GitLab auth, Claude, git, DB, FTS5
-ai-reviewer serve     # opens the local web UI
+ai-reviewer start     # opens the local web UI
 ```
+
+On first run the web UI shows a setup screen: enter your GitLab host and a
+personal access token (scope: `api`) — the token is verified live, your
+username is auto-detected, and everything is saved to
+`~/.ai-reviewer/config.yaml` (chmod 600). Directories and the SQLite DB are
+created automatically. `ai-reviewer doctor` verifies the environment any time.
 
 Then in the web UI: **Sync assigned MRs** → open an MR → **Run review** →
 approve findings → **Create GitLab draft notes** → **Publish** (type the
@@ -61,16 +64,15 @@ confirmation phrase).
 
 | Command                    | Purpose                                                   |
 | -------------------------- | --------------------------------------------------------- |
-| `ai-reviewer init`         | Create config, data dir, and migrated SQLite DB           |
 | `ai-reviewer doctor`       | Check GitLab auth/reachability, Claude, git, DB, FTS5, Go |
-| `ai-reviewer serve`        | Start the local web UI (+ background worker)              |
+| `ai-reviewer start`        | Start the local web UI (+ background worker)              |
 | `ai-reviewer daemon`       | Run the watch worker + scheduler headless                 |
 | `ai-reviewer sync`         | One-shot sync of MRs assigned to you for review           |
 | `ai-reviewer review <ref>` | One-shot review of one MR (local report only)             |
 
 `<ref>` accepts a full MR URL, `group/sub/repo!123`, or `project-id:iid`.
 
-Global flags: `--config <path>`, `--debug`. `serve` adds `--host`, `--port`,
+Global flags: `--config <path>`, `--debug`. `start` adds `--host`, `--port`,
 `--open`, `--daemon`. `daemon` adds `--interval`, `--auto-review`,
 `--auto-draft`, `--auto-publish`, `--max-parallel`.
 
@@ -149,7 +151,7 @@ changes. Cost shows as "unavailable" on subscription/OAuth auth.
 
 ## Configuration
 
-`~/.ai-reviewer/config.yaml` (created by `init`). Any field can be overridden by
+`~/.ai-reviewer/config.yaml` (created automatically on first setup). Any field can be overridden by
 `AI_REVIEWER_<PATH>` env vars. Key sections: `app`, `gitlab`, `llm`, `review`
 (including `review.pipeline` for pass/verification modes and `review.context`
 for prompt-context budgets), `watch`, `index`, `storage`. See the generated
