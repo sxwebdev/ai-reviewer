@@ -271,7 +271,7 @@ func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *
 		Title: mr.Title, Description: mr.Description, AuthorUsername: mr.Author.Username,
 		SourceBranch: mr.SourceBranch, TargetBranch: mr.TargetBranch, State: mr.State,
 		Draft: mr.IsDraft(), HeadSHA: mr.SHA, BaseSHA: mr.DiffRefs.BaseSHA, StartSHA: mr.DiffRefs.StartSHA,
-		UpdatedAt: parseTime(mr.UpdatedAt),
+		UpdatedAt: parseTime(mr.UpdatedAt), CreatedAt: parseTime(mr.CreatedAt),
 	})
 }
 

@@ -110,7 +110,11 @@ func (db *DB) GetProjectByGitLabID(ctx context.Context, host string, projectID i
 // ---- merge requests ----
 
 // UpsertMergeRequest inserts or updates an MR by (host, project_id, iid) and
-// returns its local id.
+// returns its local id. created_at is preserved when the incoming value is 0: a
+// partial upsert from the review flow — which does not carry the MR's creation
+// time — can't clobber the stored value, while a real value from sync still
+// heals a row that a prior partial upsert had zeroed. review_status is likewise
+// preserved across upserts (never in the update set).
 func (db *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, error) {
 	now := nowMillis()
 	_, err := db.ExecContext(ctx,
@@ -131,7 +135,7 @@ func (db *DB) UpsertMergeRequest(ctx context.Context, mr *MergeRequest) (int64, 
 			head_sha        = excluded.head_sha,
 			base_sha        = excluded.base_sha,
 			start_sha       = excluded.start_sha,
-			created_at      = excluded.created_at,
+			created_at      = COALESCE(NULLIF(excluded.created_at, 0), created_at),
 			updated_at      = excluded.updated_at,
 			last_seen_at    = excluded.last_seen_at`,
 		mr.GitLabHost, mr.ProjectID, mr.IID, mr.WebURL, mr.Title, mr.Description, mr.AuthorUsername,
