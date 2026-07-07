@@ -56,7 +56,7 @@ func TestTSCVerifierDropOnClean(t *testing.T) {
 		tsFinding("web/src/App.tsx", "type error in App", "this does not typecheck"),
 		tsFinding("web/src/App.tsx", "naming", "rename please"), // no claim → untouched
 	}
-	got := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
+	got, _ := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 || got[0].Title != "naming" {
 		t.Fatalf("clean tsc must drop the type-error claim: %v", titlesOf(got))
 	}
@@ -76,7 +76,7 @@ func TestTSCVerifierAnnotateWhenFileFlagged(t *testing.T) {
 		"node_modules/.bin/tsc": fakeTSC(t, "src/App.tsx(3,5): error TS2322: nope", 2, marker),
 	})
 	findings := []ValidatedFinding{tsFinding("src/App.tsx", "type error", "not assignable to string")}
-	got := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
+	got, _ := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 {
 		t.Fatal("flagged file must be kept")
 	}
@@ -96,7 +96,7 @@ func TestTSCVerifierKeepWhenErrorsElsewhere(t *testing.T) {
 		"node_modules/.bin/tsc": fakeTSC(t, "src/Other.tsx(1,1): error TS2304: x", 2, marker),
 	})
 	findings := []ValidatedFinding{tsFinding("src/App.tsx", "type error", "does not compile")}
-	got := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
+	got, _ := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 || got[0].ValidationError != "" {
 		t.Fatalf("errors in other files must neither drop nor annotate: %+v", got)
 	}
@@ -105,7 +105,7 @@ func TestTSCVerifierKeepWhenErrorsElsewhere(t *testing.T) {
 func TestTSCVerifierKeepWithoutTsconfigOrTSC(t *testing.T) {
 	wd := writeTree(t, map[string]string{"src/App.tsx": "export {}"})
 	findings := []ValidatedFinding{tsFinding("src/App.tsx", "type error", "does not typecheck")}
-	got := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
+	got, _ := runVerifiers(context.Background(), wd, []Verifier{newTSCVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 {
 		t.Fatal("no tsconfig → keep")
 	}
@@ -146,7 +146,7 @@ func TestPySyntaxVerifier(t *testing.T) {
 		{FilePath: "bad.py", Title: "syntax error", Body: "invalid syntax here", Severity: "high"},
 		{FilePath: "good.py", Title: "logic", Body: "off by one", Severity: "high"},
 	}
-	got := runVerifiers(context.Background(), wd, []Verifier{newPySyntaxVerifier(discardLog())}, findings, discardLog())
+	got, _ := runVerifiers(context.Background(), wd, []Verifier{newPySyntaxVerifier(discardLog())}, findings, discardLog())
 	byTitleFile := map[string]ValidatedFinding{}
 	for _, f := range got {
 		byTitleFile[f.FilePath+"/"+f.Title] = f

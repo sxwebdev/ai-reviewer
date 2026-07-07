@@ -100,6 +100,7 @@ type Review struct {
 	RiskJSON              string // serialized review.RiskReport (deterministic risk)
 	CompletenessJSON      string // serialized review.CompletenessReport
 	CoverageJSON          string // serialized coverage.Report (changed-line coverage)
+	SuppressedJSON        string // serialized []review.SuppressedFinding (dropped-but-surfaced)
 	CostUSD               float64
 	DurationMS            int64  // wall-clock time the review run took, in ms
 	UserContext           string // free-form reviewer-supplied context for this run

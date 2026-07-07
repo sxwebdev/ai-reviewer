@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/state"
 )
 
@@ -57,7 +58,10 @@ func TestTemplatesRender(t *testing.T) {
 			PublishPhrase: "PUBLISH 1 COMMENTS", CostLabel: "≈$0.9300 (covered by subscription)", Diff: diff,
 			AgentMode: true, UsedSkills: []string{"go-test"},
 			AvailableSkills: []skillOption{{Name: "go-test", Description: "Go testing house style"}, {Name: "commit"}},
-			PastReviews:     []pastReviewVM{{ID: "revOld", When: "now", HeadSHA: "abc", RiskLevel: "low", Status: "done", Findings: 0}}},
+			Suppressed: []suppressedVM{{review.SuppressedFinding{Title: "low nit", Body: "minor", Severity: "low",
+				Category: "style", FilePath: "main.go", Pass: "correctness", Stage: review.SuppressThreshold,
+				Reason: "severity low is below the medium threshold"}}},
+			PastReviews: []pastReviewVM{{ID: "revOld", When: "now", HeadSHA: "abc", RiskLevel: "low", Status: "done", Findings: 0}}},
 		"jobs":   jobsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Jobs: []*state.Job{{ID: "j1", Type: "review", Status: "failed", Error: "boom", MRIID: &mrIID, ProgressCurrent: 2, ProgressTotal: 5}}},
 		"memory": memoryVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Items: []*state.ReviewMemory{{ID: "m1", Type: "false_positive", Scope: "project", Title: "t", Body: "b", Enabled: true}}},
 		"settings": settingsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Settings: SettingsView{Sections: []SettingsSection{{

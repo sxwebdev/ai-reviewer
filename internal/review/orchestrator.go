@@ -90,6 +90,7 @@ type Result struct {
 	RiskLevel      string
 	Recommendation string
 	Findings       []ValidatedFinding
+	Suppressed     []SuppressedFinding // dropped-but-surfaced findings (informational, never published)
 	MissingTests   []llm.MissingTest
 	Questions      []llm.Question
 	Raw            string
@@ -200,13 +201,15 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		SeverityThreshold: in.Profile.SeverityThreshold,
 		MaxComments:       maxComments * candidateMultiplier,
 	})
-	findings := v.Validate(merged, in.Files, in.Refs, in.ProjectID, in.MRIID, in.ExistingFingerprints)
+	findings, suppressed := v.Validate(merged, in.Files, in.Refs, in.ProjectID, in.MRIID, in.ExistingFingerprints)
 
 	// Stage 4: skeptic verification (agent mode only).
 	if pc.VerifyMode == VerifySkeptic && in.WorkDir != "" && len(findings) > 0 {
 		start := time.Now()
 		var skepticCost float64
-		findings, skepticCost = e.skepticStage(ctx, in, pc, findings)
+		var skepticDropped []SuppressedFinding
+		findings, skepticDropped, skepticCost = e.skepticStage(ctx, in, pc, findings)
+		suppressed = append(suppressed, skepticDropped...)
 		merged.CostUSD += skepticCost
 		reports = append(reports, PassReport{
 			Name: "skeptic", CostUSD: skepticCost, DurationMS: time.Since(start).Milliseconds(),
@@ -216,13 +219,21 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	// Stage 5: deterministic verification against the worktree (e.g. go build
 	// refuting "does not compile" claims, go vet corroboration).
 	if in.WorkDir != "" {
-		findings = runVerifiers(ctx, in.WorkDir, BuiltinVerifiers(pc.Verifiers, e.log), findings, e.log)
+		var verifierDropped []SuppressedFinding
+		findings, verifierDropped = runVerifiers(ctx, in.WorkDir, BuiltinVerifiers(pc.Verifiers, e.log), findings, e.log)
+		suppressed = append(suppressed, verifierDropped...)
 	}
 
 	// Stage 6: finalize.
 	rankFindings(findings)
 	if len(findings) > maxComments {
 		findings = findings[:maxComments]
+	}
+	// Suppressed items are informational only — rank by severity and bound the
+	// list so a noisy run can't bloat the stored review.
+	suppressed = rankSuppressed(suppressed)
+	if len(suppressed) > maxSuppressed {
+		suppressed = suppressed[:maxSuppressed]
 	}
 
 	complWG.Wait()
@@ -240,6 +251,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		"risk", merged.RiskLevel, "cost_usd", merged.CostUSD)
 
 	res := assembleResult(merged, findings, reports)
+	res.Suppressed = suppressed
 	res.Completeness = completeness
 	return res, nil
 }

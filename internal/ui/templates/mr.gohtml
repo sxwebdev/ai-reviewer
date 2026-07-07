@@ -193,6 +193,26 @@
     </details>
     {{end}}
 
+    {{if .Suppressed}}
+    <details class="report-details suppressed">
+      <summary class="muted small">Also considered · {{len .Suppressed}} suppressed — informational, not published</summary>
+      {{range .Suppressed}}
+      <div class="suppressed-item">
+        <div class="row wrap">
+          <span class="badge sev-{{.Severity}}">{{.Severity}}</span>
+          {{if .Category}}<span class="badge badge--cat">{{.Category}}</span>{{end}}
+          <span class="badge badge--info" title="{{.Reason}}">{{.StageLabel}}</span>
+          {{if and .Pass (ne .Pass "general")}}<span class="badge badge--pass">{{.Pass}}</span>{{end}}
+          <strong class="finding-title">{{.Title}}</strong>
+          {{if .FilePath}}<span class="mono muted small">{{.FilePath}}</span>{{end}}
+        </div>
+        {{if .Body}}<div class="finding-body">{{.Body}}</div>{{end}}
+        <p class="hint">{{.Reason}}</p>
+      </div>
+      {{end}}
+    </details>
+    {{end}}
+
     {{if not .Groups}}<p class="muted">No findings.</p>{{end}}
     {{range .Groups}}
     <h4 class="sev-group-head sev-{{.Severity}}">{{.Severity}} <span class="count">· {{len .Items}}</span></h4>

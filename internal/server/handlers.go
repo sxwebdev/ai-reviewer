@@ -135,6 +135,7 @@ type mrVM struct {
 	Risk            *review.RiskReport
 	Completeness    *review.CompletenessReport
 	Coverage        *coverage.Report
+	Suppressed      []suppressedVM // findings the pipeline dropped, shown read-only
 	ActionError     string
 	PastReviews     []pastReviewVM
 	Diff            diffVM
@@ -153,6 +154,28 @@ type mrVM struct {
 type newCommitVM struct {
 	ShortSHA string
 	Title    string
+}
+
+// suppressedVM is one finding the pipeline dropped, surfaced read-only in the
+// "also considered" section. It embeds the engine type and adds display helpers.
+type suppressedVM struct {
+	review.SuppressedFinding
+}
+
+// StageLabel is the short human label for the drop stage badge.
+func (s suppressedVM) StageLabel() string {
+	switch s.Stage {
+	case review.SuppressThreshold:
+		return "below threshold"
+	case review.SuppressDuplicate:
+		return "already raised"
+	case review.SuppressSkeptic:
+		return "skeptic disputed"
+	case review.SuppressVerifier:
+		return "refuted by build/vet"
+	default:
+		return s.Stage
+	}
 }
 
 // HeadChanged reports that the MR's current head has advanced past the head the
@@ -388,6 +411,14 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 			var cov coverage.Report
 			if err := json.Unmarshal([]byte(sel.CoverageJSON), &cov); err == nil && (len(cov.Files) > 0 || len(cov.Skipped) > 0) {
 				vm.Coverage = &cov
+			}
+		}
+		if sel.SuppressedJSON != "" {
+			var sup []review.SuppressedFinding
+			if err := json.Unmarshal([]byte(sel.SuppressedJSON), &sup); err == nil {
+				for _, sf := range sup {
+					vm.Suppressed = append(vm.Suppressed, suppressedVM{sf})
+				}
 			}
 		}
 		for _, rv := range reviews {

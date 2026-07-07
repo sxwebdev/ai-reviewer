@@ -88,6 +88,14 @@ func TestReviewServiceEndToEnd(t *testing.T) {
 	if f2, _ := db.ListFindingsByReview(ctx, reviewID2); len(f2) != 0 {
 		t.Errorf("re-review should dedupe existing finding, got %d", len(f2))
 	}
+	// ...but the deduped finding is now retained as a suppressed item, not lost.
+	rv2, err := db.GetReview(ctx, reviewID2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rv2.SuppressedJSON, `"stage":"duplicate"`) {
+		t.Errorf("re-review should record the deduped finding as suppressed, got %q", rv2.SuppressedJSON)
+	}
 }
 
 // A re-review at a new head SHA must carry the previous review (summary,

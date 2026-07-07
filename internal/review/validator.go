@@ -1,6 +1,7 @@
 package review
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -47,29 +48,52 @@ func (v *Validator) Validate(
 	refs gitlab.DiffRefs,
 	projectID, mrIID int64,
 	existing map[string]bool,
-) []ValidatedFinding {
+) ([]ValidatedFinding, []SuppressedFinding) {
 	threshold := SeverityRank(v.cfg.SeverityThreshold)
-	seen := map[string]bool{}
+	seen := map[string]bool{}    // dedup for kept findings
+	seenSup := map[string]bool{} // dedup for suppressed findings (independent set)
 	var out []ValidatedFinding
+	var suppressed []SuppressedFinding
 
 	for _, f := range resp.Findings {
 		if strings.TrimSpace(f.Title) == "" || strings.TrimSpace(f.Body) == "" {
 			continue // empty findings are not actionable
 		}
 		severity := NormalizeSeverity(f.Severity)
-		// Blocking findings are a floor: they always pass the threshold, so a
-		// finding flagged critical/blocking is never dropped by a label mismatch.
-		if !f.Blocking && SeverityRank(severity) < threshold {
-			continue // below severity threshold
-		}
+		// File-in-diff is the first gate: we never surface (nor comment on) a
+		// finding about code outside the changed set, regardless of severity.
 		fd := FindFileDiff(files, f.FilePath)
 		if fd == nil {
 			continue // file not in the changed set — do not comment on pre-existing code
 		}
-
 		fp := Fingerprint(projectID, mrIID, f.FilePath, f.Category, f.Title)
-		if existing[fp] || seen[fp] {
-			continue // duplicate of a prior finding / existing discussion / within this response
+
+		// Blocking findings are a floor: they always pass the threshold, so a
+		// finding flagged critical/blocking is never dropped by a label mismatch.
+		if !f.Blocking && SeverityRank(severity) < threshold {
+			// Real but low-severity: keep it as informational context instead of
+			// discarding it silently. seenSup dedupes so a repeated finding does
+			// not fill the "also considered" list with identical copies.
+			if !seenSup[fp] {
+				seenSup[fp] = true
+				suppressed = append(suppressed, suppressedFrom(f, severity, SuppressThreshold,
+					fmt.Sprintf("severity %s is below the %s threshold", severity, v.cfg.SeverityThreshold)))
+			}
+			continue
+		}
+		if existing[fp] {
+			// Matches a prior review's finding / an existing discussion: kept out
+			// of the comment flow (anti-spam) but shown so the reviewer sees it
+			// was raised again.
+			if !seenSup[fp] {
+				seenSup[fp] = true
+				suppressed = append(suppressed, suppressedFrom(f, severity, SuppressDuplicate,
+					"already raised in a prior review or an existing discussion"))
+			}
+			continue
+		}
+		if seen[fp] {
+			continue // duplicate within this same response — pure noise
 		}
 		seen[fp] = true
 
@@ -106,7 +130,23 @@ func (v *Validator) Validate(
 	if len(out) > v.cfg.MaxComments {
 		out = out[:v.cfg.MaxComments]
 	}
-	return out
+	return out, suppressed
+}
+
+// suppressedFrom builds a SuppressedFinding from a raw LLM finding dropped before
+// position mapping. The body is scrubbed and length-capped exactly like a kept
+// finding, so the "no secrets in output" invariant holds for suppressed items too.
+func suppressedFrom(f llm.Finding, severity, stage, reason string) SuppressedFinding {
+	return SuppressedFinding{
+		Title:    strings.TrimSpace(f.Title),
+		Body:     sanitizeBody(f.Body),
+		Severity: severity,
+		Category: strings.ToLower(strings.TrimSpace(f.Category)),
+		FilePath: f.FilePath,
+		Pass:     f.PassName,
+		Stage:    stage,
+		Reason:   reason,
+	}
 }
 
 // clamp01 bounds a model-supplied confidence to [0,1] — Go owns validation of
@@ -129,6 +169,17 @@ func rankFindings(fs []ValidatedFinding) {
 		}
 		return fs[i].Confidence > fs[j].Confidence
 	})
+}
+
+// maxSuppressed bounds the informational "also considered" list stored per review.
+const maxSuppressed = 20
+
+// rankSuppressed orders suppressed findings most-severe first for display.
+func rankSuppressed(fs []SuppressedFinding) []SuppressedFinding {
+	sort.SliceStable(fs, func(i, j int) bool {
+		return SeverityRank(fs[i].Severity) > SeverityRank(fs[j].Severity)
+	})
+	return fs
 }
 
 func verificationRank(v string) int {

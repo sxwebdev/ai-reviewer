@@ -41,8 +41,9 @@ func requireGo(t *testing.T) {
 
 func runBuildVerifier(t *testing.T, dir string, findings []ValidatedFinding) []ValidatedFinding {
 	t.Helper()
-	return runVerifiers(context.Background(), dir,
+	got, _ := runVerifiers(context.Background(), dir,
 		[]Verifier{newGoBuildVerifier(discardLog())}, findings, discardLog())
+	return got
 }
 
 // The exact regression: a blocking finding claims new(0.3) does not compile, but
@@ -166,7 +167,7 @@ func TestRunVerifiersNoWorkdirIsNoop(t *testing.T) {
 	findings := []ValidatedFinding{
 		{FilePath: "eval/eval.go", Title: "does not compile", Body: "x", Severity: "blocking"},
 	}
-	got := runVerifiers(context.Background(), "",
+	got, _ := runVerifiers(context.Background(), "",
 		[]Verifier{newGoBuildVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 {
 		t.Fatalf("no-workdir must pass findings through, got %d", len(got))
@@ -186,7 +187,7 @@ func TestGoVetVerifierAnnotatesAndNeverDrops(t *testing.T) {
 		{FilePath: "p/p.go", Title: "printf bug", Body: "arity mismatch", Severity: "high", Category: "correctness"},
 		{FilePath: "q/q.go", Title: "logic bug", Body: "suspicious", Severity: "high", Category: "correctness"},
 	}
-	got := runVerifiers(context.Background(), dir,
+	got, _ := runVerifiers(context.Background(), dir,
 		[]Verifier{newGoVetVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 2 {
 		t.Fatalf("vet verifier must never drop, got %d survivors", len(got))
@@ -211,7 +212,7 @@ func TestGoVetVerifierExactFileMatch(t *testing.T) {
 	findings := []ValidatedFinding{
 		{FilePath: "p/client.go", Title: "logic bug", Body: "suspicious", Severity: "high", Category: "correctness"},
 	}
-	got := runVerifiers(context.Background(), dir,
+	got, _ := runVerifiers(context.Background(), dir,
 		[]Verifier{newGoVetVerifier(discardLog())}, findings, discardLog())
 	if len(got) != 1 {
 		t.Fatal("vet never drops")
