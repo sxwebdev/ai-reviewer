@@ -47,7 +47,7 @@ func TestReviewServiceEndToEnd(t *testing.T) {
 		LLMProvider: "claude-cli", Profile: review.DefaultProfile(),
 	}, discardLogger())
 
-	reviewID, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5})
+	reviewID, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}, ReviewOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestReviewServiceEndToEnd(t *testing.T) {
 	}
 
 	// Re-review dedupes against the prior finding (same fingerprint).
-	reviewID2, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5})
+	reviewID2, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}, ReviewOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestReviewServicePriorReviewContext(t *testing.T) {
 		Context: review.DefaultContextBudget(),
 	}, discardLogger())
 
-	reviewID, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5})
+	reviewID, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}, ReviewOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestReviewServicePriorReviewContext(t *testing.T) {
 	fake.MRs["10/5"].SHA = "sha-two"
 	fake.MRs["10/5"].DiffRefs.HeadSHA = "sha-two"
 
-	if _, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}); err != nil {
+	if _, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}, ReviewOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	prompt := llmFake.LastRequest.Prompt
@@ -155,5 +155,55 @@ func TestReviewServicePriorReviewContext(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "rejected: intentional: errors ignored here") {
 		t.Error("rejection reason missing from prompt")
+	}
+}
+
+// Project-scoped review memory must reach only its own project's prompt; global
+// memory (no project id) must reach every project. Guards the loadMemory scope
+// filter that backs the "remember context for this project" feature.
+func TestReviewServiceMemoryScope(t *testing.T) {
+	ctx := t.Context()
+	db := testDB(t)
+
+	const diff = "@@ -1,2 +1,3 @@\n package main\n+import \"fmt\"\n func main() {}\n"
+	fake := gitlab.NewFake()
+	fake.Projects["10"] = &gitlab.Project{ID: 10, PathWithNamespace: "group/repo"}
+	fake.MRs["10/5"] = &gitlab.MergeRequest{
+		IID: 5, ProjectID: 10, Title: "Add import", SHA: "headsha",
+		Author:   gitlab.User{Username: "alice"},
+		DiffRefs: gitlab.DiffRefs{BaseSHA: "base", HeadSHA: "headsha", StartSHA: "start"},
+	}
+	fake.Diffs["10/5"] = []gitlab.MergeRequestDiff{{OldPath: "main.go", NewPath: "main.go", Diff: diff}}
+
+	otherProj, thisProj := int64(99), int64(10)
+	for _, m := range []*state.ReviewMemory{
+		{ID: "global", Scope: "global", Type: "convention", Title: "GlobalRule", Body: "global-body", Enabled: true},
+		{ID: "mine", Scope: "project", ProjectID: &thisProj, Type: "context", Title: "MineRule", Body: "mine-body", Enabled: true},
+		{ID: "other", Scope: "project", ProjectID: &otherProj, Type: "context", Title: "OtherRule", Body: "other-body", Enabled: true},
+	} {
+		if err := db.UpsertReviewMemory(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	llmFake := llm.NewFake(&llm.ReviewResponse{Summary: "ok", RiskLevel: "low", OverallRecommendation: "comment"})
+	eng := review.NewEngine(llmFake, discardLogger())
+	svc := NewReviewService(fake, db, eng, ReviewConfig{
+		Host: "https://gitlab.test", ReviewerUsername: "me", Model: "sonnet",
+		LLMProvider: "claude-cli", Profile: review.DefaultProfile(),
+	}, discardLogger())
+
+	if _, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}, ReviewOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := llmFake.LastRequest.Prompt
+	if !strings.Contains(prompt, "global-body") {
+		t.Error("global memory should reach every project's prompt")
+	}
+	if !strings.Contains(prompt, "mine-body") {
+		t.Error("this project's scoped memory should be in the prompt")
+	}
+	if strings.Contains(prompt, "other-body") {
+		t.Error("another project's scoped memory leaked into this project's prompt")
 	}
 }

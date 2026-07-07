@@ -153,7 +153,7 @@ func (a *App) ReviewOnce(ctx context.Context, ref string) error {
 		Risk:             riskSettingsFromConfig(cfg.Review),
 	}, a.Log)
 
-	reviewID, err := svc.RunReview(ctx, mrRef)
+	reviewID, err := svc.RunReview(ctx, mrRef, service.ReviewOptions{})
 	if err != nil {
 		return err
 	}

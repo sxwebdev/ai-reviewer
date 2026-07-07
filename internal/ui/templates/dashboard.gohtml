@@ -8,7 +8,7 @@
   <form method="post" action="/sync"><button class="btn btn--primary">Sync assigned MRs</button></form>
 </div>
 {{else}}
-<div x-data="{ f: 'all' }">
+<div x-data="{ f: 'all', q: '' }">
   <div class="chips" role="group" aria-label="Filter merge requests">
     <button type="button" class="chip" :aria-pressed="f==='all'" @click="f='all'">All</button>
     <button type="button" class="chip" :aria-pressed="f==='todo'" @click="f='todo'">Not reviewed</button>
@@ -17,6 +17,7 @@
     <button type="button" class="chip" :aria-pressed="f==='active'" @click="f='active'">Running / failed</button>
     <button type="button" class="chip" :aria-pressed="f==='drafts'" @click="f='drafts'">Has drafts</button>
     <button type="button" class="chip" :aria-pressed="f==='pub'" @click="f='pub'">Published</button>
+    <input class="input mr-search" type="search" x-model="q" placeholder="Search title or !number…" aria-label="Search merge requests by title or number">
   </div>
   <table class="table table--rows table--stack">
     <thead>
@@ -25,7 +26,8 @@
     <tbody>
     {{range .MRs}}
     <tr data-f="{{.StatusClass}}" data-drafts="{{if gt .Drafted 0}}1{{else}}0{{end}}" data-pub="{{if gt .Published 0}}1{{else}}0{{end}}"
-        x-show="f==='all' || (f==='todo' && $el.dataset.f==='none') || (f==='done' && $el.dataset.f==='ok') || (f==='stale' && $el.dataset.f==='warn') || (f==='active' && ($el.dataset.f==='running' || $el.dataset.f==='failed')) || (f==='drafts' && $el.dataset.drafts==='1') || (f==='pub' && $el.dataset.pub==='1')">
+        data-search="{{.IID}} {{.Title}}"
+        x-show="(f==='all' || (f==='todo' && $el.dataset.f==='none') || (f==='done' && $el.dataset.f==='ok') || (f==='stale' && $el.dataset.f==='warn') || (f==='active' && ($el.dataset.f==='running' || $el.dataset.f==='failed')) || (f==='drafts' && $el.dataset.drafts==='1') || (f==='pub' && $el.dataset.pub==='1')) && (q==='' || $el.dataset.search.toLowerCase().includes(q.toLowerCase().replace(/^!/, '')))">
       <td data-label="Project" class="cell-sub mono">{{.ProjectPath}}</td>
       <td data-label="Merge request">
         <a class="cell-title" href="/mr/{{.ID}}">{{.Title}}</a>

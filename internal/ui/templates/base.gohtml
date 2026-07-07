@@ -7,7 +7,10 @@
 <title>{{template "title" .}}</title>
 <link rel="stylesheet" href="/static/app.css">
 <script>
-  // Apply saved theme before first paint to avoid a flash.
+  // Apply a saved theme before first paint to avoid a flash. When nothing is
+  // saved we intentionally leave data-theme unset so the CSS prefers-color-scheme
+  // fallback keeps following the OS live; the first-click no-op is handled in
+  // toggleTheme() by resolving the effective theme from matchMedia.
   (function () {
     try {
       var t = localStorage.getItem('theme');
@@ -39,7 +42,14 @@
   <form method="post" action="/settings/apply" class="header-select" title="LLM model used for reviews">
     <label class="header-select__label" for="hdr-model">Model</label>
     <select id="hdr-model" name="llm_model" onchange="this.form.submit()" aria-label="LLM model">
-      {{range .UI.Models}}<option value="{{.}}" {{if eq . $.UI.LLMModel}}selected{{end}}>{{.}}</option>{{end}}
+      {{range .UI.Models}}<option value="{{.ID}}" {{if eq .ID $.UI.LLMModel}}selected{{end}}>{{.Label}}</option>{{end}}
+    </select>
+  </form>
+  <form method="post" action="/settings/apply" class="header-select" title="Agentic mode: let the reviewer read the repo with tools (required for skills)">
+    <label class="header-select__label" for="hdr-agent">Agentic</label>
+    <select id="hdr-agent" name="agent_mode" onchange="this.form.submit()" aria-label="Agentic mode">
+      <option value="false" {{if not $.UI.AgentMode}}selected{{end}}>off</option>
+      <option value="true" {{if $.UI.AgentMode}}selected{{end}}>on</option>
     </select>
   </form>
   {{end}}
@@ -56,6 +66,11 @@
 <script>
   function toggleTheme() {
     var cur = document.documentElement.getAttribute('data-theme');
+    if (!cur) {
+      // No explicit theme yet: resolve the effective one from the OS preference
+      // so the very first click actually flips what the user is seeing.
+      cur = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
     var next = cur === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
     try { localStorage.setItem('theme', next); } catch (e) {}

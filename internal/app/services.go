@@ -126,6 +126,7 @@ func (a *App) buildBundle(cfg *config.Config) (*service.Bundle, error) {
 		LLMProvider:      cfg.LLM.Provider,
 		AgentMode:        cfg.Review.AgentMode && cfg.LLM.Claude.AgentMode,
 		AllowedTools:     cfg.LLM.Claude.AllowedTools,
+		SkillTools:       cfg.LLM.Claude.SkillTools,
 		Profile:          profileFromConfig(cfg.Review),
 		Token:            cfg.GitLabToken(),
 		CacheDir:         cfg.Storage.CacheDir,

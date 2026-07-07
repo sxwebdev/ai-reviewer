@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -111,6 +112,11 @@ func (a *App) ApplySetup(_ context.Context, host, username, token string) error 
 // errBadSetting marks user-facing validation failures for header switches.
 var errBadSetting = errors.New("invalid setting")
 
+// rawConfigKeys are the whitelisted header-switch keys whose config fields are
+// non-string scalars (bool/number) and must be written unquoted. The single
+// source of truth for the raw-vs-quoted decision in ApplySettings.
+var rawConfigKeys = map[string]bool{"review.agent_mode": true}
+
 // ApplySettings persists whitelisted config keys (the header switches) and
 // hot-applies them.
 func (a *App) ApplySettings(_ context.Context, values map[string]string) error {
@@ -124,14 +130,20 @@ func (a *App) ApplySettings(_ context.Context, values map[string]string) error {
 				return fmt.Errorf("%w: pipeline mode %q", errBadSetting, v)
 			}
 		case "llm.model":
-			if !slices.Contains(modelChoices(cfg), v) {
+			if !slices.Contains(modelIDs(cfg), v) {
 				return fmt.Errorf("%w: model %q is not one of the offered choices", errBadSetting, v)
+			}
+		case "review.agent_mode":
+			if v != "true" && v != "false" {
+				return fmt.Errorf("%w: agent_mode %q must be true or false", errBadSetting, v)
 			}
 		default:
 			return fmt.Errorf("%w: unsupported key %q", errBadSetting, key)
 		}
 	}
-	if err := config.PatchFile(a.ConfigPath, values); err != nil {
+	// rawConfigKeys are written as bare YAML scalars in one atomic pass (a quoted
+	// "true" fails to unmarshal into a Go bool); everything else is quoted.
+	if err := config.PatchFileMixed(a.ConfigPath, values, rawConfigKeys); err != nil {
 		return err
 	}
 	return a.reloadAndRebuild(values)
@@ -186,6 +198,7 @@ func envShadowedKeys(cfg *config.Config, requested map[string]string) []string {
 		"gitlab.token":         cfg.GitLab.Token,
 		"review.pipeline.mode": cfg.Review.Pipeline.Mode,
 		"llm.model":            cfg.LLM.Model,
+		"review.agent_mode":    strconv.FormatBool(cfg.Review.AgentMode),
 	}
 	var shadowed []string
 	for _, key := range slices.Sorted(maps.Keys(requested)) {
@@ -218,14 +231,32 @@ func pipelineModes(cfg *config.Config) []string {
 	return modes
 }
 
+// stockModels are the version-pinned models offered by the header switch. IDs
+// are passed verbatim to the claude CLI (--model); labels are display-only.
+var stockModels = []server.ModelChoice{
+	{ID: "claude-opus-4-8", Label: "Opus 4.8"},
+	{ID: "claude-sonnet-5", Label: "Sonnet 5"},
+	{ID: "claude-haiku-4-5-20251001", Label: "Haiku 4.5"},
+	{ID: "claude-fable-5", Label: "Fable 5"},
+}
+
 // modelChoices lists the models offered by the header switch, keeping a
-// hand-configured model selectable even when it is not a stock alias.
-func modelChoices(cfg *config.Config) []string {
-	stock := []string{"sonnet", "opus", "haiku"}
-	if cfg.LLM.Model != "" && !slices.Contains(stock, cfg.LLM.Model) {
-		return append([]string{cfg.LLM.Model}, stock...)
+// hand-configured model selectable even when it is not a stock pinned ID.
+func modelChoices(cfg *config.Config) []server.ModelChoice {
+	if cfg.LLM.Model != "" && !slices.ContainsFunc(stockModels, func(m server.ModelChoice) bool { return m.ID == cfg.LLM.Model }) {
+		return append([]server.ModelChoice{{ID: cfg.LLM.Model, Label: cfg.LLM.Model}}, stockModels...)
 	}
-	return stock
+	return stockModels
+}
+
+// modelIDs returns just the selectable model IDs (for validation).
+func modelIDs(cfg *config.Config) []string {
+	choices := modelChoices(cfg)
+	ids := make([]string, len(choices))
+	for i, m := range choices {
+		ids[i] = m.ID
+	}
+	return ids
 }
 
 // uiConfigFrom derives the server's display config from a config snapshot. It
@@ -236,16 +267,17 @@ func uiConfigFrom(cfg *config.Config) server.UIConfig {
 		mode = "standard"
 	}
 	return server.UIConfig{
-		Host:              cfg.GitLab.Host,
-		LLMModel:          cfg.LLM.Model,
-		CommentLanguage:   cfg.Review.PreferredCommentLanguage,
-		SeverityThreshold: cfg.Review.SeverityThreshold,
-		MaxComments:       cfg.Review.MaxComments,
-		AgentMode:         cfg.Review.AgentMode,
-		SubscriptionAuth:  cfg.LLM.Claude.AuthMode != "api-key",
-		PipelineMode:      mode,
-		PipelineModes:     pipelineModes(cfg),
-		Models:            modelChoices(cfg),
+		Host:               cfg.GitLab.Host,
+		LLMModel:           cfg.LLM.Model,
+		CommentLanguage:    cfg.Review.PreferredCommentLanguage,
+		SeverityThreshold:  cfg.Review.SeverityThreshold,
+		MaxComments:        cfg.Review.MaxComments,
+		AgentMode:          cfg.Review.AgentMode,
+		AgentModeEffective: cfg.Review.AgentMode && cfg.LLM.Claude.AgentMode,
+		SubscriptionAuth:   cfg.LLM.Claude.AuthMode != "api-key",
+		PipelineMode:       mode,
+		PipelineModes:      pipelineModes(cfg),
+		Models:             modelChoices(cfg),
 	}
 }
 

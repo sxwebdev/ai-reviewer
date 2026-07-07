@@ -15,6 +15,7 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/jobs"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/service"
+	"github.com/sxwebdev/ai-reviewer/internal/skills"
 	"github.com/sxwebdev/ai-reviewer/internal/state"
 )
 
@@ -97,39 +98,65 @@ func (p passReportVM) CostLabel() string {
 	return fmt.Sprintf("$%.4f", p.CostUSD)
 }
 
-// DurationLabel formats the pass duration in seconds.
-func (p passReportVM) DurationLabel() string {
-	if p.DurationMS <= 0 {
+// DurationLabel formats the pass duration.
+func (p passReportVM) DurationLabel() string { return durationLabel(p.DurationMS) }
+
+// durationLabel renders a millisecond duration as "8.4s" (sub-minute) or
+// "1m 12s" (a minute or more), or "" when non-positive/unknown.
+func durationLabel(ms int64) string {
+	if ms <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("%.1fs", float64(p.DurationMS)/1000)
+	sec := float64(ms) / 1000
+	if sec < 60 {
+		return fmt.Sprintf("%.1fs", sec)
+	}
+	return fmt.Sprintf("%dm %ds", int(sec)/60, int(sec)%60)
 }
 
 type mrVM struct {
 	baseVM
-	MR            *state.MergeRequest
-	ProjectPath   string
-	Running       bool
-	Progress      string // "3/7" when a running review job reports progress
-	JobStatus     string // latest review job status
-	JobError      string // latest review job's error, if it failed
-	Review        *state.Review
-	Historical    bool // viewing a past review (not the latest) → actions hidden
-	Groups        []findingGroup
-	FindingCount  int
-	ProposedCount int
-	ApprovedCount int
-	DraftedCount  int
-	PublishPhrase string
-	CostLabel     string
-	PassReports   []passReportVM
-	Risk          *review.RiskReport
-	Completeness  *review.CompletenessReport
-	Coverage      *coverage.Report
-	ActionError   string
-	PastReviews   []pastReviewVM
-	Diff          diffVM
-	findings      []*state.Finding // flat findings of the selected review, for the diff pane
+	MR              *state.MergeRequest
+	ProjectPath     string
+	Running         bool
+	Progress        string // "3/7" when a running review job reports progress
+	JobStatus       string // latest review job status
+	JobError        string // latest review job's error, if it failed
+	Review          *state.Review
+	Historical      bool // viewing a past review (not the latest) → actions hidden
+	Groups          []findingGroup
+	FindingCount    int
+	ProposedCount   int
+	ApprovedCount   int
+	DraftedCount    int
+	PublishPhrase   string
+	CostLabel       string
+	PassReports     []passReportVM
+	Risk            *review.RiskReport
+	Completeness    *review.CompletenessReport
+	Coverage        *coverage.Report
+	ActionError     string
+	PastReviews     []pastReviewVM
+	Diff            diffVM
+	AvailableSkills []skillOption    // skills offered in the run form
+	AgentMode       bool             // agentic mode on → skills are usable
+	UsedSkills      []string         // skills the shown review actually ran with
+	findings        []*state.Finding // flat findings of the selected review, for the diff pane
+}
+
+// skillOption is one selectable skill in the run-review form.
+type skillOption struct {
+	Name        string
+	Description string
+}
+
+// DurationLabel formats the shown review's wall-clock duration (e.g. "1m 12s",
+// "8.4s"), or "" when unknown (older reviews predate duration tracking).
+func (v mrVM) DurationLabel() string {
+	if v.Review == nil {
+		return ""
+	}
+	return durationLabel(v.Review.DurationMS)
 }
 
 // ---- diff viewer view models (assembled server-side; templates stay logic-free) ----
@@ -309,6 +336,9 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 		vm.Groups = groupBySeverity(findings)
 		vm.PublishPhrase = service.ConfirmPhrase(vm.DraftedCount)
 		vm.CostLabel = s.costLabel(vm.Review.CostUSD)
+		if sel.SkillsJSON != "" {
+			_ = json.Unmarshal([]byte(sel.SkillsJSON), &vm.UsedSkills)
+		}
 		if sel.PipelineJSON != "" {
 			var reports []passReportVM
 			if err := json.Unmarshal([]byte(sel.PipelineJSON), &reports); err == nil && len(reports) > 1 {
@@ -488,6 +518,11 @@ func (s *Server) handleMR(w http.ResponseWriter, r *http.Request) {
 	}
 	vm.baseVM = s.base(w, r)
 	vm.PageClass = "page--wide"
+	// Gate skills on the EFFECTIVE agent mode (both review.agent_mode and
+	// llm.claude.agent_mode) — the header toggle only flips the former, and
+	// skills silently do nothing unless both are on.
+	vm.AgentMode = vm.UI.AgentModeEffective
+	vm.AvailableSkills = discoverSkillOptions()
 	// Diff pane: use the selected review's head so line numbers match its
 	// findings; fall back to the MR head for a not-yet-reviewed MR.
 	headSHA := vm.MR.HeadSHA
@@ -496,6 +531,19 @@ func (s *Server) handleMR(w http.ResponseWriter, r *http.Request) {
 	}
 	vm.Diff = s.buildDiffVM(r.Context(), vm.MR.ID, headSHA, vm.findings)
 	s.render(w, "mr", vm)
+}
+
+// discoverSkillOptions lists user-level Claude skills (~/.claude/skills) for the
+// run-review form. Only user skills are offered: project skills live in the
+// reviewed MR's worktree (created per review), not in the server's working
+// directory, so they cannot be resolved reliably at form-render time. Best-effort.
+func discoverSkillOptions() []skillOption {
+	found := skills.Discover([]skills.Source{{Label: "user", Dir: skills.UserDir()}})
+	out := make([]skillOption, 0, len(found))
+	for _, sk := range found {
+		out = append(out, skillOption{Name: sk.Name, Description: sk.Description})
+	}
+	return out
 }
 
 // handleReviewSection renders just the review card — used for htmx polling while
@@ -532,10 +580,28 @@ func (s *Server) handleRunReview(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	jobID, err := jobs.EnqueueReview(r.Context(), s.svc().DB, mr.ID, mr.ProjectID, mr.IID)
+	_ = r.ParseForm() // populate r.Form so multi-valued "skills" is readable
+	var skills []string
+	for _, sk := range r.Form["skills"] {
+		if sk = strings.TrimSpace(sk); sk != "" {
+			skills = append(skills, sk)
+		}
+	}
+	userContext := strings.TrimSpace(r.FormValue("context"))
+	jobID, err := jobs.EnqueueReview(r.Context(), s.svc().DB, mr.ID, mr.ProjectID, mr.IID, jobs.ReviewRequest{
+		UserContext:     userContext,
+		Skills:          skills,
+		RememberContext: r.FormValue("remember") == "on",
+	})
+	hadInput := userContext != "" || len(skills) > 0
 	switch {
 	case err != nil:
 		setFlash(w, "err", "Could not queue review: "+err.Error())
+	case jobID == "" && hadInput:
+		// The already-running job carries its own (possibly empty) payload; the
+		// context/skills just submitted are not applied. Say so rather than
+		// implying they took effect.
+		setFlash(w, "warn", "A review is already running for this MR — your context and skills were not applied. Wait for it to finish, then run again.")
 	case jobID == "":
 		setFlash(w, "ok", "A review is already queued for this MR.")
 	default:
@@ -766,6 +832,9 @@ func (s *Server) handleApplySettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if v := strings.TrimSpace(r.FormValue("llm_model")); v != "" {
 		values["llm.model"] = v
+	}
+	if v := strings.TrimSpace(r.FormValue("agent_mode")); v != "" {
+		values["review.agent_mode"] = v
 	}
 	if len(values) == 0 {
 		setFlash(w, "err", "Nothing to apply.")

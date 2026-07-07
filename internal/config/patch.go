@@ -24,6 +24,20 @@ import (
 //
 // Values may be secrets: they must never appear in returned errors.
 func PatchFile(path string, values map[string]string) error {
+	return patchFile(path, values, nil)
+}
+
+// PatchFileMixed is like PatchFile but writes the keys named in rawKeys as bare
+// YAML scalars (no surrounding quotes), for non-string fields such as booleans
+// and numbers — a quoted "true" fails to unmarshal into a Go bool field. All
+// other keys are quoted as usual. Doing both in one pass keeps the write atomic
+// (a single read-modify-rename). Raw values must be plain literals and are never
+// secrets.
+func PatchFileMixed(path string, values map[string]string, rawKeys map[string]bool) error {
+	return patchFile(path, values, rawKeys)
+}
+
+func patchFile(path string, values map[string]string, rawKeys map[string]bool) error {
 	if len(values) == 0 {
 		return nil
 	}
@@ -50,7 +64,7 @@ func PatchFile(path string, values map[string]string) error {
 
 	// Deterministic order so created-key output is reproducible.
 	for _, key := range slices.Sorted(maps.Keys(values)) {
-		if err := setYAMLValue(file, key, values[key]); err != nil {
+		if err := setYAMLValue(file, key, values[key], rawKeys[key]); err != nil {
 			return fmt.Errorf("set %s in config %s: %w", key, path, err)
 		}
 	}
@@ -66,8 +80,11 @@ func PatchFile(path string, values map[string]string) error {
 // are replaced in place; missing keys are merged into the deepest existing
 // ancestor mapping (ReplaceWithReader silently no-ops on missing paths, so
 // existence is checked explicitly).
-func setYAMLValue(file *ast.File, dottedKey, value string) error {
+func setYAMLValue(file *ast.File, dottedKey, value string, raw bool) error {
 	quoted := strconv.Quote(value)
+	if raw {
+		quoted = value
+	}
 	full, err := yaml.PathString("$." + dottedKey)
 	if err != nil {
 		return fmt.Errorf("bad key: %w", err)

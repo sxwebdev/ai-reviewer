@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/sxwebdev/ai-reviewer/internal/coverage"
@@ -25,6 +26,7 @@ type ReviewConfig struct {
 	LLMProvider      string
 	AgentMode        bool
 	AllowedTools     []string
+	SkillTools       []string
 	Profile          *review.Profile
 	Token            string
 	CacheDir         string
@@ -68,8 +70,18 @@ func NewReviewService(gl gitlab.API, db *state.DB, eng *review.Engine, cfg Revie
 	return s
 }
 
+// ReviewOptions carries per-trigger inputs the user supplied when starting a
+// review: free-form context, selected skills, and whether to persist the
+// context to project review memory.
+type ReviewOptions struct {
+	UserContext     string
+	Skills          []string
+	RememberContext bool
+}
+
 // RunReview reviews the MR identified by ref and returns the new review id.
-func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string, error) {
+func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef, opts ReviewOptions) (string, error) {
+	start := time.Now()
 	projectKey := ref.ProjectKey()
 
 	mr, err := s.gl.GetMR(ctx, projectKey, ref.IID)
@@ -100,7 +112,7 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 
 	discussions, _ := s.gl.ListMRDiscussions(ctx, projectKey, ref.IID)
 	pipelineStatus := s.latestPipelineStatus(ctx, projectKey, ref.IID)
-	memory := s.loadMemory(ctx)
+	memory := s.loadMemory(ctx, proj.ID)
 	existing := s.existingFingerprints(ctx, mrID)
 
 	// One head SHA for everything content-addressed in this review: diffs and
@@ -171,11 +183,21 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 		ExistingFingerprints: existing,
 		PipelineStatus:       pipelineStatus,
 		ExistingDiscussions:  len(discussions),
+		UserContext:          opts.UserContext,
 		WorkDir:              workDir,
 		AgentMode:            agentMode,
 		AllowedTools:         s.cfg.AllowedTools,
 		Model:                s.cfg.Model,
 		Pipeline:             s.cfg.Pipeline,
+	}
+	// Skills need repo tools; they only take effect in agent mode. When selected,
+	// grant the broader skill tool set (union with the read-only default) so the
+	// skills can actually run under the pre-approve permission mode.
+	if len(opts.Skills) > 0 && agentMode {
+		in.Skills = opts.Skills
+		in.AllowedTools = unionTools(s.cfg.AllowedTools, s.cfg.SkillTools)
+	} else if len(opts.Skills) > 0 {
+		s.log.Warn("skills selected but agent mode unavailable — skills will not run", "skills", opts.Skills)
 	}
 	// The skeptic pass needs a worktree to read code; without one it degrades
 	// to the self-reflection prune.
@@ -188,7 +210,53 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	if err != nil {
 		return "", err
 	}
-	return s.persist(ctx, mrID, mr, result, riskReport, coverageReport)
+	if opts.RememberContext && strings.TrimSpace(opts.UserContext) != "" {
+		s.rememberContext(ctx, proj.ID, mr.IID, opts.UserContext)
+	}
+	meta := reviewMeta{
+		DurationMS:  time.Since(start).Milliseconds(),
+		UserContext: opts.UserContext,
+		Skills:      in.Skills,
+	}
+	return s.persist(ctx, mrID, mr, result, riskReport, coverageReport, meta)
+}
+
+// unionTools returns the concatenation of the two tool-rule lists with
+// duplicates removed, preserving first-seen order.
+func unionTools(a, b []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(a)+len(b))
+	for _, t := range append(append([]string{}, a...), b...) {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// rememberContext saves the reviewer-supplied context as a project-scoped review
+// memory item so it applies to future reviews of this project. Best-effort.
+func (s *ReviewService) rememberContext(ctx context.Context, projectID, mrIID int64, text string) {
+	pid := projectID
+	m := &state.ReviewMemory{
+		// Deterministic id per (project, MR): re-remembering updates the row via
+		// UpsertReviewMemory's ON CONFLICT rather than accumulating duplicates.
+		ID:         fmt.Sprintf("mrctx-%d-%d", projectID, mrIID),
+		Scope:      "project",
+		GitLabHost: s.cfg.Host,
+		ProjectID:  &pid,
+		Type:       "context",
+		Title:      fmt.Sprintf("Context from !%d", mrIID),
+		Body:       strings.TrimSpace(text),
+		Priority:   1,
+		Enabled:    true,
+		Source:     "user",
+	}
+	if err := s.db.UpsertReviewMemory(ctx, m); err != nil {
+		s.log.Warn("remember context failed", "err", err)
+	}
 }
 
 func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *gitlab.MergeRequest) (int64, error) {
@@ -244,7 +312,7 @@ func (s *ReviewService) latestPipelineStatus(ctx context.Context, projectKey str
 	return pipelines[0].Status
 }
 
-func (s *ReviewService) loadMemory(ctx context.Context) []review.MemoryRule {
+func (s *ReviewService) loadMemory(ctx context.Context, projectID int64) []review.MemoryRule {
 	items, err := s.db.ListReviewMemory(ctx)
 	if err != nil {
 		s.log.Warn("load memory failed", "err", err)
@@ -253,6 +321,12 @@ func (s *ReviewService) loadMemory(ctx context.Context) []review.MemoryRule {
 	var out []review.MemoryRule
 	for _, m := range items {
 		if !m.Enabled {
+			continue
+		}
+		// Project-scoped memory (e.g. remembered per-MR context) applies only to
+		// its own project; global memory (no project id) applies everywhere. The
+		// retrieval query is unscoped, so honour the scope here.
+		if m.ProjectID != nil && *m.ProjectID != projectID {
 			continue
 		}
 		out = append(out, review.MemoryRule{Type: m.Type, Title: m.Title, Body: m.Body})
@@ -277,7 +351,14 @@ func (s *ReviewService) existingFingerprints(ctx context.Context, mrID int64) ma
 	return set
 }
 
-func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.MergeRequest, result *review.Result, risk *review.RiskReport, cov *coverage.Report) (string, error) {
+// reviewMeta carries per-run inputs/timing persisted alongside the review row.
+type reviewMeta struct {
+	DurationMS  int64
+	UserContext string
+	Skills      []string
+}
+
+func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.MergeRequest, result *review.Result, risk *review.RiskReport, cov *coverage.Report, meta reviewMeta) (string, error) {
 	reviewID := uuid.NewString()
 	rv := &state.Review{
 		ID: reviewID, MRID: mrID, ProjectID: mr.ProjectID, MRIID: mr.IID,
@@ -286,6 +367,12 @@ func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.Merg
 		OverallRecommendation: result.Recommendation, LLMProvider: s.cfg.LLMProvider,
 		LLMModel: s.cfg.Model, ReviewerProfileID: s.cfg.Profile.Name, Summary: result.Summary,
 		RawReportJSON: result.Raw, CostUSD: result.CostUSD,
+		DurationMS: meta.DurationMS, UserContext: meta.UserContext,
+	}
+	if len(meta.Skills) > 0 {
+		if sj, err := json.Marshal(meta.Skills); err == nil {
+			rv.SkillsJSON = string(sj)
+		}
 	}
 	if len(result.PassReports) > 0 {
 		if pj, err := json.Marshal(result.PassReports); err == nil {

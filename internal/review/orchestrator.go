@@ -64,6 +64,15 @@ type ReviewInput struct {
 	PipelineStatus       string
 	ExistingDiscussions  int
 
+	// UserContext is free-form reviewer-supplied context typed at run time. It is
+	// rendered verbatim into a dedicated prompt section (it is the user's own
+	// input to their own LLM, so it is not scrubbed; it is not written to logs).
+	UserContext string
+
+	// Skills are Claude skill names the reviewer selected for this run. They are
+	// named in the prompt and enabled on the CLI (agent mode only).
+	Skills []string
+
 	// Agent mode.
 	WorkDir      string
 	AgentMode    bool

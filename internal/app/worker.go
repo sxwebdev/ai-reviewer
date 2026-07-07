@@ -5,6 +5,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/jobs"
+	"github.com/sxwebdev/ai-reviewer/internal/service"
 	"github.com/sxwebdev/ai-reviewer/internal/state"
 )
 
@@ -28,6 +29,10 @@ func (a *App) newWorker() *jobs.Worker {
 		}
 		_, err = bundle.Review.RunReview(ctx, gitlab.MRRef{
 			Host: mr.GitLabHost, ProjectID: mr.ProjectID, IID: mr.IID,
+		}, service.ReviewOptions{
+			UserContext:     p.UserContext,
+			Skills:          p.Skills,
+			RememberContext: p.RememberContext,
 		})
 		return err
 	})

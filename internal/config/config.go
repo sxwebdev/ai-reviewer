@@ -74,6 +74,7 @@ type ClaudeConfig struct {
 	AgentMode      bool     `yaml:"agent_mode" usage:"Allow read-only repo inspection during review"`
 	ReadOnly       bool     `yaml:"read_only" usage:"Deny all write/destructive tools"`
 	AllowedTools   []string `yaml:"allowed_tools" usage:"Allowed tool permission rules"`
+	SkillTools     []string `yaml:"skill_tools" usage:"Tool permission rules granted when a review selects skills (union with allowed_tools)"`
 	ExtraArgs      []string `yaml:"extra_args" usage:"Extra raw CLI args appended to every invocation"`
 }
 
@@ -192,7 +193,7 @@ func DefaultConfig() *Config {
 		},
 		LLM: LLMConfig{
 			Provider: "claude-cli",
-			Model:    "sonnet",
+			Model:    "claude-sonnet-5",
 			Timeout:  15 * time.Minute,
 			Claude: ClaudeConfig{
 				Bin:            "claude",
@@ -206,6 +207,10 @@ func DefaultConfig() *Config {
 					"Read", "Grep", "Glob",
 					"Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
 				},
+				// Granted only when a review explicitly selects skills. Skills may
+				// run arbitrary tooling (incl. Bash), so this is broader than the
+				// default read-only review set — an explicit per-run opt-in.
+				SkillTools: []string{"Skill", "Read", "Grep", "Glob", "Bash"},
 			},
 		},
 		Review: ReviewConfig{

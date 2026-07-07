@@ -120,6 +120,20 @@ func BuildUserPrompt(in ReviewInput) string {
 		}
 	}
 
+	if strings.TrimSpace(in.UserContext) != "" {
+		b.WriteString("\n## Reviewer-supplied context for this review (weight this heavily)\n")
+		b.WriteString(strings.TrimSpace(in.UserContext))
+		b.WriteByte('\n')
+	}
+
+	if len(in.Skills) > 0 && in.AgentMode {
+		b.WriteString("\n## Skills available for this review\n")
+		b.WriteString("Invoke the following skills where they apply to the changed code:\n")
+		for _, sk := range in.Skills {
+			fmt.Fprintf(&b, "- /%s\n", sk)
+		}
+	}
+
 	writeRiskSection(&b, in.Risk)
 
 	writeCoverageSection(&b, in.Coverage)

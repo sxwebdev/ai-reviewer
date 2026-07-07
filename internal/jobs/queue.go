@@ -7,14 +7,28 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/state"
 )
 
-// ReviewPayload identifies the MR to review by its local id.
+// ReviewPayload identifies the MR to review by its local id, plus any
+// per-trigger inputs the user supplied when starting the review.
 type ReviewPayload struct {
 	MRLocalID int64 `json:"mr_local_id"`
+	// UserContext is free-form context typed at run time (rendered into the
+	// prompt). Skills are the Claude skills selected for this run.
+	// RememberContext asks that UserContext be saved to project review memory.
+	UserContext     string   `json:"user_context,omitempty"`
+	Skills          []string `json:"skills,omitempty"`
+	RememberContext bool     `json:"remember_context,omitempty"`
+}
+
+// ReviewRequest carries the optional per-trigger inputs to EnqueueReview.
+type ReviewRequest struct {
+	UserContext     string
+	Skills          []string
+	RememberContext bool
 }
 
 // EnqueueReview enqueues a review job for a locally-tracked MR. It is a no-op
 // (returns "", nil) if an active review job already exists for the MR.
-func EnqueueReview(ctx context.Context, db *state.DB, mrLocalID, projectID, iid int64) (string, error) {
+func EnqueueReview(ctx context.Context, db *state.DB, mrLocalID, projectID, iid int64, req ReviewRequest) (string, error) {
 	active, err := db.HasActiveJob(ctx, state.JobReview, projectID, iid)
 	if err != nil {
 		return "", err
@@ -22,7 +36,12 @@ func EnqueueReview(ctx context.Context, db *state.DB, mrLocalID, projectID, iid 
 	if active {
 		return "", nil
 	}
-	payload, _ := json.Marshal(ReviewPayload{MRLocalID: mrLocalID})
+	payload, _ := json.Marshal(ReviewPayload{
+		MRLocalID:       mrLocalID,
+		UserContext:     req.UserContext,
+		Skills:          req.Skills,
+		RememberContext: req.RememberContext,
+	})
 	j := &state.Job{
 		Type:        state.JobReview,
 		PayloadJSON: string(payload),

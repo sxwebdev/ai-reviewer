@@ -101,6 +101,9 @@ type Review struct {
 	CompletenessJSON      string // serialized review.CompletenessReport
 	CoverageJSON          string // serialized coverage.Report (changed-line coverage)
 	CostUSD               float64
+	DurationMS            int64  // wall-clock time the review run took, in ms
+	UserContext           string // free-form reviewer-supplied context for this run
+	SkillsJSON            string // serialized []string of Claude skills used
 	CreatedAt             int64
 	UpdatedAt             int64
 }

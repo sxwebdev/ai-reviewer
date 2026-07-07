@@ -24,19 +24,27 @@ import (
 // UIConfig carries the config bits the UI displays (Settings page, header
 // switches) and uses to label cost (subscription auth reports notional cost).
 type UIConfig struct {
-	Host              string
-	LLMModel          string
-	CommentLanguage   string
-	SeverityThreshold string
-	MaxComments       int
-	AgentMode         bool
-	SubscriptionAuth  bool // existing-login/oauth → reported cost is notional
+	Host               string
+	LLMModel           string
+	CommentLanguage    string
+	SeverityThreshold  string
+	MaxComments        int
+	AgentMode          bool // review.agent_mode toggle state (header switch)
+	AgentModeEffective bool // review.agent_mode AND llm.claude.agent_mode — what actually enables skills
+	SubscriptionAuth   bool // existing-login/oauth → reported cost is notional
 
 	// Header switches: current review depth (pipeline mode) and model, plus the
 	// choices offered in the selects.
 	PipelineMode  string
 	PipelineModes []string
-	Models        []string
+	Models        []ModelChoice
+}
+
+// ModelChoice is one entry in the model select: ID is the value passed to the
+// claude CLI (--model), Label is the human-friendly name shown in the dropdown.
+type ModelChoice struct {
+	ID    string
+	Label string
 }
 
 // SetupStatus feeds the setup page: current prefills and environment checks.

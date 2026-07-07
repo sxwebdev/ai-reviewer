@@ -111,6 +111,7 @@ func (e *Engine) runPasses(ctx context.Context, in ReviewInput, specs []PassSpec
 				WorkDir:      in.WorkDir,
 				AgentMode:    in.AgentMode,
 				AllowedTools: in.AllowedTools,
+				Skills:       in.Skills,
 				JSONSchema:   llm.ReviewJSONSchema,
 			})
 			outcomes[i] = passOutcome{spec: spec, resp: resp, err: err}
