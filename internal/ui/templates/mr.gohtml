@@ -66,6 +66,7 @@
   <div class="card">
     <div class="review-head">
       <span class="badge risk-{{.Review.RiskLevel}}">risk: {{.Review.RiskLevel}}</span>
+      {{if .Risk}}<span class="badge risk-{{.Risk.Level}}" title="deterministic score from git history and diff stats">computed: {{.Risk.Score}}/100</span>{{end}}
       <span class="badge">{{.Review.OverallRecommendation}}</span>
       {{if .CostLabel}}<span class="muted small">{{.CostLabel}}</span>{{end}}
       {{if .Review.LLMModel}}<span class="muted small mono">{{.Review.LLMModel}}</span>{{end}}
@@ -77,6 +78,66 @@
     </div>
     {{if .Review.Summary}}<p class="summary">{{.Review.Summary}}</p>{{end}}
 
+    {{if .Completeness}}
+    <div class="report-block">
+      <h4 class="report-head">Task completeness (stated intent vs. diff)</h4>
+      {{if .Completeness.Note}}<p class="muted small">{{.Completeness.Note}}</p>{{end}}
+      {{range .Completeness.Criteria}}
+      <div class="criterion">
+        <span class="badge crit-{{.Status}}">{{.Status}}</span>
+        <span class="criterion-text">{{.Criterion}}</span>
+        {{if .Evidence}}<span class="muted small">— {{.Evidence}}</span>{{end}}
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+
+    {{if .Risk}}
+    <details class="report-details">
+      <summary class="muted small">computed risk {{.Risk.Score}}/100 ({{.Risk.Level}}) — {{len .Risk.Factors}} factors</summary>
+      <table class="pass-table">
+        <thead><tr><th>factor</th><th>points</th><th>detail</th></tr></thead>
+        <tbody>
+        {{range .Risk.Factors}}<tr><td class="mono">{{.Name}}</td><td>{{printf "%.0f" .Weight}}</td><td>{{.Detail}}</td></tr>{{end}}
+        </tbody>
+      </table>
+    </details>
+    {{end}}
+
+    {{if .Coverage}}
+    <details class="report-details">
+      <summary class="muted small">{{if gt .Coverage.TotalAdded 0}}changed-line coverage: {{printf "%.0f" .Coverage.Pct}}% ({{.Coverage.TotalCovered}}/{{.Coverage.TotalAdded}} added lines){{else}}changed-line coverage: not measured{{end}}</summary>
+      <table class="pass-table">
+        <thead><tr><th>file</th><th>covered</th><th>uncovered added lines</th></tr></thead>
+        <tbody>
+        {{range .Coverage.Files}}<tr><td class="mono">{{.Path}}</td><td>{{.Covered}}/{{.Added}}</td><td class="mono">{{range $i, $l := .Uncovered}}{{if $i}}, {{end}}{{$l}}{{end}}</td></tr>{{end}}
+        </tbody>
+      </table>
+      {{range .Coverage.Skipped}}<div class="muted small">not measured: {{.Root}} — {{.Reason}}</div>{{end}}
+      {{range .Coverage.Notes}}<div class="muted small">note: {{.}}</div>{{end}}
+    </details>
+    {{end}}
+
+    {{if .PassReports}}
+    <details class="pass-reports">
+      <summary class="muted small">pipeline: {{len .PassReports}} passes</summary>
+      <table class="pass-table">
+        <thead><tr><th>pass</th><th>findings</th><th>cost</th><th>time</th><th></th></tr></thead>
+        <tbody>
+        {{range .PassReports}}
+        <tr>
+          <td class="mono">{{.Name}}</td>
+          <td>{{.RawFindings}}</td>
+          <td>{{.CostLabel}}</td>
+          <td>{{.DurationLabel}}</td>
+          <td>{{if .Err}}<span class="badge st-failed" title="{{.Err}}">failed</span>{{end}}</td>
+        </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </details>
+    {{end}}
+
     {{if not .Groups}}<p class="muted">No findings.</p>{{end}}
     {{range .Groups}}
     <h4 class="sev-group-head sev-{{.Severity}}">{{.Severity}} <span class="count">· {{len .Items}}</span></h4>
@@ -85,6 +146,8 @@
       <div class="finding-head">
         <span class="badge sev-{{.Severity}}">{{.Severity}}</span>
         <span class="badge badge--cat">{{.Category}}</span>
+        {{if and .Pass (ne .Pass "general")}}<span class="badge badge--pass" title="found by the {{.Pass}} specialist pass">{{.Pass}}</span>{{end}}
+        {{if .Verification}}<span class="badge ver-{{.Verification}}" title="skeptic verification outcome">{{.Verification}}</span>{{end}}
         <strong class="finding-title">{{.Title}}</strong>
         {{if gt .EditedAt 0}}<span class="badge st-edited">edited</span>{{end}}
         {{if .FilePath}}<a class="finding-loc" href="{{$.MR.WebURL}}/diffs" target="_blank" rel="noreferrer">{{.FilePath}}{{if .NewLine}}:{{.NewLine}}{{else if .OldLine}}:{{.OldLine}}{{end}}</a>{{end}}

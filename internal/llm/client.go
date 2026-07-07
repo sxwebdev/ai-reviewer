@@ -18,8 +18,9 @@ type Request struct {
 type Client interface {
 	// Review runs a code review and returns the strict ReviewResponse.
 	Review(ctx context.Context, req Request) (*ReviewResponse, error)
-	// CompleteJSON runs a prompt and unmarshals strict JSON output into out.
-	CompleteJSON(ctx context.Context, req Request, out any) error
+	// CompleteJSON runs a prompt, unmarshals strict JSON output into out, and
+	// returns the call's cost in USD.
+	CompleteJSON(ctx context.Context, req Request, out any) (float64, error)
 	// Ask runs a free-form prompt and returns the text answer.
 	Ask(ctx context.Context, req Request) (string, error)
 }

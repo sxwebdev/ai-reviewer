@@ -3,7 +3,6 @@ package review
 import (
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
@@ -85,11 +84,12 @@ func (v *Validator) Validate(
 			Suggestion:  f.Suggestion,
 			Severity:    severity,
 			Category:    strings.ToLower(f.Category),
-			Confidence:  f.Confidence,
+			Confidence:  clamp01(f.Confidence),
 			FilePath:    f.FilePath,
 			Position:    pos,
 			Outcome:     outcome,
 			Fingerprint: fp,
+			Pass:        f.PassName,
 		}
 		switch outcome.Kind {
 		case MapOverview:
@@ -109,27 +109,40 @@ func (v *Validator) Validate(
 	return out
 }
 
-// rankFindings sorts by severity (desc) then confidence (desc).
+// clamp01 bounds a model-supplied confidence to [0,1] — Go owns validation of
+// model numbers; the JSON schema bounds are advisory, not trusted.
+func clamp01(v float64) float64 {
+	return min(max(v, 0), 1)
+}
+
+// rankFindings sorts by severity (desc), then verification state
+// (confirmed > unverified/none > uncertain), then confidence (desc).
 func rankFindings(fs []ValidatedFinding) {
 	sort.SliceStable(fs, func(i, j int) bool {
 		ri, rj := SeverityRank(fs[i].Severity), SeverityRank(fs[j].Severity)
 		if ri != rj {
 			return ri > rj
 		}
+		vi, vj := verificationRank(fs[i].Verification), verificationRank(fs[j].Verification)
+		if vi != vj {
+			return vi > vj
+		}
 		return fs[i].Confidence > fs[j].Confidence
 	})
 }
 
-// sanitizeBody masks secrets and caps the length of a comment body, truncating
-// on a UTF-8 rune boundary so the result is always valid UTF-8.
-func sanitizeBody(body string) string {
-	body = security.Mask(strings.TrimSpace(body))
-	if len(body) > maxBodyLen {
-		cut := maxBodyLen
-		for cut > 0 && !utf8.RuneStart(body[cut]) {
-			cut--
-		}
-		body = body[:cut] + "…"
+func verificationRank(v string) int {
+	switch v {
+	case VerificationConfirmed:
+		return 2
+	case VerificationUncertain:
+		return 0
+	default: // "" or unverified
+		return 1
 	}
-	return body
+}
+
+// sanitizeBody masks secrets and caps the length of a comment body.
+func sanitizeBody(body string) string {
+	return security.Truncate(security.Mask(strings.TrimSpace(body)), maxBodyLen)
 }

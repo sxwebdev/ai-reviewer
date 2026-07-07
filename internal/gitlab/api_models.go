@@ -66,6 +66,16 @@ type MergeRequestVersion struct {
 	CreatedAt      string `json:"created_at"`
 }
 
+// Commit is one commit of an MR (from /commits).
+type Commit struct {
+	ID         string `json:"id"`
+	ShortID    string `json:"short_id"`
+	Title      string `json:"title"`
+	Message    string `json:"message"`
+	AuthorName string `json:"author_name"`
+	CreatedAt  string `json:"created_at"`
+}
+
 // Note is a single note within a discussion.
 type Note struct {
 	ID       int64     `json:"id"`

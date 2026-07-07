@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
+	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 	"github.com/sxwebdev/ai-reviewer/internal/git"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/index"
@@ -27,6 +29,17 @@ type ReviewConfig struct {
 	Token            string
 	CacheDir         string
 	IgnoreGlobs      []string
+	Context          review.ContextBudget
+	Pipeline         review.PipelineConfig
+	Risk             RiskSettings
+	Coverage         CoverageSettings
+}
+
+// RiskSettings configures the deterministic risk score.
+type RiskSettings struct {
+	Enabled        bool
+	HistoryCommits int
+	SensitiveGlobs []string
 }
 
 // ReviewService drives a full review: fetch MR context from GitLab, run the
@@ -77,7 +90,7 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	if err != nil {
 		return "", fmt.Errorf("list diffs: %w", err)
 	}
-	files, rawDiffs := parseDiffs(diffs, s.log)
+	files := parseDiffs(diffs, s.log)
 	if len(files) == 0 {
 		return "", fmt.Errorf("no reviewable changed files (binary/generated/vendored excluded)")
 	}
@@ -90,11 +103,51 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	memory := s.loadMemory(ctx)
 	existing := s.existingFingerprints(ctx, mrID)
 
+	// One head SHA for everything content-addressed in this review: diffs and
+	// positions come from diff_refs, so the worktree, the FTS index, and the
+	// related-files query must use the same commit (mr.SHA can transiently
+	// diverge from diff_refs.head_sha right after a push).
+	headSHA := mr.DiffRefs.HeadSHA
+	if headSHA == "" {
+		headSHA = mr.SHA
+	}
+
 	// Agent mode: prepare a read-only worktree at head sha so the LLM can
 	// inspect the repository. Best-effort — any failure falls back to
 	// diff-only review.
-	workDir, agentMode, cleanup := s.prepareWorktree(ctx, proj, mr)
+	workDir, agentMode, cleanup := s.prepareWorktree(ctx, proj, headSHA)
 	defer cleanup()
+
+	// The enrichment builders are independent, best-effort I/O (worktree/API
+	// reads, test runs, git history, FTS) — run them concurrently so total
+	// latency is the max (coverage usually dominates), not the sum. Each
+	// goroutine writes only its own variable.
+	var (
+		fileContexts   []review.FileContext
+		coverageReport *coverage.Report
+		commits        []review.CommitInfo
+		priorReview    *review.PriorReview
+		riskReport     *review.RiskReport
+		relatedFiles   []review.RelatedFile
+	)
+	var enrich sync.WaitGroup
+	runEnrich := func(fn func()) {
+		enrich.Add(1)
+		go func() {
+			defer enrich.Done()
+			fn()
+		}()
+	}
+	runEnrich(func() { fileContexts = s.buildFileContexts(ctx, projectKey, mr, files, workDir) })
+	runEnrich(func() { coverageReport = s.buildCoverageReport(ctx, workDir, files) })
+	runEnrich(func() { commits = s.buildCommits(ctx, projectKey, ref.IID) })
+	runEnrich(func() { priorReview = s.buildPriorReview(ctx, proj, mr, mrID) })
+	runEnrich(func() { riskReport = s.buildRiskReport(ctx, proj, files) })
+	if agentMode {
+		runEnrich(func() { relatedFiles = s.findRelatedFiles(ctx, proj.ID, headSHA, files) })
+	}
+	discussionNotes := s.buildDiscussionNotes(discussions) // pure mapping, no I/O
+	enrich.Wait()
 
 	in := review.ReviewInput{
 		ProjectPath:          proj.PathWithNamespace,
@@ -107,7 +160,13 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 		SourceBranch:         mr.SourceBranch,
 		TargetBranch:         mr.TargetBranch,
 		Files:                files,
-		RawDiffs:             rawDiffs,
+		FileContexts:         fileContexts,
+		Commits:              commits,
+		Discussions:          discussionNotes,
+		PriorReview:          priorReview,
+		RelatedFiles:         relatedFiles,
+		Risk:                 riskReport,
+		Coverage:             coverageReport,
 		Refs:                 mr.DiffRefs,
 		Memory:               memory,
 		Profile:              s.cfg.Profile,
@@ -118,13 +177,20 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 		AgentMode:            agentMode,
 		AllowedTools:         s.cfg.AllowedTools,
 		Model:                s.cfg.Model,
+		Pipeline:             s.cfg.Pipeline,
+	}
+	// The skeptic pass needs a worktree to read code; without one it degrades
+	// to the self-reflection prune.
+	if in.Pipeline.VerifyMode == review.VerifySkeptic && workDir == "" {
+		s.log.Info("no worktree available: downgrading verify_mode skeptic -> reflect")
+		in.Pipeline.VerifyMode = review.VerifyReflect
 	}
 
 	result, err := s.eng.Review(ctx, in)
 	if err != nil {
 		return "", err
 	}
-	return s.persist(ctx, mrID, mr, result)
+	return s.persist(ctx, mrID, mr, result, riskReport, coverageReport)
 }
 
 func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *gitlab.MergeRequest) (int64, error) {
@@ -144,28 +210,29 @@ func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *
 }
 
 // prepareWorktree clones/fetches the project mirror, checks out a worktree at
-// the MR head sha, and indexes it. It returns the worktree dir, whether agent
-// mode is active, and a cleanup func (always non-nil). On any failure it
-// degrades to diff-only review.
-func (s *ReviewService) prepareWorktree(ctx context.Context, proj *gitlab.Project, mr *gitlab.MergeRequest) (string, bool, func()) {
+// headSHA, and indexes it under the same SHA (writer and readers must agree on
+// the key). It returns the worktree dir, whether agent mode is active, and a
+// cleanup func (always non-nil). On any failure it degrades to diff-only
+// review.
+func (s *ReviewService) prepareWorktree(ctx context.Context, proj *gitlab.Project, headSHA string) (string, bool, func()) {
 	noop := func() {}
-	if s.cache == nil || proj.HTTPURLToRepo == "" || mr.SHA == "" {
+	if s.cache == nil || proj.HTTPURLToRepo == "" || headSHA == "" {
 		return "", false, noop
 	}
 	if _, err := s.cache.EnsureMirror(ctx, proj.HTTPURLToRepo, s.cfg.Host, proj.PathWithNamespace, s.cfg.Token); err != nil {
 		s.log.Warn("agent mode: mirror failed, falling back to diff-only", "err", err)
 		return "", false, noop
 	}
-	wt, cleanup, err := s.cache.AddWorktree(ctx, s.cfg.Host, proj.PathWithNamespace, mr.SHA)
+	wt, cleanup, err := s.cache.AddWorktree(ctx, s.cfg.Host, proj.PathWithNamespace, headSHA)
 	if err != nil {
 		s.log.Warn("agent mode: worktree failed, falling back to diff-only", "err", err)
 		return "", false, noop
 	}
 	if s.indexer != nil {
-		if n, err := s.indexer.IndexWorktree(ctx, proj.ID, mr.SHA, wt, s.cfg.IgnoreGlobs); err != nil {
+		if n, err := s.indexer.IndexWorktree(ctx, proj.ID, headSHA, wt, s.cfg.IgnoreGlobs); err != nil {
 			s.log.Warn("index worktree failed", "err", err)
 		} else {
-			s.log.Info("indexed worktree", "files", n, "sha", mr.SHA)
+			s.log.Info("indexed worktree", "files", n, "sha", headSHA)
 		}
 	}
 	return wt, true, cleanup
@@ -212,7 +279,7 @@ func (s *ReviewService) existingFingerprints(ctx context.Context, mrID int64) ma
 	return set
 }
 
-func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.MergeRequest, result *review.Result) (string, error) {
+func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.MergeRequest, result *review.Result, risk *review.RiskReport, cov *coverage.Report) (string, error) {
 	reviewID := uuid.NewString()
 	rv := &state.Review{
 		ID: reviewID, MRID: mrID, ProjectID: mr.ProjectID, MRIID: mr.IID,
@@ -221,6 +288,26 @@ func (s *ReviewService) persist(ctx context.Context, mrID int64, mr *gitlab.Merg
 		OverallRecommendation: result.Recommendation, LLMProvider: s.cfg.LLMProvider,
 		LLMModel: s.cfg.Model, ReviewerProfileID: s.cfg.Profile.Name, Summary: result.Summary,
 		RawReportJSON: result.Raw, CostUSD: result.CostUSD,
+	}
+	if len(result.PassReports) > 0 {
+		if pj, err := json.Marshal(result.PassReports); err == nil {
+			rv.PipelineJSON = string(pj)
+		}
+	}
+	if risk != nil {
+		if rj, err := json.Marshal(risk); err == nil {
+			rv.RiskJSON = string(rj)
+		}
+	}
+	if result.Completeness != nil {
+		if cj, err := json.Marshal(result.Completeness); err == nil {
+			rv.CompletenessJSON = string(cj)
+		}
+	}
+	if cov != nil {
+		if vj, err := json.Marshal(cov); err == nil {
+			rv.CoverageJSON = string(vj)
+		}
 	}
 	if err := s.db.CreateReview(ctx, rv); err != nil {
 		return "", fmt.Errorf("create review: %w", err)
@@ -240,7 +327,7 @@ func toStateFinding(reviewID string, mrID int64, headSHA string, vf review.Valid
 		Severity: vf.Severity, Category: vf.Category, FilePath: vf.FilePath,
 		LineKind: vf.Source.LineKind, Title: vf.Title, Body: vf.Body, Suggestion: vf.Suggestion,
 		Confidence: vf.Confidence, Fingerprint: vf.Fingerprint, Status: state.FindingProposed,
-		ValidationError: vf.ValidationError,
+		ValidationError: vf.ValidationError, Pass: vf.Pass, Verification: vf.Verification,
 	}
 	if ev, err := json.Marshal(vf.Source.Evidence); err == nil {
 		f.EvidenceJSON = string(ev)
@@ -289,9 +376,8 @@ func (s *ReviewService) persistDiffs(ctx context.Context, mrID int64, headSHA st
 
 // parseDiffs converts GitLab diffs into engine FileDiffs, excluding binary,
 // generated, and vendored files (never sent to the LLM).
-func parseDiffs(diffs []gitlab.MergeRequestDiff, log *slog.Logger) ([]*review.FileDiff, map[string]string) {
+func parseDiffs(diffs []gitlab.MergeRequestDiff, log *slog.Logger) []*review.FileDiff {
 	var files []*review.FileDiff
-	raw := map[string]string{}
 	for _, d := range diffs {
 		path := d.NewPath
 		if path == "" {
@@ -312,9 +398,8 @@ func parseDiffs(diffs []gitlab.MergeRequestDiff, log *slog.Logger) ([]*review.Fi
 			OldPath: d.OldPath, NewPath: d.NewPath, NewFile: d.NewFile,
 			Renamed: d.RenamedFile, Deleted: d.DeletedFile, Hunks: hunks,
 		})
-		raw[path] = d.Diff
 	}
-	return files, raw
+	return files
 }
 
 var vendorPrefixes = []string{"vendor/", "node_modules/", "dist/", "build/", "third_party/"}

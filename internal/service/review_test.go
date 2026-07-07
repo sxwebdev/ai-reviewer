@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
@@ -86,5 +87,73 @@ func TestReviewServiceEndToEnd(t *testing.T) {
 	}
 	if f2, _ := db.ListFindingsByReview(ctx, reviewID2); len(f2) != 0 {
 		t.Errorf("re-review should dedupe existing finding, got %d", len(f2))
+	}
+}
+
+// A re-review at a new head SHA must carry the previous review (summary,
+// findings with dispositions and rejection reasons) into the prompt.
+func TestReviewServicePriorReviewContext(t *testing.T) {
+	ctx := t.Context()
+	db := testDB(t)
+
+	const diff = "@@ -1,2 +1,3 @@\n package main\n+import \"fmt\"\n func main() {}\n"
+
+	fake := gitlab.NewFake()
+	fake.Projects["10"] = &gitlab.Project{ID: 10, PathWithNamespace: "group/repo"}
+	fake.MRs["10/5"] = &gitlab.MergeRequest{
+		IID: 5, ProjectID: 10, Title: "Add import", SHA: "sha-one",
+		Author:   gitlab.User{Username: "alice"},
+		DiffRefs: gitlab.DiffRefs{BaseSHA: "base", HeadSHA: "sha-one", StartSHA: "start"},
+	}
+	fake.Diffs["10/5"] = []gitlab.MergeRequestDiff{{OldPath: "main.go", NewPath: "main.go", Diff: diff}}
+
+	llmFake := llm.NewFake(&llm.ReviewResponse{
+		Summary: "first pass summary", RiskLevel: "medium", OverallRecommendation: "comment",
+		Findings: []llm.Finding{
+			{Severity: "high", Category: "correctness", FilePath: "main.go", LineKind: "new", Line: 2,
+				Title: "Handle fmt errors", Body: "b", Confidence: 0.9},
+		},
+	})
+	eng := review.NewEngine(llmFake, discardLogger())
+	svc := NewReviewService(fake, db, eng, ReviewConfig{
+		Host: "https://gitlab.test", ReviewerUsername: "me", Model: "sonnet",
+		LLMProvider: "claude-cli", Profile: review.DefaultProfile(),
+		Context: review.DefaultContextBudget(),
+	}, discardLogger())
+
+	reviewID, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First review must NOT carry a prior-review section.
+	if strings.Contains(llmFake.LastRequest.Prompt, "Previous review of this MR") {
+		t.Error("first review must not have a prior-review section")
+	}
+
+	// Human rejects the finding with a reason.
+	findings, _ := db.ListFindingsByReview(ctx, reviewID)
+	if len(findings) != 1 {
+		t.Fatalf("want 1 finding, got %d", len(findings))
+	}
+	if err := db.UpdateFindingStatus(ctx, findings[0].ID, state.FindingRejected, "intentional: errors ignored here"); err != nil {
+		t.Fatal(err)
+	}
+
+	// New head SHA arrives.
+	fake.MRs["10/5"].SHA = "sha-two"
+	fake.MRs["10/5"].DiffRefs.HeadSHA = "sha-two"
+
+	if _, err := svc.RunReview(ctx, gitlab.MRRef{ProjectID: 10, IID: 5}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := llmFake.LastRequest.Prompt
+	if !strings.Contains(prompt, "Previous review of this MR (at commit sha-one)") {
+		t.Errorf("re-review prompt missing prior-review section:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "first pass summary") {
+		t.Error("prior summary missing from prompt")
+	}
+	if !strings.Contains(prompt, "rejected: intentional: errors ignored here") {
+		t.Error("rejection reason missing from prompt")
 	}
 }

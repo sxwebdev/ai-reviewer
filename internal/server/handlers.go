@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 	"github.com/sxwebdev/ai-reviewer/internal/jobs"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/service"
@@ -77,6 +79,32 @@ type findingGroup struct {
 	Items    []*state.Finding
 }
 
+// passReportVM is one pipeline pass for the review header (name, findings,
+// cost, duration, error). Deserialized from reviews.pipeline_json.
+type passReportVM struct {
+	Name        string  `json:"name"`
+	CostUSD     float64 `json:"cost_usd"`
+	DurationMS  int64   `json:"duration_ms"`
+	RawFindings int     `json:"raw_findings"`
+	Err         string  `json:"error"`
+}
+
+// CostLabel formats the pass cost like the review-level label.
+func (p passReportVM) CostLabel() string {
+	if p.CostUSD <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("$%.4f", p.CostUSD)
+}
+
+// DurationLabel formats the pass duration in seconds.
+func (p passReportVM) DurationLabel() string {
+	if p.DurationMS <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.1fs", float64(p.DurationMS)/1000)
+}
+
 type mrVM struct {
 	baseVM
 	MR            *state.MergeRequest
@@ -94,6 +122,10 @@ type mrVM struct {
 	DraftedCount  int
 	PublishPhrase string
 	CostLabel     string
+	PassReports   []passReportVM
+	Risk          *review.RiskReport
+	Completeness  *review.CompletenessReport
+	Coverage      *coverage.Report
 	ActionError   string
 	PastReviews   []pastReviewVM
 	Diff          diffVM
@@ -277,6 +309,31 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 		vm.Groups = groupBySeverity(findings)
 		vm.PublishPhrase = service.ConfirmPhrase(vm.DraftedCount)
 		vm.CostLabel = s.costLabel(vm.Review.CostUSD)
+		if sel.PipelineJSON != "" {
+			var reports []passReportVM
+			if err := json.Unmarshal([]byte(sel.PipelineJSON), &reports); err == nil && len(reports) > 1 {
+				vm.PassReports = reports
+			}
+		}
+		// Best-effort report columns: garbage JSON simply yields no section.
+		if sel.RiskJSON != "" {
+			var r review.RiskReport
+			if err := json.Unmarshal([]byte(sel.RiskJSON), &r); err == nil && len(r.Factors) > 0 {
+				vm.Risk = &r
+			}
+		}
+		if sel.CompletenessJSON != "" {
+			var c review.CompletenessReport
+			if err := json.Unmarshal([]byte(sel.CompletenessJSON), &c); err == nil && (len(c.Criteria) > 0 || c.Note != "") {
+				vm.Completeness = &c
+			}
+		}
+		if sel.CoverageJSON != "" {
+			var cov coverage.Report
+			if err := json.Unmarshal([]byte(sel.CoverageJSON), &cov); err == nil && (len(cov.Files) > 0 || len(cov.Skipped) > 0) {
+				vm.Coverage = &cov
+			}
+		}
 		for _, rv := range reviews {
 			if rv.ID == sel.ID {
 				continue // the one being shown is not listed under history

@@ -1,10 +1,92 @@
 package app
 
 import (
+	"github.com/sxwebdev/ai-reviewer/internal/config"
+	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/service"
 )
+
+// pipelineFromConfig resolves the review.pipeline config block (including the
+// mode presets) into the engine's pipeline config.
+func pipelineFromConfig(rc config.ReviewConfig) review.PipelineConfig {
+	p := rc.Pipeline
+	out := review.PipelineConfig{
+		MaxParallel:       p.MaxParallel,
+		VerifyMode:        p.VerifyMode,
+		VerifyMaxFindings: p.VerifyMaxFindings,
+		Verifiers:         p.Verifiers,
+	}
+	// Tri-state completeness: an explicit "on" survives cheap mode (and, in
+	// the engine, bypasses the intent-text gate); "auto" follows the preset
+	// (auto for everything but cheap).
+	switch p.Completeness {
+	case "on":
+		out.Completeness = review.CompletenessOn
+	case "off":
+		out.Completeness = review.CompletenessOff
+	default: // auto
+		if p.Mode != "cheap" {
+			out.Completeness = review.CompletenessAuto
+		} else {
+			out.Completeness = review.CompletenessOff
+		}
+	}
+	switch p.Mode {
+	case "cheap":
+		out.Passes = []string{review.PassGeneral}
+		out.VerifyMode = review.VerifyOff
+	case "deep":
+		out.Passes = []string{
+			review.PassGeneral, review.PassCorrectness, review.PassConcurrency,
+			review.PassSecurity, review.PassContracts,
+		}
+	case "custom":
+		out.Passes = p.Passes
+	default: // standard
+		out.Passes = []string{review.PassGeneral, review.PassCorrectness}
+	}
+	return out
+}
+
+// riskSettingsFromConfig maps the review.risk config block to service settings.
+func riskSettingsFromConfig(rc config.ReviewConfig) service.RiskSettings {
+	return service.RiskSettings{
+		Enabled:        rc.Risk.Enabled,
+		HistoryCommits: rc.Risk.HistoryCommits,
+		SensitiveGlobs: rc.Risk.SensitiveGlobs,
+	}
+}
+
+// coverageSettingsFromConfig maps the review.coverage config block.
+func coverageSettingsFromConfig(rc config.ReviewConfig) service.CoverageSettings {
+	return service.CoverageSettings{
+		Enabled:   rc.Coverage.Enabled,
+		Providers: rc.Coverage.Providers,
+		Options: coverage.Options{
+			Timeout:     rc.Coverage.Timeout,
+			NodeInstall: rc.Coverage.Node.Install,
+		},
+	}
+}
+
+// contextBudgetFromConfig maps the review.context config block to the engine's
+// enrichment budget.
+func contextBudgetFromConfig(rc config.ReviewConfig) review.ContextBudget {
+	return review.ContextBudget{
+		IncludeFullFiles:   rc.Context.IncludeFullFiles,
+		MaxFileLines:       rc.Context.MaxFileLines,
+		HunkWindowLines:    rc.Context.HunkWindowLines,
+		MaxTotalBytes:      rc.Context.MaxTotalKB << 10,
+		IncludeCommits:     rc.Context.IncludeCommits,
+		IncludeDiscussions: rc.Context.IncludeDiscussions,
+		MaxDiscussionBytes: rc.Context.MaxDiscussionKB << 10,
+		IncludePriorReview: rc.Context.PriorReview,
+		MaxInterdiffBytes:  rc.Context.InterdiffMaxKB << 10,
+		MaxRelatedFiles:    rc.Context.RelatedFiles,
+	}
+}
 
 // Services opens state and wires the full service bundle used by the web UI and
 // CLI actions. When GitLab is not yet configured the bundle uses a stub client
@@ -36,6 +118,10 @@ func (a *App) Services() (*service.Bundle, error) {
 		Token:            a.Cfg.GitLabToken(),
 		CacheDir:         a.Cfg.Storage.CacheDir,
 		IgnoreGlobs:      a.Cfg.Review.IgnoreGlobs,
+		Context:          contextBudgetFromConfig(a.Cfg.Review),
+		Pipeline:         pipelineFromConfig(a.Cfg.Review),
+		Risk:             riskSettingsFromConfig(a.Cfg.Review),
+		Coverage:         coverageSettingsFromConfig(a.Cfg.Review),
 	}
 	return service.NewBundle(gl, db, eng, rc, a.Log), nil
 }

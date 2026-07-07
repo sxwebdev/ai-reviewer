@@ -237,6 +237,31 @@ label.check { display: inline-flex; align-items: center; gap: var(--sp-1); font-
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px var(--sp-2); border-radius: var(--r-sm); font: 550 var(--fs-xs)/1.5 var(--font-sans); white-space: nowrap; border: 1px solid var(--border-2); color: var(--fg-2); background: var(--surface-2); }
 .badge::before { line-height: 1; }
 .badge--cat { text-transform: lowercase; color: var(--fg-muted); background: transparent; }
+.badge--pass { text-transform: lowercase; color: var(--info); background: transparent; border-style: dashed; }
+
+/* completeness criteria — glyph + color, never color alone */
+.report-block { margin: var(--sp-2) 0; }
+.report-head { margin: 0 0 var(--sp-2); font-size: var(--fs-sm); color: var(--fg-2); }
+.criterion { display: flex; align-items: baseline; gap: var(--sp-2); margin: 2px 0; }
+.badge.crit-done { color: var(--good); background: var(--good-soft); } .badge.crit-done::before { content: "✓"; }
+.badge.crit-partial { color: var(--warn); background: var(--warn-soft); } .badge.crit-partial::before { content: "◑"; }
+.badge.crit-missing { color: var(--bad); background: var(--bad-soft); } .badge.crit-missing::before { content: "✕"; }
+.badge.crit-unclear { color: var(--fg-muted); } .badge.crit-unclear::before { content: "?"; }
+
+.report-details { margin: var(--sp-2) 0; }
+.report-details summary { cursor: pointer; }
+
+/* pipeline pass report table */
+.pass-reports { margin: var(--sp-2) 0; }
+.pass-reports summary { cursor: pointer; }
+.pass-table { border-collapse: collapse; margin-top: var(--sp-2); font-size: var(--fs-xs); }
+.pass-table th, .pass-table td { text-align: left; padding: 2px var(--sp-3) 2px 0; color: var(--fg-2); }
+.pass-table th { color: var(--fg-muted); font-weight: 550; }
+
+/* skeptic verification outcome — glyph + color, never color alone */
+.badge.ver-confirmed { color: var(--good); background: var(--good-soft); } .badge.ver-confirmed::before { content: "✓"; }
+.badge.ver-uncertain { color: var(--warn); background: var(--warn-soft); } .badge.ver-uncertain::before { content: "?"; }
+.badge.ver-unverified { color: var(--fg-muted); } .badge.ver-unverified::before { content: "○"; }
 .badge--neutral, .badge--none { color: var(--fg-muted); }
 .badge--good, .badge--ok { color: var(--good); background: var(--good-soft); border-color: color-mix(in srgb, var(--good) 35%, var(--border-2)); }
 .badge--warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, var(--border-2)); }

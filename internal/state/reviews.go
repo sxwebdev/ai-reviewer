@@ -19,11 +19,13 @@ func (db *DB) CreateReview(ctx context.Context, r *Review) error {
 		`INSERT INTO reviews
 			(id, mr_id, project_id, mr_iid, head_sha, base_sha, start_sha, mode, status,
 			 risk_level, overall_recommendation, llm_provider, llm_model, reviewer_profile_id,
-			 summary, raw_report_json, cost_usd, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 summary, raw_report_json, pipeline_json, risk_json, completeness_json, coverage_json,
+			 cost_usd, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.MRID, r.ProjectID, r.MRIID, r.HeadSHA, r.BaseSHA, r.StartSHA, r.Mode, r.Status,
 		r.RiskLevel, r.OverallRecommendation, r.LLMProvider, r.LLMModel, r.ReviewerProfileID,
-		r.Summary, r.RawReportJSON, r.CostUSD, r.CreatedAt, r.UpdatedAt)
+		r.Summary, r.RawReportJSON, r.PipelineJSON, r.RiskJSON, r.CompletenessJSON, r.CoverageJSON,
+		r.CostUSD, r.CreatedAt, r.UpdatedAt)
 	return err
 }
 
@@ -37,13 +39,15 @@ func (db *DB) UpdateReviewStatus(ctx context.Context, id, status string) error {
 
 const reviewColumns = `id, mr_id, project_id, mr_iid, head_sha, base_sha, start_sha, mode, status,
 	risk_level, overall_recommendation, llm_provider, llm_model, reviewer_profile_id,
-	summary, raw_report_json, cost_usd, created_at, updated_at`
+	summary, raw_report_json, pipeline_json, risk_json, completeness_json, coverage_json,
+	cost_usd, created_at, updated_at`
 
 func scanReview(s interface{ Scan(...any) error }) (*Review, error) {
 	r := &Review{}
 	err := s.Scan(&r.ID, &r.MRID, &r.ProjectID, &r.MRIID, &r.HeadSHA, &r.BaseSHA, &r.StartSHA,
 		&r.Mode, &r.Status, &r.RiskLevel, &r.OverallRecommendation, &r.LLMProvider, &r.LLMModel,
-		&r.ReviewerProfileID, &r.Summary, &r.RawReportJSON, &r.CostUSD, &r.CreatedAt, &r.UpdatedAt)
+		&r.ReviewerProfileID, &r.Summary, &r.RawReportJSON, &r.PipelineJSON,
+		&r.RiskJSON, &r.CompletenessJSON, &r.CoverageJSON, &r.CostUSD, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -53,6 +57,20 @@ func scanReview(s interface{ Scan(...any) error }) (*Review, error) {
 // GetReview returns a review by id.
 func (db *DB) GetReview(ctx context.Context, id string) (*Review, error) {
 	r, err := scanReview(db.QueryRowContext(ctx, `SELECT `+reviewColumns+` FROM reviews WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return r, err
+}
+
+// GetLatestCompletedReviewForMR returns the newest review of an MR that
+// produced a usable report (ready/drafted/published), or ErrNotFound.
+func (db *DB) GetLatestCompletedReviewForMR(ctx context.Context, mrID int64) (*Review, error) {
+	r, err := scanReview(db.QueryRowContext(ctx,
+		`SELECT `+reviewColumns+` FROM reviews
+		 WHERE mr_id = ? AND status IN (?, ?, ?)
+		 ORDER BY created_at DESC LIMIT 1`,
+		mrID, ReviewReady, ReviewDrafted, ReviewPublished))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -103,13 +121,13 @@ func (db *DB) InsertFinding(ctx context.Context, f *Finding) error {
 			(id, review_id, mr_id, head_sha, severity, category, file_path, old_path, new_path,
 			 old_line, new_line, line_kind, line_range_start, line_range_end, title, body, suggestion,
 			 confidence, evidence_json, fingerprint, status, rejection_reason, gitlab_position_json,
-			 gitlab_draft_note_id, gitlab_discussion_id, validation_error, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 gitlab_draft_note_id, gitlab_discussion_id, validation_error, pass, verification, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(review_id, fingerprint) DO NOTHING`,
 		f.ID, f.ReviewID, f.MRID, f.HeadSHA, f.Severity, f.Category, f.FilePath, f.OldPath, f.NewPath,
 		f.OldLine, f.NewLine, f.LineKind, f.LineRangeStart, f.LineRangeEnd, f.Title, f.Body, f.Suggestion,
 		f.Confidence, f.EvidenceJSON, f.Fingerprint, f.Status, f.RejectionReason, f.GitLabPositionJSON,
-		f.GitLabDraftNoteID, f.GitLabDiscussionID, f.ValidationError, f.CreatedAt, f.UpdatedAt)
+		f.GitLabDraftNoteID, f.GitLabDiscussionID, f.ValidationError, f.Pass, f.Verification, f.CreatedAt, f.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -127,7 +145,7 @@ func (db *DB) InsertFinding(ctx context.Context, f *Finding) error {
 const findingColumns = `id, review_id, mr_id, head_sha, severity, category, file_path, old_path, new_path,
 	old_line, new_line, line_kind, line_range_start, line_range_end, title, body, suggestion,
 	confidence, evidence_json, fingerprint, status, rejection_reason, gitlab_position_json,
-	gitlab_draft_note_id, gitlab_discussion_id, validation_error, created_at, updated_at, edited_at`
+	gitlab_draft_note_id, gitlab_discussion_id, validation_error, pass, verification, created_at, updated_at, edited_at`
 
 func scanFinding(s interface{ Scan(...any) error }) (*Finding, error) {
 	f := &Finding{}
@@ -135,7 +153,7 @@ func scanFinding(s interface{ Scan(...any) error }) (*Finding, error) {
 		&f.OldPath, &f.NewPath, &f.OldLine, &f.NewLine, &f.LineKind, &f.LineRangeStart, &f.LineRangeEnd,
 		&f.Title, &f.Body, &f.Suggestion, &f.Confidence, &f.EvidenceJSON, &f.Fingerprint, &f.Status,
 		&f.RejectionReason, &f.GitLabPositionJSON, &f.GitLabDraftNoteID, &f.GitLabDiscussionID,
-		&f.ValidationError, &f.CreatedAt, &f.UpdatedAt, &f.EditedAt)
+		&f.ValidationError, &f.Pass, &f.Verification, &f.CreatedAt, &f.UpdatedAt, &f.EditedAt)
 	if err != nil {
 		return nil, err
 	}

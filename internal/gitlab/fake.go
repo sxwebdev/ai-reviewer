@@ -20,6 +20,8 @@ type FakeClient struct {
 	Versions    map[string][]MergeRequestVersion
 	Discussions map[string][]Discussion
 	Pipelines   map[string][]Pipeline
+	Commits     map[string][]Commit
+	RawFiles    map[string][]byte // "path@ref" -> content
 
 	// Recorded writes.
 	CreatedDrafts      []DraftNote
@@ -40,6 +42,8 @@ func NewFake() *FakeClient {
 		Versions:    map[string][]MergeRequestVersion{},
 		Discussions: map[string][]Discussion{},
 		Pipelines:   map[string][]Pipeline{},
+		Commits:     map[string][]Commit{},
+		RawFiles:    map[string][]byte{},
 	}
 }
 
@@ -84,6 +88,17 @@ func (f *FakeClient) ListMRDiscussions(ctx context.Context, projectKey string, i
 
 func (f *FakeClient) ListMRPipelines(ctx context.Context, projectKey string, iid int64) ([]Pipeline, error) {
 	return f.Pipelines[key(projectKey, iid)], nil
+}
+
+func (f *FakeClient) ListMRCommits(ctx context.Context, projectKey string, iid int64) ([]Commit, error) {
+	return f.Commits[key(projectKey, iid)], nil
+}
+
+func (f *FakeClient) GetRawFile(ctx context.Context, projectKey, filePath, ref string) ([]byte, error) {
+	if c, ok := f.RawFiles[filePath+"@"+ref]; ok {
+		return c, nil
+	}
+	return nil, &APIError{Status: 404, Path: "/projects/" + projectKey + "/repository/files/" + filePath}
 }
 
 func (f *FakeClient) CreateDraftNote(ctx context.Context, projectKey string, iid int64, note string, pos *Position) (*DraftNote, error) {

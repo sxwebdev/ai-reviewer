@@ -76,6 +76,92 @@ func TestEnsureMirrorAndWorktree(t *testing.T) {
 	}
 }
 
+func TestDiffRange(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src, sha1 := initSourceRepo(t)
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte("package main\n\nfunc main() { println(1) }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, src, "commit", "-aqm", "change main")
+	sha2 := gitRun(t, src, "rev-parse", "HEAD")
+
+	c := testCache(t)
+	ctx := t.Context()
+	if _, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := c.DiffRange(ctx, "https://gitlab.test", "group/repo", sha1, sha2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "println(1)") || !strings.Contains(diff, "main.go") {
+		t.Errorf("interdiff content wrong:\n%s", diff)
+	}
+
+	// Truncation appends a marker.
+	small, err := c.DiffRange(ctx, "https://gitlab.test", "group/repo", sha1, sha2, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(small, "interdiff truncated") {
+		t.Errorf("truncated interdiff missing marker: %q", small)
+	}
+
+	// Unknown SHA degrades to empty without error.
+	empty, err := c.DiffRange(ctx, "https://gitlab.test", "group/repo", strings.Repeat("0", 40), sha2, 0)
+	if err != nil || empty != "" {
+		t.Errorf("unknown sha must degrade silently, got %q err %v", empty, err)
+	}
+}
+
+func TestRecentHistory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src, _ := initSourceRepo(t)
+	// Second commit: fix touching two paths.
+	if err := os.WriteFile(filepath.Join(src, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte("package main\n\nfunc main() { _ = 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, src, "add", ".")
+	gitRun(t, src, "commit", "-qm", "fix: broken main and add a")
+
+	c := testCache(t)
+	ctx := t.Context()
+	if _, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := c.RecentHistory(ctx, "https://gitlab.test", "group/repo", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("want 2 commits, got %d: %+v", len(history), history)
+	}
+	newest := history[0]
+	if newest.Subject != "fix: broken main and add a" {
+		t.Errorf("subject wrong: %q", newest.Subject)
+	}
+	if len(newest.Paths) != 2 || newest.Paths[0] != "a.go" || newest.Paths[1] != "main.go" {
+		t.Errorf("paths wrong: %v", newest.Paths)
+	}
+	if history[1].Subject != "init" || len(history[1].Paths) != 1 {
+		t.Errorf("oldest commit wrong: %+v", history[1])
+	}
+
+	// Missing mirror degrades with an error.
+	if _, err := c.RecentHistory(ctx, "https://gitlab.test", "group/missing", 10); err == nil {
+		t.Error("missing mirror must error")
+	}
+}
+
 func TestWithinRoot(t *testing.T) {
 	c := NewCache("/tmp/cacheroot", nil)
 	if !c.withinRoot("/tmp/cacheroot/worktrees/x") {

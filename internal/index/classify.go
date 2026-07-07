@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"path"
 	"strings"
+
+	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
 )
 
 // languageByExt maps file extensions to a language label.
@@ -37,13 +39,9 @@ func isVendorPath(rel string) bool {
 	return false
 }
 
-func isTestPath(rel string) bool {
-	base := path.Base(rel)
-	return strings.HasSuffix(base, "_test.go") ||
-		strings.HasSuffix(base, ".test.js") || strings.HasSuffix(base, ".test.ts") ||
-		strings.HasSuffix(base, ".spec.js") || strings.HasSuffix(base, ".spec.ts") ||
-		strings.HasPrefix(base, "test_") // python
-}
+// isTestPath delegates to the shared classifier so the index and the risk
+// builder never disagree about what counts as a test file.
+func isTestPath(rel string) bool { return toolchain.IsTestPath(rel) }
 
 // generatedMarker matches the conventional Go generated-file header.
 var generatedMarker = []byte("Code generated")
@@ -61,32 +59,10 @@ func isGenerated(rel string, content []byte) bool {
 	return bytes.Contains(head, generatedMarker)
 }
 
-// looksBinary reports whether content appears to be binary (has a NUL byte).
-func looksBinary(content []byte) bool {
-	head := content
-	if len(head) > 8000 {
-		head = head[:8000]
-	}
-	return bytes.IndexByte(head, 0) >= 0
-}
+// looksBinary delegates to the shared classifier.
+func looksBinary(content []byte) bool { return toolchain.LooksBinary(content) }
 
-// ignored reports whether rel matches any ignore glob (supporting "dir/**").
-func ignored(rel string, globs []string) bool {
-	base := path.Base(rel)
-	for _, g := range globs {
-		if strings.HasSuffix(g, "/**") {
-			prefix := strings.TrimSuffix(g, "/**")
-			if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
-				return true
-			}
-			continue
-		}
-		if ok, _ := path.Match(g, rel); ok {
-			return true
-		}
-		if ok, _ := path.Match(g, base); ok {
-			return true
-		}
-	}
-	return false
-}
+// ignored delegates to the shared glob matcher (supports "dir/**", "**/x/**",
+// "**/*.ext", and base-name patterns) so index ignore globs and risk
+// sensitive globs share one dialect.
+func ignored(rel string, globs []string) bool { return toolchain.MatchGlob(rel, globs) }

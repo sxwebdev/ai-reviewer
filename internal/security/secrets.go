@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // placeholder is substituted for any detected secret.
@@ -90,3 +91,18 @@ func Mask(s string) string { return defaultRedactor.Mask(s) }
 
 // Default returns the process-wide redactor.
 func Default() *Redactor { return defaultRedactor }
+
+// Truncate shortens s to at most max bytes on a UTF-8 rune boundary,
+// appending an ellipsis. The single home for output-hygiene truncation
+// (comment bodies, prompt sections, subprocess error excerpts).
+func Truncate(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}

@@ -10,6 +10,7 @@ package git
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -85,6 +86,95 @@ func (c *Cache) AddWorktree(ctx context.Context, host, projectPath, headSHA stri
 		return "", nil, fmt.Errorf("add worktree: %w", err)
 	}
 	return wt, func() { c.removeWorktree(bare, wt) }, nil
+}
+
+// DiffRange returns `git diff fromSHA..toSHA` from the project's bare mirror,
+// truncated to maxBytes (0 = unlimited). It returns "" without error when
+// either commit is absent from the mirror, so callers can degrade silently.
+func (c *Cache) DiffRange(ctx context.Context, host, projectPath, fromSHA, toSHA string, maxBytes int) (string, error) {
+	bare := c.BareDir(host, projectPath)
+	if _, err := os.Stat(bare); err != nil {
+		return "", fmt.Errorf("mirror missing: %w", err)
+	}
+	for _, sha := range []string{fromSHA, toSHA} {
+		if !c.hasCommit(ctx, bare, sha) {
+			return "", nil
+		}
+	}
+	out, err := c.runOut(ctx, "git", "-C", bare, "diff", "--unified=3", fromSHA+".."+toSHA)
+	if err != nil {
+		return "", err
+	}
+	if maxBytes > 0 && len(out) > maxBytes {
+		out = out[:maxBytes] + "\n… (interdiff truncated)"
+	}
+	return out, nil
+}
+
+// CommitTouch is one commit's subject plus the paths it touched.
+type CommitTouch struct {
+	Subject string
+	Paths   []string
+}
+
+// RecentHistory returns up to maxCommits recent commits (subject + touched
+// paths) from the bare mirror. One batched `git log --name-only` process,
+// regardless of how many files the caller cares about. Best-effort: a missing
+// mirror or git failure returns an error and callers degrade.
+func (c *Cache) RecentHistory(ctx context.Context, host, projectPath string, maxCommits int) ([]CommitTouch, error) {
+	bare := c.BareDir(host, projectPath)
+	if _, err := os.Stat(bare); err != nil {
+		return nil, fmt.Errorf("mirror missing: %w", err)
+	}
+	if maxCommits <= 0 {
+		maxCommits = 500
+	}
+	// NUL-prefixed subject line starts each record; following non-empty lines
+	// are the commit's paths.
+	out, err := c.runOut(ctx, "git", "-C", bare, "log", "--name-only",
+		"--format=%x00%s", "-n", fmt.Sprint(maxCommits), "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	var commits []CommitTouch
+	for _, line := range strings.Split(out, "\n") {
+		if rest, ok := strings.CutPrefix(line, "\x00"); ok {
+			commits = append(commits, CommitTouch{Subject: rest})
+			continue
+		}
+		line = strings.TrimSpace(line)
+		if line == "" || len(commits) == 0 {
+			continue
+		}
+		last := &commits[len(commits)-1]
+		last.Paths = append(last.Paths, line)
+	}
+	return commits, nil
+}
+
+// hasCommit reports whether the bare repo contains sha as a commit.
+func (c *Cache) hasCommit(ctx context.Context, bare, sha string) bool {
+	if sha == "" {
+		return false
+	}
+	return c.run(ctx, "", nil, "git", "-C", bare, "cat-file", "-e", sha+"^{commit}") == nil
+}
+
+// runOut executes a git command and returns its stdout, masking secrets in
+// error output.
+func (c *Cache) runOut(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.Output()
+	if err != nil {
+		detail := ""
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			detail = ": " + security.Mask(strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", fmt.Errorf("%s%s", err, detail)
+	}
+	return string(out), nil
 }
 
 // removeWorktree detaches and deletes a worktree, refusing paths outside root.
