@@ -46,7 +46,8 @@ func (a *App) Serve(ctx context.Context, opts ServeOptions) error {
 		SetupStatus:    a.SetupStatus,
 		ValidateGitLab: a.ValidateGitLab,
 		ApplySetup:     a.ApplySetup,
-		ApplySettings:  a.ApplySettings,
+		ApplyConfig:    a.ApplyConfig,
+		SettingsView:   a.SettingsView,
 	}, a.Log)
 	if err != nil {
 		return err

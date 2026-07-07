@@ -153,6 +153,57 @@ func TestPatchFileEmptyFile(t *testing.T) {
 	}
 }
 
+func TestPatchFileListReplacesBlockSequence(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := WriteDefaultFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	// ignore_globs exists as a block sequence in the template; verifiers too.
+	// A missing list key (extra_args) exercises the merge-into-ancestor path.
+	err := PatchFileMixed(path, map[string]string{
+		"review.ignore_globs":       FormatYAMLList([]string{"a/**", "b/**"}),
+		"review.pipeline.verifiers": FormatYAMLList([]string{"go_build", "go_test"}),
+		"llm.claude.extra_args":     FormatYAMLList([]string{"--foo", "--bar=baz"}),
+		"review.pipeline.passes":    FormatYAMLList(nil), // empty → []
+	}, map[string]bool{
+		"review.ignore_globs":       true,
+		"review.pipeline.verifiers": true,
+		"llm.claude.extra_args":     true,
+		"review.pipeline.passes":    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Comments on unrelated keys survive the sequence replacement.
+	if !strings.Contains(string(raw), "# ai-reviewer configuration") {
+		t.Error("patched file lost header comment")
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Review.IgnoreGlobs, ","); got != "a/**,b/**" {
+		t.Errorf("ignore_globs = %q", got)
+	}
+	if got := strings.Join(cfg.Review.Pipeline.Verifiers, ","); got != "go_build,go_test" {
+		t.Errorf("verifiers = %q", got)
+	}
+	if got := strings.Join(cfg.LLM.Claude.ExtraArgs, ","); got != "--foo,--bar=baz" {
+		t.Errorf("extra_args = %q", got)
+	}
+	if len(cfg.Review.Pipeline.Passes) != 0 {
+		t.Errorf("passes = %v, want empty", cfg.Review.Pipeline.Passes)
+	}
+}
+
 func TestPatchFileNoValues(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.yaml")

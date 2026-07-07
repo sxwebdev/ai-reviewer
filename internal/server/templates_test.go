@@ -58,9 +58,17 @@ func TestTemplatesRender(t *testing.T) {
 			AgentMode: true, UsedSkills: []string{"go-test"},
 			AvailableSkills: []skillOption{{Name: "go-test", Description: "Go testing house style"}, {Name: "commit"}},
 			PastReviews:     []pastReviewVM{{ID: "revOld", When: "now", HeadSHA: "abc", RiskLevel: "low", Status: "done", Findings: 0}}},
-		"jobs":     jobsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Jobs: []*state.Job{{ID: "j1", Type: "review", Status: "failed", Error: "boom", MRIID: &mrIID, ProgressCurrent: 2, ProgressTotal: 5}}},
-		"memory":   memoryVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Items: []*state.ReviewMemory{{ID: "m1", Type: "false_positive", Scope: "project", Title: "t", Body: "b", Enabled: true}}},
-		"settings": settingsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Cfg: UIConfig{Host: "h", LLMModel: "opus", CommentLanguage: "auto", SeverityThreshold: "medium", MaxComments: 12, AgentMode: true, SubscriptionAuth: true}},
+		"jobs":   jobsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Jobs: []*state.Job{{ID: "j1", Type: "review", Status: "failed", Error: "boom", MRIID: &mrIID, ProgressCurrent: 2, ProgressTotal: 5}}},
+		"memory": memoryVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Items: []*state.ReviewMemory{{ID: "m1", Type: "false_positive", Scope: "project", Title: "t", Body: "b", Enabled: true}}},
+		"settings": settingsVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, Settings: SettingsView{Sections: []SettingsSection{{
+			Name: "Review", HasDanger: true, Fields: []SettingsFieldView{
+				{Key: "review.max_comments", Label: "Max comments", Kind: "int", Value: "12"},
+				{Key: "review.severity_threshold", Label: "Severity", Kind: "select", Value: "medium", Options: []string{"low", "medium", "high"}},
+				{Key: "review.auto_publish", Label: "Auto publish", Kind: "bool", Value: "false", Danger: true, Restart: false},
+				{Key: "review.ignore_globs", Label: "Ignore globs", Kind: "list", Value: "a/**\nb/**"},
+				{Key: "gitlab.token", Label: "Token", Kind: "password", Secret: true, EnvShadowed: true, EnvName: "AI_REVIEWER_GIT_LAB_TOKEN"},
+			},
+		}}}},
 	}
 	for page, data := range cases {
 		t.Run(page, func(t *testing.T) {

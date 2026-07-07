@@ -33,8 +33,26 @@ func PatchFile(path string, values map[string]string) error {
 // other keys are quoted as usual. Doing both in one pass keeps the write atomic
 // (a single read-modify-rename). Raw values must be plain literals and are never
 // secrets.
+//
+// List-valued fields are also written via rawKeys: format them with
+// FormatYAMLList (a YAML flow sequence such as ["a", "b"]) and mark the key raw
+// so the sequence is emitted verbatim, replacing any existing block sequence.
 func PatchFileMixed(path string, values map[string]string, rawKeys map[string]bool) error {
 	return patchFile(path, values, rawKeys)
+}
+
+// FormatYAMLList renders items as a YAML flow sequence, e.g. `["a", "b"]`; an
+// empty list renders as `[]`. Each item is double-quoted. Pass the result as a
+// rawKeys value to PatchFileMixed to overwrite a list-valued config field.
+func FormatYAMLList(items []string) string {
+	if len(items) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(items))
+	for i, s := range items {
+		parts[i] = strconv.Quote(s)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 func patchFile(path string, values map[string]string, rawKeys map[string]bool) error {

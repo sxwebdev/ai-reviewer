@@ -11,19 +11,64 @@
   </div>
 </div>
 
-<div class="card">
-  <div class="panel-head"><h3 class="grow">Configuration</h3></div>
-  <p class="muted small">Read-only. Edit <code>~/.ai-reviewer/config.yaml</code> and restart to change it.</p>
-  <table class="table kv">
-    <tr><th>GitLab host</th><td>{{if .Cfg.Host}}{{.Cfg.Host}}{{else}}<span class="muted">not set — add <code>gitlab.host</code></span>{{end}}</td></tr>
-    <tr><th>LLM model</th><td class="mono">{{.Cfg.LLMModel}}</td></tr>
-    <tr><th>Comment language</th><td>{{.Cfg.CommentLanguage}}</td></tr>
-    <tr><th>Severity threshold</th><td>{{.Cfg.SeverityThreshold}}</td></tr>
-    <tr><th>Max comments</th><td>{{.Cfg.MaxComments}}</td></tr>
-    <tr><th>Agent mode</th><td>{{if .Cfg.AgentMode}}on{{else}}off{{end}}</td></tr>
-    <tr><th>Auth</th><td>{{if .Cfg.SubscriptionAuth}}subscription — reported cost is notional{{else}}API key — billed per token{{end}}</td></tr>
-  </table>
-</div>
+<p class="muted small">
+  Edit any setting below and press <b>Save</b> for that section. Changes apply immediately unless marked
+  <span class="badge badge--warn">restart</span>. Fields marked <span class="badge badge--danger">danger</span>
+  are safety-sensitive. Values can also be edited directly in <code>~/.ai-reviewer/config.yaml</code>.
+</p>
+
+{{range .Settings.Sections}}
+<form class="card settings-section" method="post" action="/settings/apply"
+      hx-post="/settings/apply" hx-target="find .settings-result" hx-swap="innerHTML"
+      {{if .HasDanger}}hx-confirm="This section changes a safety-sensitive setting. Save anyway?"{{end}}>
+  <div class="panel-head"><h3 class="grow">{{.Name}}</h3>
+    <button class="btn btn--primary btn--sm" type="submit">Save</button>
+  </div>
+  <div class="settings-grid">
+    {{range .Fields}}
+    {{$f := .}}
+    <div class="setting-row">
+      <label class="setting-label" for="set-{{.Key}}">
+        <span class="setting-name">{{.Label}}</span>
+        {{if .Danger}}<span class="badge badge--danger" title="Safety-sensitive">danger</span>{{end}}
+        {{if .Restart}}<span class="badge badge--warn" title="Takes effect only after restart">restart</span>{{end}}
+        {{if .EnvShadowed}}<span class="badge" title="Overridden by {{.EnvName}} — unset it for edits to apply">env</span>{{end}}
+      </label>
+      <div class="setting-input">
+        {{if eq .Kind "bool"}}
+          <select class="input" id="set-{{.Key}}" name="cfg:{{.Key}}" aria-label="{{.Label}}">
+            <option value="false" {{if eq .Value "false"}}selected{{end}}>off</option>
+            <option value="true" {{if eq .Value "true"}}selected{{end}}>on</option>
+          </select>
+        {{else if eq .Kind "select"}}
+          <select class="input" id="set-{{.Key}}" name="cfg:{{.Key}}" aria-label="{{.Label}}">
+            {{range .Options}}<option value="{{.}}" {{if eq . $f.Value}}selected{{end}}>{{.}}</option>{{end}}
+          </select>
+        {{else if eq .Kind "list"}}
+          <textarea class="input input--mono" id="set-{{.Key}}" name="cfg:{{.Key}}" rows="4"
+                    spellcheck="false" placeholder="one per line" aria-label="{{.Label}}">{{.Value}}</textarea>
+        {{else if eq .Kind "password"}}
+          <input class="input input--mono" id="set-{{.Key}}" name="cfg:{{.Key}}" type="password"
+                 autocomplete="off" placeholder="leave blank to keep current" aria-label="{{.Label}}">
+        {{else if eq .Kind "int"}}
+          <input class="input" id="set-{{.Key}}" name="cfg:{{.Key}}" type="number" step="1"
+                 value="{{.Value}}" aria-label="{{.Label}}">
+        {{else}}
+          <input class="input {{if eq .Kind "duration"}}input--mono{{end}}" id="set-{{.Key}}" name="cfg:{{.Key}}"
+                 type="text" value="{{.Value}}" aria-label="{{.Label}}">
+        {{end}}
+        {{if .Help}}<p class="setting-help muted small">{{.Help}}</p>{{end}}
+      </div>
+    </div>
+    {{end}}
+  </div>
+  <div class="settings-result" aria-live="polite"></div>
+</form>
+{{end}}
+{{end}}
+
+{{define "settings-apply-result"}}
+{{if .Message}}<div class="alert alert--{{if eq .Kind "err"}}danger{{else if eq .Kind "ok"}}ok{{else if eq .Kind "warn"}}warn{{else}}info{{end}}" role="status"><div class="alert__body">{{.Message}}</div></div>{{end}}
 {{end}}
 
 {{define "health-checks"}}
