@@ -73,6 +73,16 @@ func TestApplyVerdicts(t *testing.T) {
 	}
 }
 
+func TestApplyVerdictsClampsConfidence(t *testing.T) {
+	batch := []ValidatedFinding{vf("high", "percent confidence", 0.6)}
+	out := applyVerdicts(batch, []llm.FindingVerdict{
+		{Index: 1, Verdict: "confirmed", Confidence: 95}, // percent-style, schema not trusted
+	}, discardLog())
+	if len(out) != 1 || out[0].Confidence > 1 {
+		t.Errorf("model confidence must be clamped to [0,1]: %+v", out)
+	}
+}
+
 func TestApplyVerdictsDuplicateGuards(t *testing.T) {
 	t.Run("blocking duplicate is demoted, not dropped", func(t *testing.T) {
 		batch := []ValidatedFinding{vf("high", "kept", 0.9), vf("blocking", "blocker dup", 0.9)}

@@ -114,6 +114,13 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	if in.Profile == nil {
 		in.Profile = DefaultProfile()
 	}
+	// The engine boundary owns the MaxComments floor (a zero-value field must
+	// mean "default", never "drop everything"); a local keeps the caller's
+	// shared Profile unmutated.
+	maxComments := in.Profile.MaxComments
+	if maxComments <= 0 {
+		maxComments = DefaultProfile().MaxComments
+	}
 	pc := in.Pipeline.withDefaults()
 	specs := ResolvePasses(pc.Passes, e.log)
 
@@ -126,7 +133,11 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	var complDur time.Duration
 	var complWG sync.WaitGroup
 	complCtx, complCancel := context.WithCancel(ctx)
-	complRan := pc.Completeness && hasIntentText(in)
+	// An explicit "on" always runs; "auto" additionally requires enough stated
+	// intent to audit against (which depends on the commits section being
+	// enabled — auto quietly skipping there is fine, an explicit "on" is not).
+	complRan := pc.Completeness == CompletenessOn ||
+		(pc.Completeness == CompletenessAuto && hasIntentText(in))
 	if complRan {
 		complWG.Add(1)
 		go func() {
@@ -158,20 +169,29 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 	merged := mergeResponses(outcomes)
 
 	if pc.VerifyMode == VerifyReflect {
+		start := time.Now()
 		reflected, reflectCost, err := e.selfReflect(ctx, in, merged)
-		merged.CostUSD += reflectCost
 		if err != nil {
 			e.log.Warn("self-reflection failed; keeping original findings", "err", err)
 		} else {
 			merged = applyReflect(merged, reflected, e.log)
 		}
+		// Add the reflect call's cost AFTER applyReflect: the reflected
+		// response carries the pre-reflect total, so adding earlier would lose
+		// the reflect spend on the success path.
+		merged.CostUSD += reflectCost
+		rep := PassReport{Name: "reflect", CostUSD: reflectCost, DurationMS: time.Since(start).Milliseconds()}
+		if err != nil {
+			rep.Err = err.Error()
+		}
+		reports = append(reports, rep)
 	}
 
 	// Stage 3: validate at a relaxed cap so later verification stages choose
 	// the final MaxComments from verified survivors, not a pre-starved list.
 	v := NewValidator(ValidatorConfig{
 		SeverityThreshold: in.Profile.SeverityThreshold,
-		MaxComments:       in.Profile.MaxComments * candidateMultiplier,
+		MaxComments:       maxComments * candidateMultiplier,
 	})
 	findings := v.Validate(merged, in.Files, in.Refs, in.ProjectID, in.MRIID, in.ExistingFingerprints)
 
@@ -194,8 +214,8 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 
 	// Stage 6: finalize.
 	rankFindings(findings)
-	if len(findings) > in.Profile.MaxComments {
-		findings = findings[:in.Profile.MaxComments]
+	if len(findings) > maxComments {
+		findings = findings[:maxComments]
 	}
 
 	complWG.Wait()
@@ -225,26 +245,41 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 //     pre-reflect findings (json:"-" fields do not survive the round-trip);
 //   - blocking protection: blocking/critical findings the reflection removed
 //     are restored demoted (confidence ≤ 0.5, requires human check) — the
-//     model must not silently suppress a blocker, mirroring the skeptic rule.
+//     model must not silently suppress a blocker, mirroring the skeptic rule;
+//   - drop-only enforcement: verification may only remove or demote, never
+//     add — post findings whose file+title key was not in the pre-reflect set
+//     (hallucinated additions, reworded titles) are dropped in Go, not trusted
+//     to the prompt instruction.
 func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewResponse {
 	key := func(f llm.Finding) string {
 		return strings.ToLower(strings.TrimSpace(f.FilePath)) + "\x00" + normalizeTitle(f.Title)
 	}
+	preKeys := map[string]bool{}
 	prePass := map[string]string{}
 	for _, f := range pre.Findings {
-		if _, ok := prePass[key(f)]; !ok {
-			prePass[key(f)] = f.PassName
+		k := key(f)
+		preKeys[k] = true
+		if _, ok := prePass[k]; !ok {
+			prePass[k] = f.PassName
 		}
 	}
 
 	postKeys := map[string]bool{}
-	for i := range post.Findings {
-		k := key(post.Findings[i])
-		postKeys[k] = true
-		if post.Findings[i].PassName == "" {
-			post.Findings[i].PassName = prePass[k]
+	kept := post.Findings[:0:0]
+	for _, f := range post.Findings {
+		k := key(f)
+		if !preKeys[k] {
+			log.Warn("self-reflection added a new finding; dropping (verification may only remove or demote)",
+				"file", f.FilePath, "title", f.Title)
+			continue
 		}
+		if f.PassName == "" {
+			f.PassName = prePass[k]
+		}
+		postKeys[k] = true
+		kept = append(kept, f)
 	}
+	post.Findings = kept
 
 	for _, f := range pre.Findings {
 		if SeverityRank(NormalizeSeverity(f.Severity)) < SeverityRank("blocking") || postKeys[key(f)] {

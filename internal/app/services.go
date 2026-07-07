@@ -18,15 +18,20 @@ func pipelineFromConfig(rc config.ReviewConfig) review.PipelineConfig {
 		VerifyMaxFindings: p.VerifyMaxFindings,
 		Verifiers:         p.Verifiers,
 	}
-	// Tri-state completeness: an explicit "on" survives cheap mode; "auto"
-	// follows the preset (on for everything but cheap).
+	// Tri-state completeness: an explicit "on" survives cheap mode (and, in
+	// the engine, bypasses the intent-text gate); "auto" follows the preset
+	// (auto for everything but cheap).
 	switch p.Completeness {
 	case "on":
-		out.Completeness = true
+		out.Completeness = review.CompletenessOn
 	case "off":
-		out.Completeness = false
+		out.Completeness = review.CompletenessOff
 	default: // auto
-		out.Completeness = p.Mode != "cheap"
+		if p.Mode != "cheap" {
+			out.Completeness = review.CompletenessAuto
+		} else {
+			out.Completeness = review.CompletenessOff
+		}
 	}
 	switch p.Mode {
 	case "cheap":

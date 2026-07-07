@@ -96,10 +96,42 @@ func TestMatchGlob(t *testing.T) {
 		{"src/clock.ts", []string{"package-lock.json", "yarn.lock"}, false},
 		{".github/workflows/ci.yml", []string{".github/**"}, true},
 		{"main.go", []string{"**/auth/**", "*.sql"}, false},
+		// "**/" means any depth INCLUDING zero — patterns with a slash in the
+		// remainder must match at the root, one level deep, and deeper.
+		{"gen/schema.sql", []string{"**/gen/*.sql"}, true},
+		{"pkg/gen/schema.sql", []string{"**/gen/*.sql"}, true},
+		{"a/b/gen/schema.sql", []string{"**/gen/*.sql"}, true},
+		{"pkg/gens/schema.sql", []string{"**/gen/*.sql"}, false},
+		{"a/testdata/big.json", []string{"**/testdata/*.json"}, true},
+		{"deep/nested/x.sql", []string{"**/*.sql"}, true},
 	}
 	for _, c := range cases {
 		if got := MatchGlob(c.rel, c.globs); got != c.want {
 			t.Errorf("MatchGlob(%q, %v) = %v, want %v", c.rel, c.globs, got, c.want)
+		}
+	}
+}
+
+func TestIsSourceFile(t *testing.T) {
+	cases := []struct {
+		rel  string
+		want bool
+	}{
+		{"cmd/main.go", true},
+		{"web/src/App.tsx", true},
+		{"scripts/migrate.py", true},
+		{"db/0001_init.sql", true},
+		{"api/v1/service.proto", true},
+		{"deploy.sh", true},
+		{"Handler.KT", true}, // extension match is deliberately case-insensitive
+		{"README.md", false},
+		{"config.yaml", false},
+		{"package.json", false},
+		{"LICENSE", false},
+	}
+	for _, c := range cases {
+		if got := IsSourceFile(c.rel); got != c.want {
+			t.Errorf("IsSourceFile(%q) = %v, want %v", c.rel, got, c.want)
 		}
 	}
 }

@@ -230,7 +230,7 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 			out = append(out, f)
 		case "confirmed":
 			f.Verification = VerificationConfirmed
-			f.Confidence = max(f.Confidence, v.Confidence)
+			f.Confidence = max(f.Confidence, clamp01(v.Confidence))
 			out = append(out, f)
 		default:
 			f.Verification = VerificationUnverified

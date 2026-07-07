@@ -103,10 +103,19 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	memory := s.loadMemory(ctx)
 	existing := s.existingFingerprints(ctx, mrID)
 
+	// One head SHA for everything content-addressed in this review: diffs and
+	// positions come from diff_refs, so the worktree, the FTS index, and the
+	// related-files query must use the same commit (mr.SHA can transiently
+	// diverge from diff_refs.head_sha right after a push).
+	headSHA := mr.DiffRefs.HeadSHA
+	if headSHA == "" {
+		headSHA = mr.SHA
+	}
+
 	// Agent mode: prepare a read-only worktree at head sha so the LLM can
 	// inspect the repository. Best-effort — any failure falls back to
 	// diff-only review.
-	workDir, agentMode, cleanup := s.prepareWorktree(ctx, proj, mr)
+	workDir, agentMode, cleanup := s.prepareWorktree(ctx, proj, headSHA)
 	defer cleanup()
 
 	// The enrichment builders are independent, best-effort I/O (worktree/API
@@ -135,7 +144,7 @@ func (s *ReviewService) RunReview(ctx context.Context, ref gitlab.MRRef) (string
 	runEnrich(func() { priorReview = s.buildPriorReview(ctx, proj, mr, mrID) })
 	runEnrich(func() { riskReport = s.buildRiskReport(ctx, proj, files) })
 	if agentMode {
-		runEnrich(func() { relatedFiles = s.findRelatedFiles(ctx, proj.ID, mr.DiffRefs.HeadSHA, files) })
+		runEnrich(func() { relatedFiles = s.findRelatedFiles(ctx, proj.ID, headSHA, files) })
 	}
 	discussionNotes := s.buildDiscussionNotes(discussions) // pure mapping, no I/O
 	enrich.Wait()
@@ -201,28 +210,29 @@ func (s *ReviewService) upsertMR(ctx context.Context, proj *gitlab.Project, mr *
 }
 
 // prepareWorktree clones/fetches the project mirror, checks out a worktree at
-// the MR head sha, and indexes it. It returns the worktree dir, whether agent
-// mode is active, and a cleanup func (always non-nil). On any failure it
-// degrades to diff-only review.
-func (s *ReviewService) prepareWorktree(ctx context.Context, proj *gitlab.Project, mr *gitlab.MergeRequest) (string, bool, func()) {
+// headSHA, and indexes it under the same SHA (writer and readers must agree on
+// the key). It returns the worktree dir, whether agent mode is active, and a
+// cleanup func (always non-nil). On any failure it degrades to diff-only
+// review.
+func (s *ReviewService) prepareWorktree(ctx context.Context, proj *gitlab.Project, headSHA string) (string, bool, func()) {
 	noop := func() {}
-	if s.cache == nil || proj.HTTPURLToRepo == "" || mr.SHA == "" {
+	if s.cache == nil || proj.HTTPURLToRepo == "" || headSHA == "" {
 		return "", false, noop
 	}
 	if _, err := s.cache.EnsureMirror(ctx, proj.HTTPURLToRepo, s.cfg.Host, proj.PathWithNamespace, s.cfg.Token); err != nil {
 		s.log.Warn("agent mode: mirror failed, falling back to diff-only", "err", err)
 		return "", false, noop
 	}
-	wt, cleanup, err := s.cache.AddWorktree(ctx, s.cfg.Host, proj.PathWithNamespace, mr.SHA)
+	wt, cleanup, err := s.cache.AddWorktree(ctx, s.cfg.Host, proj.PathWithNamespace, headSHA)
 	if err != nil {
 		s.log.Warn("agent mode: worktree failed, falling back to diff-only", "err", err)
 		return "", false, noop
 	}
 	if s.indexer != nil {
-		if n, err := s.indexer.IndexWorktree(ctx, proj.ID, mr.SHA, wt, s.cfg.IgnoreGlobs); err != nil {
+		if n, err := s.indexer.IndexWorktree(ctx, proj.ID, headSHA, wt, s.cfg.IgnoreGlobs); err != nil {
 			s.log.Warn("index worktree failed", "err", err)
 		} else {
-			s.log.Info("indexed worktree", "files", n, "sha", mr.SHA)
+			s.log.Info("indexed worktree", "files", n, "sha", headSHA)
 		}
 	}
 	return wt, true, cleanup

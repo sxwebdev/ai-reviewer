@@ -175,3 +175,30 @@ func TestBuildFileContextsDisabled(t *testing.T) {
 		t.Errorf("disabled context should return nil, got %+v", got)
 	}
 }
+
+func TestBuildRiskReportSkipsNonSourceFiles(t *testing.T) {
+	svc := NewReviewService(gitlab.NewFake(), nil, nil, ReviewConfig{
+		Profile: review.DefaultProfile(),
+		Risk:    RiskSettings{Enabled: true},
+	}, discardLogger())
+
+	docs := []*review.FileDiff{parsedFile(t, "README.md", ctxDiff), parsedFile(t, "ci.yaml", ctxDiff)}
+	rep := svc.buildRiskReport(t.Context(), &gitlab.Project{}, docs)
+	for _, f := range rep.Factors {
+		if f.Name == "no_tests" {
+			t.Errorf("docs-only MR must not trip the no_tests factor: %+v", rep.Factors)
+		}
+	}
+
+	code := append(docs, parsedFile(t, "svc/main.go", ctxDiff))
+	rep = svc.buildRiskReport(t.Context(), &gitlab.Project{}, code)
+	found := false
+	for _, f := range rep.Factors {
+		if f.Name == "no_tests" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("untested source change must trip the no_tests factor: %+v", rep.Factors)
+	}
+}

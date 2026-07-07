@@ -51,6 +51,34 @@ func TestApplyReflect(t *testing.T) {
 	}
 }
 
+func TestApplyReflectDropsAddedFindings(t *testing.T) {
+	pre := &llm.ReviewResponse{Findings: []llm.Finding{reflFinding("high", "real bug", "general", 0.9)}}
+	post := &llm.ReviewResponse{Findings: []llm.Finding{
+		reflFinding("high", "real bug", "", 0.9),
+		reflFinding("high", "hallucinated new bug", "", 0.9), // not in pre
+	}}
+	got := applyReflect(pre, post, discardLog())
+	if len(got.Findings) != 1 || got.Findings[0].Title != "real bug" {
+		t.Fatalf("reflection may only remove or demote, never add: %+v", got.Findings)
+	}
+}
+
+func TestApplyReflectRewordedBlockerNotDuplicated(t *testing.T) {
+	pre := &llm.ReviewResponse{Findings: []llm.Finding{reflFinding("blocking", "nil deref in handler", "general", 0.9)}}
+	// The model reworded the blocker's title: the reworded copy is an
+	// addition (dropped) and the original is restored demoted — exactly one
+	// finding must survive.
+	post := &llm.ReviewResponse{Findings: []llm.Finding{reflFinding("blocking", "possible nil pointer dereference", "", 0.9)}}
+	got := applyReflect(pre, post, discardLog())
+	if len(got.Findings) != 1 {
+		t.Fatalf("reworded blocker must not produce near-duplicates: %+v", got.Findings)
+	}
+	f := got.Findings[0]
+	if f.Title != "nil deref in handler" || !f.RequiresHumanCheck || f.Confidence > 0.5 {
+		t.Errorf("original blocker must be restored demoted: %+v", f)
+	}
+}
+
 func TestApplyReflectNoChanges(t *testing.T) {
 	pre := &llm.ReviewResponse{Findings: []llm.Finding{reflFinding("blocking", "b1", "general", 0.9)}}
 	post := &llm.ReviewResponse{Findings: []llm.Finding{reflFinding("blocking", "b1", "", 0.9)}}
@@ -60,5 +88,55 @@ func TestApplyReflectNoChanges(t *testing.T) {
 	}
 	if got.Findings[0].PassName != "general" {
 		t.Errorf("provenance restore failed: %+v", got.Findings[0])
+	}
+}
+
+func TestReflectCostCountedOnSuccess(t *testing.T) {
+	fake := llm.NewFake(&llm.ReviewResponse{
+		Summary: "ok", RiskLevel: "low", OverallRecommendation: "comment",
+		Findings: []llm.Finding{passFinding("high", "correctness", "bug", 0.9)},
+		CostUSD:  1.0,
+	})
+	// The reflect call keeps the finding and costs 0.25 on its own.
+	fake.JSON = `{"summary":"ok","risk_level":"low","overall_recommendation":"comment",` +
+		`"findings":[{"severity":"high","category":"correctness","file_path":"main.go",` +
+		`"line_kind":"new","line":2,"title":"bug","body":"body of bug","confidence":0.9}]}`
+	fake.JSONCost = 0.25
+
+	res, err := pipelineEngine(fake).Review(t.Context(), testInput(t, PipelineConfig{VerifyMode: VerifyReflect}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.CostUSD != 1.25 {
+		t.Errorf("successful reflection must add its cost: got %v, want 1.25", res.CostUSD)
+	}
+	var reflectRep *PassReport
+	for i := range res.PassReports {
+		if res.PassReports[i].Name == "reflect" {
+			reflectRep = &res.PassReports[i]
+		}
+	}
+	if reflectRep == nil || reflectRep.CostUSD != 0.25 {
+		t.Errorf("reflect must appear in pass reports with its cost: %+v", res.PassReports)
+	}
+}
+
+func TestMaxCommentsZeroAndNegativeUseDefault(t *testing.T) {
+	for _, mc := range []int{0, -1} {
+		fake := llm.NewFake(&llm.ReviewResponse{
+			Summary: "ok", RiskLevel: "low", OverallRecommendation: "comment",
+			Findings: []llm.Finding{passFinding("high", "correctness", "bug", 0.9)},
+		})
+		in := testInput(t, PipelineConfig{})
+		p := *DefaultProfile()
+		p.MaxComments = mc
+		in.Profile = &p
+		res, err := pipelineEngine(fake).Review(t.Context(), in)
+		if err != nil {
+			t.Fatalf("MaxComments=%d: %v", mc, err)
+		}
+		if len(res.Findings) != 1 {
+			t.Errorf("MaxComments=%d must mean default, not drop-everything: %+v", mc, res.Findings)
+		}
 	}
 }

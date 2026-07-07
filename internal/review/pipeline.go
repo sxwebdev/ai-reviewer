@@ -22,6 +22,15 @@ const (
 // later verification stages choose the final list from verified survivors.
 const candidateMultiplier = 2
 
+// Completeness modes for PipelineConfig.Completeness. The distinction matters
+// at the engine: "on" always runs the audit, "auto" additionally requires the
+// MR to carry enough stated intent (hasIntentText).
+const (
+	CompletenessOff  = "off"
+	CompletenessAuto = "auto"
+	CompletenessOn   = "on"
+)
+
 // PipelineConfig controls the multi-pass review pipeline. The zero value is
 // the cheap single-pass mode with verification off (previous behaviour).
 type PipelineConfig struct {
@@ -30,7 +39,7 @@ type PipelineConfig struct {
 	VerifyMode        string   // off | reflect | skeptic (default off)
 	VerifyMaxFindings int      // cap on findings sent to the skeptic (default 24)
 	Verifiers         []string // deterministic verifier names (default ["go_build"])
-	Completeness      bool     // run the acceptance-criteria audit (default off)
+	Completeness      string   // acceptance-criteria audit: off | auto | on (default off)
 }
 
 func (pc PipelineConfig) withDefaults() PipelineConfig {
@@ -48,6 +57,9 @@ func (pc PipelineConfig) withDefaults() PipelineConfig {
 	}
 	if pc.Verifiers == nil {
 		pc.Verifiers = []string{"go_build"}
+	}
+	if pc.Completeness == "" {
+		pc.Completeness = CompletenessOff
 	}
 	return pc
 }

@@ -2,9 +2,11 @@ package coverage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
 )
@@ -86,10 +88,24 @@ func Collect(ctx context.Context, workDir string, changedFiles []string, provide
 		}
 	}
 
+	// Aggregate unclaimed files into one note — an MR touching dozens of
+	// docs/config files must not flood every pass prompt and the UI with one
+	// line per file.
+	var unclaimed []string
 	for _, f := range changedFiles {
 		if !claimed[f] {
-			skips = append(skips, SkipNote{Root: path.Dir(f), Reason: "no coverage provider for " + f})
+			unclaimed = append(unclaimed, f)
 		}
+	}
+	if len(unclaimed) > 0 {
+		const maxListed = 5
+		listed := strings.Join(unclaimed[:min(len(unclaimed), maxListed)], ", ")
+		if extra := len(unclaimed) - maxListed; extra > 0 {
+			listed += fmt.Sprintf(" and %d more", extra)
+		}
+		skips = append(skips, SkipNote{
+			Reason: fmt.Sprintf("no coverage provider for %d file(s): %s", len(unclaimed), listed),
+		})
 	}
 	return merged, skips, notes
 }

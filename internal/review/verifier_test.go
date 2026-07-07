@@ -234,3 +234,21 @@ func TestBuiltinVerifiersUnknownSkipped(t *testing.T) {
 		}
 	}
 }
+
+func TestHasBuildConstraintAfterLongHeader(t *testing.T) {
+	dir := t.TempDir()
+	header := "// " + strings.Repeat("license text ", 120) + "\n" // > 1KB before the constraint
+	content := header + "//go:build integration\n\npackage p\n"
+	if err := os.WriteFile(filepath.Join(dir, "tagged.go"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !hasBuildConstraint(dir, "tagged.go") {
+		t.Error("constraint after a >1KB header must still be detected")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plain.go"), []byte(header+"package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if hasBuildConstraint(dir, "plain.go") {
+		t.Error("file without a constraint must report false")
+	}
+}

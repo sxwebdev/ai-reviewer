@@ -1,6 +1,7 @@
 package review
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"os"
@@ -63,10 +64,13 @@ func hasBuildConstraint(workDir, filePath string) bool {
 		return false
 	}
 	defer f.Close() //nolint:errcheck
-	head := make([]byte, 1024)
-	n, _ := f.Read(head)
-	for _, line := range bytes.Split(head[:n], []byte("\n")) {
-		trimmed := bytes.TrimSpace(line)
+	// Scan line by line up to the package clause — constraints must precede
+	// it, but a long license/doc header may push them past any fixed-size
+	// buffer.
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		trimmed := bytes.TrimSpace(sc.Bytes())
 		if bytes.HasPrefix(trimmed, []byte("//go:build")) || bytes.HasPrefix(trimmed, []byte("// +build")) {
 			return true
 		}

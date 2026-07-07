@@ -66,6 +66,24 @@ func IsTestPath(rel string) bool {
 		strings.Contains(rel, "/__tests__/")
 }
 
+// sourceExts are extensions of files that carry executable behaviour (code,
+// migrations, API contracts, scripts) — the set the risk scorer treats as
+// "source" when deciding whether behaviour changed without tests.
+var sourceExts = map[string]bool{
+	".go": true, ".js": true, ".jsx": true, ".ts": true, ".tsx": true,
+	".mjs": true, ".cjs": true, ".mts": true, ".cts": true, ".vue": true, ".svelte": true,
+	".py": true, ".rb": true, ".php": true, ".java": true, ".kt": true, ".kts": true,
+	".rs": true, ".c": true, ".h": true, ".cc": true, ".cpp": true, ".hpp": true,
+	".cs": true, ".swift": true, ".scala": true, ".ex": true, ".exs": true,
+	".sql": true, ".proto": true, ".sh": true, ".bash": true,
+}
+
+// IsSourceFile reports whether a repo-relative path looks like executable
+// source code (as opposed to docs, config, or data).
+func IsSourceFile(rel string) bool {
+	return sourceExts[strings.ToLower(path.Ext(rel))]
+}
+
 // LooksBinary reports whether content appears to be binary (a NUL byte within
 // the head). Shared by the indexer and the file-context builder so both
 // classify the same file identically.
@@ -100,11 +118,26 @@ func MatchGlob(rel string, globs []string) bool {
 			}
 			continue
 		}
-		pat := strings.TrimPrefix(g, "**/") // "**/*.sql" matches at any depth
-		if ok, _ := path.Match(pat, rel); ok {
+		if pat, anyDepth := strings.CutPrefix(g, "**/"); anyDepth {
+			// "**/dir/*.ext" matches at any depth, including zero: try the
+			// stripped pattern against rel and every path suffix of rel.
+			rest := rel
+			for {
+				if ok, _ := path.Match(pat, rest); ok {
+					return true
+				}
+				i := strings.IndexByte(rest, '/')
+				if i < 0 {
+					break
+				}
+				rest = rest[i+1:]
+			}
+			continue
+		}
+		if ok, _ := path.Match(g, rel); ok {
 			return true
 		}
-		if ok, _ := path.Match(pat, base); ok {
+		if ok, _ := path.Match(g, base); ok {
 			return true
 		}
 	}

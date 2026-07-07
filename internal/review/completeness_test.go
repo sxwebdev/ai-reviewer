@@ -11,7 +11,7 @@ import (
 
 func completenessInput(t *testing.T) ReviewInput {
 	t.Helper()
-	in := testInput(t, PipelineConfig{Completeness: true})
+	in := testInput(t, PipelineConfig{Completeness: CompletenessAuto})
 	in.Description = "Implements refund processing:\n- validate amounts\n- write audit log"
 	in.Commits = []CommitInfo{{ShortSHA: "c1", Title: "feat: refunds", Message: "adds ProcessRefund"}}
 	return in
@@ -81,12 +81,26 @@ func TestCompletenessFailureIsNonFatal(t *testing.T) {
 
 func TestCompletenessSkippedWithoutIntent(t *testing.T) {
 	fake := llm.NewFake(&llm.ReviewResponse{Summary: "ok", RiskLevel: "low", OverallRecommendation: "comment"})
-	in := testInput(t, PipelineConfig{Completeness: true}) // bare title, no description/commits
+	in := testInput(t, PipelineConfig{Completeness: CompletenessAuto}) // bare title, no description/commits
 	if _, err := pipelineEngine(fake).Review(t.Context(), in); err != nil {
 		t.Fatal(err)
 	}
 	if fake.Calls != 1 {
 		t.Errorf("no intent text → audit must be skipped, got %d calls", fake.Calls)
+	}
+}
+
+func TestCompletenessExplicitOnRunsWithoutIntent(t *testing.T) {
+	// Explicit "on" must run even without intent text — hasIntentText depends
+	// on the commits section, which an unrelated config flag can empty.
+	fake := llm.NewFake(&llm.ReviewResponse{Summary: "ok", RiskLevel: "low", OverallRecommendation: "comment"})
+	fake.JSON = `{"criteria":[]}`
+	in := testInput(t, PipelineConfig{Completeness: CompletenessOn}) // bare title, no description/commits
+	if _, err := pipelineEngine(fake).Review(t.Context(), in); err != nil {
+		t.Fatal(err)
+	}
+	if fake.Calls != 2 {
+		t.Errorf("explicit on must run the audit despite missing intent, got %d calls", fake.Calls)
 	}
 }
 

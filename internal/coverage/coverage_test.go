@@ -200,7 +200,7 @@ func TestCollectUncoverableFileUnderRootIsSkippedNote(t *testing.T) {
 	}
 	found := false
 	for _, s := range skips {
-		if strings.Contains(s.Reason, "no coverage provider for app.ts") {
+		if strings.Contains(s.Reason, "no coverage provider") && strings.Contains(s.Reason, "app.ts") {
 			found = true
 		}
 	}
@@ -233,6 +233,18 @@ func TestCollectUnclaimedFilesSkipped(t *testing.T) {
 		Options{}, discardLog())
 	if len(profile) != 0 || len(skips) != 1 || !strings.Contains(skips[0].Reason, "no coverage provider") {
 		t.Errorf("unclaimed file must be reported: %+v %+v", profile, skips)
+	}
+}
+
+func TestCollectAggregatesUnclaimedFilesIntoOneNote(t *testing.T) {
+	wd := t.TempDir()
+	files := []string{"a.md", "b.md", "c.yaml", "d.yaml", "e.txt", "f.txt", "g.json"}
+	_, skips, _ := Collect(t.Context(), wd, files, nil, Options{}, discardLog())
+	if len(skips) != 1 {
+		t.Fatalf("unclaimed files must aggregate into one note, got %d: %+v", len(skips), skips)
+	}
+	if !strings.Contains(skips[0].Reason, "7 file(s)") || !strings.Contains(skips[0].Reason, "and 2 more") {
+		t.Errorf("aggregated note must carry the count and a capped list: %q", skips[0].Reason)
 	}
 }
 
@@ -389,5 +401,28 @@ func TestBuiltinProvidersUnknownSkipped(t *testing.T) {
 	ps := BuiltinProviders([]string{"go", "nonsense", "node"}, nil, Options{}, discardLog())
 	if len(ps) != 2 || ps[0].Name() != "go" || ps[1].Name() != "node" {
 		t.Fatalf("unknown provider must be skipped: %v", ps)
+	}
+}
+
+func TestProviderCovers(t *testing.T) {
+	goP := NewGoProvider(nil, discardLog())
+	nodeP := NewNodeProvider(nil, false, discardLog())
+	cases := []struct {
+		path       string
+		goC, nodeC bool
+	}{
+		{"pkg/x.go", true, false},
+		{"web/App.tsx", false, true},
+		{"web/util.mjs", false, true},
+		{"README.md", false, false},
+		{"schema.sql", false, false},
+	}
+	for _, c := range cases {
+		if got := goP.Covers(c.path); got != c.goC {
+			t.Errorf("go.Covers(%q) = %v, want %v", c.path, got, c.goC)
+		}
+		if got := nodeP.Covers(c.path); got != c.nodeC {
+			t.Errorf("node.Covers(%q) = %v, want %v", c.path, got, c.nodeC)
+		}
 	}
 }

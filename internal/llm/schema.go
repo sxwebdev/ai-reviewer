@@ -119,7 +119,7 @@ const VerdictJSONSchema = `{
           "index": {"type": "integer"},
           "verdict": {"type": "string", "enum": ["confirmed", "refuted", "uncertain"]},
           "reason": {"type": "string"},
-          "confidence": {"type": "number"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
           "duplicate_of": {"type": "integer"}
         }
       }
@@ -152,7 +152,7 @@ const ReviewJSONSchema = `{
           "title": {"type": "string"},
           "body": {"type": "string"},
           "suggestion": {"type": "string"},
-          "confidence": {"type": "number"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
           "evidence": {"type": "array", "items": {"type": "string"}},
           "blocking": {"type": "boolean"},
           "requires_human_check": {"type": "boolean"}

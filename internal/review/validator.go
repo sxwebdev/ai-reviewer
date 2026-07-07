@@ -84,7 +84,7 @@ func (v *Validator) Validate(
 			Suggestion:  f.Suggestion,
 			Severity:    severity,
 			Category:    strings.ToLower(f.Category),
-			Confidence:  f.Confidence,
+			Confidence:  clamp01(f.Confidence),
 			FilePath:    f.FilePath,
 			Position:    pos,
 			Outcome:     outcome,
@@ -107,6 +107,12 @@ func (v *Validator) Validate(
 		out = out[:v.cfg.MaxComments]
 	}
 	return out
+}
+
+// clamp01 bounds a model-supplied confidence to [0,1] — Go owns validation of
+// model numbers; the JSON schema bounds are advisory, not trusted.
+func clamp01(v float64) float64 {
+	return min(max(v, 0), 1)
 }
 
 // rankFindings sorts by severity (desc), then verification state

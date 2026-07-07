@@ -41,7 +41,9 @@ func (s *ReviewService) buildRiskReport(ctx context.Context, proj *gitlab.Projec
 		}
 		if isTest {
 			in.TestsTouched = true
-		} else if hasCode {
+		} else if hasCode && toolchain.IsSourceFile(path) {
+			// Docs/config/data changes must not trip the "behaviour changed
+			// without tests" factor.
 			in.BehaviorFiles++
 		}
 		if toolchain.MatchGlob(path, s.cfg.Risk.SensitiveGlobs) {
