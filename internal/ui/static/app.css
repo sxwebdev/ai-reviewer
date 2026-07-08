@@ -237,6 +237,9 @@ label.skill-opt { white-space: normal; }
   .table--stack tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: var(--sp-4); padding: var(--sp-1) 0; border: 0; text-align: right; }
   .table--stack tbody td::before { content: attr(data-label); text-align: left; flex: 0 0 auto; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .04em; color: var(--fg-muted); font-weight: 600; }
   .table--stack tbody td[data-label=""] { display: none; }
+  /* Honor the `hidden` attribute (toggled column cells): the display:flex
+     rule above would otherwise re-show them. Desktop uses the UA [hidden] rule. */
+  .table--stack tbody td[hidden] { display: none; }
 }
 
 /* ---- badges ---- */
@@ -299,7 +302,16 @@ label.skill-opt { white-space: normal; }
 .chip { cursor: pointer; background: var(--surface); border: 1px solid var(--border-2); color: var(--fg-muted); border-radius: var(--r-pill); padding: 4px var(--sp-3); font: 500 var(--fs-sm)/1.2 var(--font-sans); }
 .chip:hover { color: var(--fg); border-color: var(--border-strong); }
 .chip[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
-.mr-search { margin-left: auto; width: min(260px, 100%); padding: 4px var(--sp-3); font-size: var(--fs-sm); }
+.mr-search { flex: 1 1 100%; padding: 4px var(--sp-3); font-size: var(--fs-sm); }
+.mr-sort { margin-left: auto; width: auto; padding: 4px var(--sp-3); font-size: var(--fs-sm); }
+
+/* ---- dropdown menu (column picker) ---- */
+.menu { position: relative; }
+/* Sits above table content but below the sticky header (--z-sticky) so it
+   slides under the header when the page scrolls instead of over it. */
+.menu__panel { position: absolute; right: 0; top: calc(100% + 6px); z-index: 10; min-width: 170px; background: var(--surface); border: 1px solid var(--border-2); border-radius: var(--r-md); padding: var(--sp-2); box-shadow: var(--shadow-pop); display: flex; flex-direction: column; gap: 2px; }
+.menu__item { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-sm); padding: 4px var(--sp-2); border-radius: var(--r-sm); cursor: pointer; }
+.menu__item:hover { background: var(--accent-soft); }
 
 /* ---- findings ---- */
 .sev-group-head { display: flex; align-items: baseline; gap: var(--sp-2); margin: var(--sp-5) 0 var(--sp-2); color: var(--fg-2); text-transform: capitalize; font-weight: 600; }
