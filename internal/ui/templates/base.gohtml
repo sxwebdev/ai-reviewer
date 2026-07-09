@@ -54,12 +54,22 @@
   </form>
   {{end}}
   <span class="host" title="GitLab host">{{.UI.Host}}</span>
+  {{if .Paused}}
+  <form method="post" action="/jobs/resume" title="Resume the review queue">
+    <button class="btn btn--sm" aria-label="Resume reviews">▶ Resume</button>
+  </form>
+  {{else}}
+  <form method="post" action="/jobs/pause" title="Pause all reviews: stop the queue and return running reviews to it">
+    <button class="btn btn--ghost btn--sm" aria-label="Pause reviews">⏸ Pause</button>
+  </form>
+  {{end}}
   <button class="btn btn--ghost btn--sm" type="button" onclick="toggleTheme()" aria-label="Toggle light and dark theme">Theme</button>
   <form method="post" action="/sync">
     <button class="btn" aria-label="Sync assigned merge requests from GitLab"><span class="sync-label">Sync</span> MRs</button>
   </form>
 </header>
 <main id="main" class="page {{.PageClass}}">
+{{if .Paused}}<div class="alert alert--warn" role="status"><div class="alert__body"><strong>Reviews paused.</strong> Queued jobs won't start and running reviews are returned to the queue until you resume.</div></div>{{end}}
 {{if .Flash}}<div class="alert alert--{{if eq .FlashKind "err"}}danger{{else if eq .FlashKind "ok"}}ok{{else if eq .FlashKind "warn"}}warn{{else}}info{{end}}" role="status"><div class="alert__body">{{.Flash}}</div></div>{{end}}
 {{template "content" .}}
 </main>

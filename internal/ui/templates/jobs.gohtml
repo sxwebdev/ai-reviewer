@@ -1,6 +1,13 @@
 {{define "title"}}Jobs · ai-reviewer{{end}}
 {{define "content"}}
-<div class="page-head"><h1 class="grow">Background jobs</h1><a class="btn btn--ghost" href="/jobs">Refresh</a></div>
+<div class="page-head"><h1 class="grow">Background jobs</h1>
+  {{if .Paused}}
+  <form method="post" action="/jobs/resume"><button class="btn btn--sm">Resume reviews</button></form>
+  {{else}}
+  <form method="post" action="/jobs/pause"><button class="btn btn--sm btn--danger">Pause reviews</button></form>
+  {{end}}
+  <a class="btn btn--ghost" href="/jobs">Refresh</a></div>
+{{if .Paused}}<div class="alert alert--warn" role="status"><div class="alert__body">Reviews are paused. Queued jobs won't start and running reviews are returned to the queue until you resume.</div></div>{{end}}
 {{if not .Jobs}}
 <div class="empty">
   <p class="empty__title">No background jobs yet</p>
@@ -19,7 +26,9 @@
     <td data-label="Progress" class="num muted">{{if gt .ProgressTotal 0}}{{.ProgressCurrent}}/{{.ProgressTotal}}{{else}}—{{end}}</td>
     <td data-label="Detail" class="mono small truncate" style="max-width:40ch" title="{{.Error}}">{{if .Error}}{{.Error}}{{else}}<span class="muted">—</span>{{end}}</td>
     <td data-label="">{{if or (eq .Status "failed") (eq .Status "cancelled")}}
-      <form method="post" action="/jobs/{{.ID}}/retry"><button class="btn btn--sm">Retry</button></form>{{end}}</td>
+      <form method="post" action="/jobs/{{.ID}}/retry"><button class="btn btn--sm">Retry</button></form>
+      {{else if or (eq .Status "queued") (eq .Status "running")}}
+      <form method="post" action="/jobs/{{.ID}}/cancel"><button class="btn btn--sm btn--danger">Stop</button></form>{{end}}</td>
   </tr>
   {{end}}
   </tbody>

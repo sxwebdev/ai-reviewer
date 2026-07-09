@@ -104,7 +104,8 @@
 
   {{if .Running}}
   <div class="card" role="status">
-    <div class="row"><span class="spinner" aria-hidden="true"></span> <strong>Reviewing…</strong>{{if .Progress}} <span class="muted">{{.Progress}}</span>{{end}}</div>
+    <div class="row"><span class="spinner" aria-hidden="true"></span> <strong>Reviewing…</strong>{{if .Progress}} <span class="muted">{{.Progress}}</span>{{end}}
+      {{if .JobID}}<form method="post" action="/jobs/{{.JobID}}/cancel" class="grow" style="text-align:right"><button class="btn btn--sm btn--danger">Stop review</button></form>{{end}}</div>
     <p class="muted small" style="margin:0">This panel updates on its own.</p>
   </div>
   {{else if and (eq .JobStatus "failed") (not .Review)}}

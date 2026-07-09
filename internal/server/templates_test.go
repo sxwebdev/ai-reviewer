@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/sxwebdev/ai-reviewer/internal/review"
@@ -100,7 +101,7 @@ func TestReviewSectionFragment(t *testing.T) {
 	rev := &state.Review{ID: "cur", HeadSHA: "oldhead0000", RiskLevel: "low"}
 	find := &state.Finding{ID: "f", Severity: "low", Title: "t", Body: "b", Status: "proposed"}
 	for _, vm := range []mrVM{
-		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Running: true, Progress: "2/5"},
+		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Running: true, Progress: "2/5", JobID: "job-1"},
 		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, JobStatus: "failed", JobError: "not logged in"},
 		{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MR: mr, Historical: true, Review: hist,
 			Groups: []findingGroup{{Severity: "low", Items: []*state.Finding{find}}}},
@@ -118,6 +119,12 @@ func TestReviewSectionFragment(t *testing.T) {
 		var buf bytes.Buffer
 		if err := tmpl["mr"].ExecuteTemplate(&buf, "review-section", vm); err != nil {
 			t.Fatalf("review-section: %v", err)
+		}
+		// A running review with a known job id must offer a Stop control.
+		if vm.Running && vm.JobID != "" {
+			if want := "/jobs/" + vm.JobID + "/cancel"; !strings.Contains(buf.String(), want) {
+				t.Errorf("running fragment missing Stop action %q", want)
+			}
 		}
 	}
 }
