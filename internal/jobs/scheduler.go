@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/service"
 	"github.com/sxwebdev/ai-reviewer/internal/state"
 )
@@ -56,6 +57,9 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 	for _, mr := range mrs {
+		if !gitlab.IsOpenState(mr.State) {
+			continue // never auto-review a merged/closed MR (reconcile refreshes its head sha)
+		}
 		if mr.HeadSHA == "" {
 			continue // can't review (or checkout) without a head sha — avoid an endless enqueue/fail loop
 		}

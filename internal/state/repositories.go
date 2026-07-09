@@ -187,6 +187,30 @@ func (db *DB) ListMergeRequests(ctx context.Context) ([]*MergeRequest, error) {
 	return out, rows.Err()
 }
 
+// ListOpenMergeRequests returns tracked MRs for a host that are still open
+// (state opened/locked/unknown), most-recently-updated first. Used by sync
+// reconciliation, which only cares about MRs that might have transitioned to
+// merged/closed — terminal rows are already settled and need no re-fetch.
+func (db *DB) ListOpenMergeRequests(ctx context.Context, host string) ([]*MergeRequest, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT `+mrColumns+` FROM merge_requests
+		 WHERE gitlab_host = ? AND (state IS NULL OR state IN ('', 'opened', 'locked'))
+		 ORDER BY updated_at DESC`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*MergeRequest
+	for rows.Next() {
+		mr, err := scanMR(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, mr)
+	}
+	return out, rows.Err()
+}
+
 // GetMergeRequest returns an MR by local id.
 func (db *DB) GetMergeRequest(ctx context.Context, id int64) (*MergeRequest, error) {
 	mr, err := scanMR(db.QueryRowContext(ctx, `SELECT `+mrColumns+` FROM merge_requests WHERE id = ?`, id))

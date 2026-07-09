@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sxwebdev/ai-reviewer/internal/coverage"
+	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/jobs"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/service"
@@ -29,7 +30,8 @@ type baseVM struct {
 
 type dashboardVM struct {
 	baseVM
-	MRs []dashItem
+	MRs        []dashItem
+	ShowClosed bool // true when the view includes merged/closed MRs (?show=all)
 }
 
 // dashItem is a dashboard row plus live job state, with helpers that derive a
@@ -42,6 +44,11 @@ type dashItem struct {
 
 func (d dashItem) Reviewed() bool { return d.ReviewHeadSHA != "" }
 func (d dashItem) Current() bool  { return d.ReviewHeadSHA != "" && d.ReviewHeadSHA == d.HeadSHA }
+
+// Open reports whether the MR is still open (vs merged/closed). Merged/closed
+// MRs are hidden from the dashboard by default; the "Show merged/closed" filter
+// reveals them.
+func (d dashItem) Open() bool { return gitlab.IsOpenState(d.State) }
 
 // Status is a short label for the review state, shown as a badge.
 func (d dashItem) Status() string {
@@ -281,7 +288,8 @@ func (s *Server) baseActive(w http.ResponseWriter, r *http.Request, active strin
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	rows, err := s.svc().DB.DashboardRows(ctx)
+	showClosed := r.URL.Query().Get("show") == "all"
+	rows, err := s.svc().DB.DashboardRows(ctx, showClosed)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -292,7 +300,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		k := mrKey{row.ProjectID, row.IID}
 		items = append(items, dashItem{DashboardRow: row, Running: running[k], Failed: failed[k]})
 	}
-	s.render(w, "dashboard", dashboardVM{baseVM: s.baseActive(w, r, "dashboard"), MRs: items})
+	s.render(w, "dashboard", dashboardVM{baseVM: s.baseActive(w, r, "dashboard"), MRs: items, ShowClosed: showClosed})
 }
 
 type mrKey struct{ projectID, iid int64 }
@@ -325,7 +333,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		setFlash(w, "err", "Sync failed: "+err.Error())
 	} else {
-		setFlash(w, "ok", "Synced "+strconv.Itoa(res.Tracked)+" merge request(s).")
+		msg := "Synced " + strconv.Itoa(res.Tracked) + " open merge request(s)."
+		if res.Closed > 0 {
+			msg += " " + strconv.Itoa(res.Closed) + " merged/closed and hidden."
+		}
+		setFlash(w, "ok", msg)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

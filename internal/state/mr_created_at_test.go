@@ -25,7 +25,7 @@ func TestMergeRequestCreatedAtRoundTrip(t *testing.T) {
 	if got.CreatedAt != created {
 		t.Errorf("GetMergeRequest CreatedAt = %d, want %d", got.CreatedAt, created)
 	}
-	rows, err := db.DashboardRows(ctx)
+	rows, err := db.DashboardRows(ctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}

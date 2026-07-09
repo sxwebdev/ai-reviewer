@@ -3,8 +3,12 @@
 <div class="page-head"><h1 class="grow">Assigned merge requests</h1></div>
 {{if not .MRs}}
 <div class="empty">
+  {{if .ShowClosed}}
   <p class="empty__title">No merge requests tracked yet</p>
-  <p class="empty__hint">Run <strong>Sync MRs</strong> to pull the open MRs where you're a reviewer. Nothing is fetched until you ask.</p>
+  {{else}}
+  <p class="empty__title">No open merge requests</p>
+  {{end}}
+  <p class="empty__hint">Run <strong>Sync MRs</strong> to pull the open MRs where you're a reviewer. Nothing is fetched until you ask.{{if not .ShowClosed}} Merged and closed MRs are hidden — <a href="/?show=all">show all</a>.{{end}}</p>
   <form method="post" action="/sync"><button class="btn btn--primary">Sync assigned MRs</button></form>
 </div>
 {{else}}
@@ -17,6 +21,11 @@
     <button type="button" class="chip" :aria-pressed="f==='active'" @click="f='active'">Running / failed</button>
     <button type="button" class="chip" :aria-pressed="f==='drafts'" @click="f='drafts'">Has drafts</button>
     <button type="button" class="chip" :aria-pressed="f==='pub'" @click="f='pub'">Published</button>
+    {{if .ShowClosed}}
+    <a class="chip" href="/" aria-pressed="true" title="Currently showing merged/closed MRs — click to show open only">Open only</a>
+    {{else}}
+    <a class="chip" href="/?show=all" aria-pressed="false" title="Merged and closed MRs are hidden by default">Show merged/closed</a>
+    {{end}}
     <select class="input mr-sort" x-model="sort" aria-label="Sort merge requests">
       <option value="updated">Recently updated</option>
       <option value="reviewed-desc">Recently reviewed</option>
@@ -49,6 +58,7 @@
       </td>
       <td data-label="Status" class="nowrap" :hidden="!cols.status">
         <span class="badge badge--{{$m.StatusClass}}"{{if eq $m.Status "new commits"}} title="new commits pushed since the last review — open to re-review"{{end}}>{{$m.Status}}</span>
+        {{if not $m.Open}} <span class="badge badge--none" title="this MR is {{$m.State}} on GitLab">{{$m.State}}</span>{{end}}
         {{if and $m.Reviewed $m.RiskLevel}} <span class="badge risk-{{$m.RiskLevel}}">risk {{$m.RiskLevel}}</span>{{end}}
         {{if gt $m.Drafted 0}} <span class="badge badge--info" title="draft notes awaiting publish">{{$m.Drafted}} draft</span>{{end}}
         {{if gt $m.Published 0}} <span class="badge badge--good" title="published to GitLab">{{$m.Published}} published</span>{{end}}

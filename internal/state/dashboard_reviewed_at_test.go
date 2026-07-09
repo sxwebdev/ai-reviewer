@@ -19,7 +19,7 @@ func TestDashboardRowsReviewedAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := db.DashboardRows(ctx)
+	rows, err := db.DashboardRows(ctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestDashboardRowsReviewedAt(t *testing.T) {
 		}
 	}
 
-	rows, err = db.DashboardRows(ctx)
+	rows, err = db.DashboardRows(ctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
