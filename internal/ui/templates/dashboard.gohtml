@@ -3,12 +3,16 @@
 <div class="page-head"><h1 class="grow">Assigned merge requests</h1></div>
 {{if not .MRs}}
 <div class="empty">
+  {{if .ShowClosed}}
   <p class="empty__title">No merge requests tracked yet</p>
-  <p class="empty__hint">Run <strong>Sync MRs</strong> to pull the open MRs where you're a reviewer. Nothing is fetched until you ask.</p>
+  {{else}}
+  <p class="empty__title">No open merge requests</p>
+  {{end}}
+  <p class="empty__hint">Run <strong>Sync MRs</strong> to pull the open MRs where you're a reviewer. Nothing is fetched until you ask.{{if not .ShowClosed}} Merged and closed MRs are hidden — <a href="/?show=all">show all</a>.{{end}}</p>
   <form method="post" action="/sync"><button class="btn btn--primary">Sync assigned MRs</button></form>
 </div>
 {{else}}
-<div x-data="{ f: 'all', q: '' }">
+<div x-data="mrTable()">
   <div class="chips" role="group" aria-label="Filter merge requests">
     <button type="button" class="chip" :aria-pressed="f==='all'" @click="f='all'">All</button>
     <button type="button" class="chip" :aria-pressed="f==='todo'" @click="f='todo'">Not reviewed</button>
@@ -17,35 +21,95 @@
     <button type="button" class="chip" :aria-pressed="f==='active'" @click="f='active'">Running / failed</button>
     <button type="button" class="chip" :aria-pressed="f==='drafts'" @click="f='drafts'">Has drafts</button>
     <button type="button" class="chip" :aria-pressed="f==='pub'" @click="f='pub'">Published</button>
+    {{if .ShowClosed}}
+    <a class="chip" href="/" aria-pressed="true" title="Currently showing merged/closed MRs — click to show open only">Open only</a>
+    {{else}}
+    <a class="chip" href="/?show=all" aria-pressed="false" title="Merged and closed MRs are hidden by default">Show merged/closed</a>
+    {{end}}
+    <select class="input mr-sort" x-model="sort" aria-label="Sort merge requests">
+      <option value="updated">Recently updated</option>
+      <option value="reviewed-desc">Recently reviewed</option>
+      <option value="reviewed-asc">Oldest reviewed</option>
+    </select>
+    <div class="menu" @click.outside="colsOpen=false" @keydown.escape.window="colsOpen=false">
+      <button type="button" class="chip" aria-haspopup="true" :aria-expanded="colsOpen" @click="colsOpen=!colsOpen">Columns</button>
+      <div class="menu__panel" x-show="colsOpen" x-cloak aria-label="Toggle table columns">
+        <label class="menu__item"><input type="checkbox" x-model="cols.project"> Project</label>
+        <label class="menu__item"><input type="checkbox" x-model="cols.status"> Status</label>
+        <label class="menu__item"><input type="checkbox" x-model="cols.open"> Open</label>
+        <label class="menu__item"><input type="checkbox" x-model="cols.findings"> Findings</label>
+      </div>
+    </div>
     <input class="input mr-search" type="search" x-model="q" placeholder="Search title or !number…" aria-label="Search merge requests by title or number">
   </div>
   <table class="table table--rows table--stack">
     <thead>
-      <tr><th>Project</th><th>Merge request</th><th>Status</th><th class="num">Open</th><th class="num">Findings</th><th></th></tr>
+      <tr><th :hidden="!cols.project" hidden>Project</th><th>Merge request</th><th :hidden="!cols.status">Status</th><th class="num" :hidden="!cols.open">Open</th><th class="num" :hidden="!cols.findings">Findings</th><th></th></tr>
     </thead>
-    <tbody>
-    {{range .MRs}}
-    <tr data-f="{{.StatusClass}}" data-drafts="{{if gt .Drafted 0}}1{{else}}0{{end}}" data-pub="{{if gt .Published 0}}1{{else}}0{{end}}"
-        data-search="{{.IID}} {{.Title}}"
+    <tbody x-ref="rows">
+    {{range $i, $m := .MRs}}
+    <tr data-f="{{$m.StatusClass}}" data-drafts="{{if gt $m.Drafted 0}}1{{else}}0{{end}}" data-pub="{{if gt $m.Published 0}}1{{else}}0{{end}}"
+        data-search="{{$m.IID}} {{$m.Title}}" data-idx="{{$i}}" data-reviewed="{{$m.ReviewedAt}}"
         x-show="(f==='all' || (f==='todo' && $el.dataset.f==='none') || (f==='done' && $el.dataset.f==='ok') || (f==='stale' && $el.dataset.f==='warn') || (f==='active' && ($el.dataset.f==='running' || $el.dataset.f==='failed')) || (f==='drafts' && $el.dataset.drafts==='1') || (f==='pub' && $el.dataset.pub==='1')) && (q==='' || $el.dataset.search.toLowerCase().includes(q.toLowerCase().replace(/^!/, '')))">
-      <td data-label="Project" class="cell-sub mono">{{.ProjectPath}}</td>
+      <td data-label="Project" class="cell-sub mono" :hidden="!cols.project" hidden>{{$m.ProjectPath}}</td>
       <td data-label="Merge request">
-        <a class="cell-title" href="/mr/{{.ID}}">{{.Title}}</a>
-        <div class="cell-sub">!{{.IID}}{{if .Author}} · {{.Author}}{{end}} · {{.Source}} → {{.Target}}</div>
+        <a class="cell-title" href="/mr/{{$m.ID}}">{{$m.Title}}</a>
+        <div class="cell-sub">!{{$m.IID}}{{if $m.Author}} · {{$m.Author}}{{end}} · {{$m.Source}} → {{$m.Target}}</div>
       </td>
-      <td data-label="Status" class="nowrap">
-        <span class="badge badge--{{.StatusClass}}"{{if eq .Status "new commits"}} title="new commits pushed since the last review — open to re-review"{{end}}>{{.Status}}</span>
-        {{if and .Reviewed .RiskLevel}} <span class="badge risk-{{.RiskLevel}}">risk {{.RiskLevel}}</span>{{end}}
-        {{if gt .Drafted 0}} <span class="badge badge--info" title="draft notes awaiting publish">{{.Drafted}} draft</span>{{end}}
-        {{if gt .Published 0}} <span class="badge badge--good" title="published to GitLab">{{.Published}} published</span>{{end}}
+      <td data-label="Status" class="nowrap" :hidden="!cols.status">
+        <span class="badge badge--{{$m.StatusClass}}"{{if eq $m.Status "new commits"}} title="new commits pushed since the last review — open to re-review"{{end}}>{{$m.Status}}</span>
+        {{if not $m.Open}} <span class="badge badge--none" title="this MR is {{$m.State}} on GitLab">{{$m.State}}</span>{{end}}
+        {{if and $m.Reviewed $m.RiskLevel}} <span class="badge risk-{{$m.RiskLevel}}">risk {{$m.RiskLevel}}</span>{{end}}
+        {{if gt $m.Drafted 0}} <span class="badge badge--info" title="draft notes awaiting publish">{{$m.Drafted}} draft</span>{{end}}
+        {{if gt $m.Published 0}} <span class="badge badge--good" title="published to GitLab">{{$m.Published}} published</span>{{end}}
       </td>
-      <td data-label="Open" class="num nowrap" title="opened {{fmtTime .CreatedAt}}">{{if gt .CreatedAt 0}}{{ago .CreatedAt}}{{else}}—{{end}}</td>
-      <td data-label="Findings" class="num">{{if .Reviewed}}{{.Findings}}{{else}}<span class="muted">—</span>{{end}}</td>
-      <td data-label=""><a class="btn btn--sm" href="/mr/{{.ID}}">Open</a></td>
+      <td data-label="Open" class="num nowrap" title="opened {{fmtTime $m.CreatedAt}}" :hidden="!cols.open">{{if gt $m.CreatedAt 0}}{{ago $m.CreatedAt}}{{else}}—{{end}}</td>
+      <td data-label="Findings" class="num" :hidden="!cols.findings">{{if $m.Reviewed}}{{$m.Findings}}{{else}}<span class="muted">—</span>{{end}}</td>
+      <td data-label=""><a class="btn btn--sm" href="/mr/{{$m.ID}}">Open</a></td>
     </tr>
     {{end}}
     </tbody>
   </table>
 </div>
+<script>
+  // Dashboard table state. Sort and column choices persist in localStorage;
+  // the Project column ships hidden by default (the server renders `hidden`
+  // on its cells so the pre-Alpine paint matches).
+  function mrTable() {
+    return {
+      f: 'all', q: '', sort: 'updated', colsOpen: false,
+      sorts: ['updated', 'reviewed-desc', 'reviewed-asc'],
+      cols: { project: false, status: true, open: true, findings: true },
+      init() {
+        try {
+          var s = localStorage.getItem('dash-sort');
+          if (this.sorts.includes(s)) this.sort = s;
+          var saved = JSON.parse(localStorage.getItem('dash-cols') || 'null');
+          if (saved) for (var k in this.cols) if (typeof saved[k] === 'boolean') this.cols[k] = saved[k];
+        } catch (e) {}
+        // Server renders rows in 'updated' order already, so only re-sort when
+        // a different order is in effect.
+        if (this.sort !== 'updated') this.applySort();
+        this.$watch('sort', () => { this.persist('dash-sort', this.sort); this.applySort(); });
+        this.$watch('cols', () => { this.persist('dash-cols', JSON.stringify(this.cols)); });
+      },
+      persist(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+      applySort() {
+        var tbody = this.$refs.rows;
+        var sort = this.sort;
+        var byIdx = function (a, b) { return (+a.dataset.idx) - (+b.dataset.idx); };
+        var rows = Array.prototype.slice.call(tbody.children).sort(function (a, b) {
+          if (sort === 'updated') return byIdx(a, b);
+          var ra = +a.dataset.reviewed, rb = +b.dataset.reviewed;
+          // Never-reviewed MRs have no review time: sink them below the
+          // reviewed ones in both directions, keeping their server order.
+          if (!ra || !rb) return (rb ? 1 : 0) - (ra ? 1 : 0) || byIdx(a, b);
+          return sort === 'reviewed-asc' ? ra - rb : rb - ra;
+        });
+        rows.forEach(function (r) { tbody.appendChild(r); });
+      },
+    };
+  }
+</script>
 {{end}}
 {{end}}

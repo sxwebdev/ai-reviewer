@@ -49,9 +49,9 @@ func TestTemplatesRender(t *testing.T) {
 
 	cases := map[string]any{
 		"dashboard": dashboardVM{baseVM: baseVM{UI: UIConfig{Host: "h"}}, MRs: []dashItem{
-			{DashboardRow: state.DashboardRow{ID: 1, IID: 5, Title: "reviewed", Author: "alice", CreatedAt: 1700000000000, HeadSHA: "abc", ReviewHeadSHA: "abc", RiskLevel: "high", Findings: 2, Drafted: 1, Published: 2}},
+			{DashboardRow: state.DashboardRow{ID: 1, IID: 5, Title: "reviewed", Author: "alice", CreatedAt: 1700000000000, HeadSHA: "abc", ReviewHeadSHA: "abc", ReviewedAt: 1700000002000, RiskLevel: "high", Findings: 2, Drafted: 1, Published: 2}},
 			{DashboardRow: state.DashboardRow{ID: 2, IID: 6, Title: "fresh", HeadSHA: "def"}},
-			{DashboardRow: state.DashboardRow{ID: 3, IID: 7, Title: "moved", HeadSHA: "new", ReviewHeadSHA: "old", RiskLevel: "low", Findings: 1}},
+			{DashboardRow: state.DashboardRow{ID: 3, IID: 7, Title: "moved", HeadSHA: "new", ReviewHeadSHA: "old", ReviewedAt: 1700000001000, RiskLevel: "low", Findings: 1}},
 		}},
 		"mr": mrVM{baseVM: baseVM{UI: hdrUI}, MR: mr, Review: rev, ProposedCount: 1, ApprovedCount: 1, DraftedCount: 1,
 			Groups:        []findingGroup{{Severity: "blocking", Items: []*state.Finding{find}}},

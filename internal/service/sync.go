@@ -18,7 +18,11 @@ import (
 type SyncResult struct {
 	Total   int
 	Tracked int
+	Closed  int // tracked MRs found merged/closed during reconciliation
 }
+
+// mrIdent identifies an MR within a host by its project and iid.
+type mrIdent struct{ projectID, iid int64 }
 
 // SyncService pulls MRs assigned to the current user into local state.
 type SyncService struct {
@@ -43,9 +47,11 @@ func (s *SyncService) SyncAssignedMRs(ctx context.Context) (SyncResult, error) {
 	}
 
 	projectPaths := map[int64]string{}
+	seen := make(map[mrIdent]bool, len(mrs))
 	res := SyncResult{Total: len(mrs)}
 	for i := range mrs {
 		mr := &mrs[i]
+		seen[mrIdent{mr.ProjectID, mr.IID}] = true
 		if err := s.trackProject(ctx, mr.ProjectID, projectPaths); err != nil {
 			s.log.Warn("track project failed", "project_id", mr.ProjectID, "err", err)
 		}
@@ -55,7 +61,46 @@ func (s *SyncService) SyncAssignedMRs(ctx context.Context) (SyncResult, error) {
 		}
 		res.Tracked++
 	}
+
+	res.Closed = s.reconcileClosed(ctx, seen)
 	return res, nil
+}
+
+// reconcileClosed refreshes the state of locally-tracked MRs that GitLab no
+// longer returns among the open reviewer MRs. ListReviewerMRs asks only for
+// open MRs, so an MR that was merged or closed since the last sync silently
+// drops out of the response and would otherwise keep its stale "opened" state
+// forever. For each such row still marked open locally, we fetch its current
+// state and upsert it, so the dashboard can drop it from the default (open-only)
+// view. Returns the count that turned out to be merged/closed.
+func (s *SyncService) reconcileClosed(ctx context.Context, seen map[mrIdent]bool) int {
+	// Only open MRs for this host can have transitioned; the query filters out
+	// already-terminal rows so the scan stays proportional to open MRs, not the
+	// full (ever-growing) history of merged/closed ones.
+	tracked, err := s.db.ListOpenMergeRequests(ctx, s.host)
+	if err != nil {
+		s.log.Warn("reconcile: list open MRs failed", "err", err)
+		return 0
+	}
+	closed := 0
+	for _, row := range tracked {
+		if seen[mrIdent{row.ProjectID, row.IID}] {
+			continue // still an open reviewer MR — already refreshed by trackMR
+		}
+		mr, err := s.gl.GetMR(ctx, strconv.FormatInt(row.ProjectID, 10), row.IID)
+		if err != nil {
+			s.log.Warn("reconcile: get MR failed", "iid", row.IID, "err", err)
+			continue
+		}
+		if err := s.trackMR(ctx, mr); err != nil {
+			s.log.Warn("reconcile: track MR failed", "iid", row.IID, "err", err)
+			continue
+		}
+		if !mr.IsOpen() {
+			closed++
+		}
+	}
+	return closed
 }
 
 func (s *SyncService) trackProject(ctx context.Context, projectID int64, cache map[int64]string) error {

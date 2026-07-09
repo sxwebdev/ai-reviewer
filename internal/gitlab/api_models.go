@@ -44,6 +44,24 @@ type MergeRequest struct {
 // IsDraft reports whether the MR is a draft/WIP (field name varies by version).
 func (m MergeRequest) IsDraft() bool { return m.Draft || m.WorkInProg }
 
+// IsOpen reports whether the MR is still open (vs merged/closed).
+func (m MergeRequest) IsOpen() bool { return IsOpenState(m.State) }
+
+// IsOpenState reports whether a GitLab MR state counts as open — i.e. the MR
+// still belongs on the default dashboard view and is a candidate for review.
+// "opened" and "locked" (locked discussion, still open) are open; "merged" and
+// "closed" are terminal. An empty string is treated as open: it means the state
+// is unknown (e.g. a partial upsert that never carried one), and we prefer to
+// keep such a row visible rather than silently hide it.
+func IsOpenState(state string) bool {
+	switch state {
+	case "", "opened", "locked":
+		return true
+	default:
+		return false
+	}
+}
+
 // MergeRequestDiff is one changed file from the /diffs endpoint.
 type MergeRequestDiff struct {
 	OldPath       string `json:"old_path"`
