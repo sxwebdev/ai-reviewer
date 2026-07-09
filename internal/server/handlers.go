@@ -26,6 +26,7 @@ type baseVM struct {
 	FlashKind string
 	Active    string // nav highlight: dashboard|jobs|memory|settings
 	PageClass string // extra class on <main> (e.g. "page--wide" for the MR workspace)
+	Paused    bool   // global queue pause is active
 }
 
 type dashboardVM struct {
@@ -126,6 +127,7 @@ type mrVM struct {
 	MR              *state.MergeRequest
 	ProjectPath     string
 	Running         bool
+	JobID           string // latest review job id (for the Stop action while active)
 	Progress        string // "3/7" when a running review job reports progress
 	JobStatus       string // latest review job status
 	JobError        string // latest review job's error, if it failed
@@ -277,7 +279,15 @@ type applyResultVM struct {
 
 func (s *Server) base(w http.ResponseWriter, r *http.Request) baseVM {
 	kind, msg := takeFlash(w, r)
-	return baseVM{UI: s.ui(), Flash: msg, FlashKind: kind}
+	var paused bool
+	// The settings/setup pages render before a service bundle exists (setup gate),
+	// so query the pause flag only when the DB is wired.
+	if s.deps.Bundle != nil {
+		if b := s.deps.Bundle(); b != nil && b.DB != nil {
+			paused, _ = b.DB.JobsPaused(r.Context())
+		}
+	}
+	return baseVM{UI: s.ui(), Flash: msg, FlashKind: kind, Paused: paused}
 }
 
 func (s *Server) baseActive(w http.ResponseWriter, r *http.Request, active string) baseVM {
@@ -361,6 +371,9 @@ func (s *Server) buildMRVM(ctx context.Context, id int64, selectedReviewID strin
 	// correct regardless of overall job volume.
 	if j, err := s.svc().DB.GetLatestReviewJob(ctx, mr.ProjectID, mr.IID); err == nil {
 		vm.JobStatus = j.Status
+		if j.Status == state.JobQueued || j.Status == state.JobRunning {
+			vm.JobID = j.ID
+		}
 		if j.Status == state.JobFailed {
 			vm.JobError = j.Error
 		}
@@ -815,6 +828,39 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 		setFlash(w, "ok", "Job requeued.")
 	}
 	http.Redirect(w, r, "/jobs", http.StatusSeeOther)
+}
+
+func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	outcome, err := s.svc().DB.RequestCancelJob(r.Context(), r.PathValue("id"))
+	switch {
+	case err != nil:
+		setFlash(w, "err", err.Error())
+	case outcome == state.CancelDone:
+		setFlash(w, "ok", "Job cancelled.")
+	case outcome == state.CancelPending:
+		setFlash(w, "ok", "Stopping review…")
+	default:
+		setFlash(w, "err", "Job is not queued or running.")
+	}
+	redirectBack(w, r)
+}
+
+func (s *Server) handlePauseJobs(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc().DB.SetJobsPaused(r.Context(), true); err != nil {
+		setFlash(w, "err", err.Error())
+	} else {
+		setFlash(w, "ok", "Reviews paused. Running reviews are being returned to the queue.")
+	}
+	redirectBack(w, r)
+}
+
+func (s *Server) handleResumeJobs(w http.ResponseWriter, r *http.Request) {
+	if err := s.svc().DB.SetJobsPaused(r.Context(), false); err != nil {
+		setFlash(w, "err", err.Error())
+	} else {
+		setFlash(w, "ok", "Reviews resumed.")
+	}
+	redirectBack(w, r)
 }
 
 // ---- memory + settings ----

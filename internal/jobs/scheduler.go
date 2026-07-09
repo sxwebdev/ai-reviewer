@@ -51,6 +51,12 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if !s.autoReview {
 		return
 	}
+	if paused, err := s.db.JobsPaused(ctx); err != nil {
+		s.log.Warn("check pause state failed", "err", err)
+		return
+	} else if paused {
+		return // queue paused; don't enqueue new reviews
+	}
 	mrs, err := s.db.ListMergeRequests(ctx)
 	if err != nil {
 		s.log.Warn("list MRs failed", "err", err)

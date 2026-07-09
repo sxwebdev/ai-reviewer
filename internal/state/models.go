@@ -185,6 +185,7 @@ type Job struct {
 	LockedAt        *int64
 	LockedBy        string
 	Error           string
+	CancelRequested bool
 	ProgressCurrent int
 	ProgressTotal   int
 	CreatedAt       int64
