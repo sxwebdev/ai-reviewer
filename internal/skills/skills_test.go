@@ -68,6 +68,34 @@ func TestDiscoverFirstSourceWinsOnDuplicate(t *testing.T) {
 	}
 }
 
+// Repos commonly expose .claude/skills/<name> as a symlink to a shared skills
+// directory; ReadDir reports those entries as non-dirs, so discovery must not
+// gate on DirEntry.IsDir().
+func TestDiscoverFollowsSymlinkedSkillDirs(t *testing.T) {
+	root := t.TempDir()
+	shared, claude := filepath.Join(root, "skills"), filepath.Join(root, ".claude", "skills")
+	writeSkill(t, shared, "integration-tests", "---\nname: integration-tests\ndescription: linked\n---\n")
+	if err := os.MkdirAll(claude, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "skills", "integration-tests"),
+		filepath.Join(claude, "integration-tests")); err != nil {
+		t.Fatal(err)
+	}
+	// A plain file next to the symlink must still be ignored.
+	if err := os.WriteFile(filepath.Join(claude, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Discover([]Source{{Label: "project", Dir: claude}})
+	if len(got) != 1 {
+		t.Fatalf("want 1 skill via symlink, got %d: %+v", len(got), got)
+	}
+	if got[0].Name != "integration-tests" || got[0].Description != "linked" {
+		t.Errorf("symlinked skill parsed wrong: %+v", got[0])
+	}
+}
+
 func TestDiscoverSkipsMissingDirs(t *testing.T) {
 	got := Discover([]Source{{Label: "x", Dir: ""}, {Label: "y", Dir: "/nonexistent/path/xyz"}})
 	if len(got) != 0 {

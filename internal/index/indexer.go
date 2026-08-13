@@ -59,6 +59,12 @@ func (ix *Indexer) IndexWorktree(ctx context.Context, projectID int64, headSHA, 
 		if err != nil {
 			return nil
 		}
+		// WalkDir does not follow symlinks, so d.IsDir() is false for a symlink to a
+		// directory while os.ReadFile would follow it and fail. Skip anything that is
+		// not a regular file (symlinks, sockets, devices, fifos).
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 		if info.Size() > maxFileBytes {
 			return nil // skip large files entirely (would otherwise share an empty-content hash)
 		}

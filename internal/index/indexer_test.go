@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/sxwebdev/ai-reviewer/internal/state"
@@ -31,6 +32,17 @@ func writeFile(t *testing.T, root, rel, content string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeSymlink(t *testing.T, root, rel, target string) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.FromSlash(target), p); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -98,6 +110,37 @@ func TestIndexWorktree(t *testing.T) {
 	}
 	if all := mustSearchAll(t, db); len(all) != 5 {
 		t.Errorf("re-index left %d rows, want 5", len(all))
+	}
+}
+
+// Symlinks are not regular files: WalkDir reports them with IsDir()==false, so
+// reading one that points at a directory used to fail with "is a directory".
+func TestIndexWorktreeSkipsSymlinks(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "skills/integration-tests/SKILL.md", "# integration tests\n")
+	writeFile(t, root, "main.go", "package main\n")
+	writeSymlink(t, root, ".claude/skills/integration-tests", "../../skills/integration-tests")
+	writeSymlink(t, root, ".claude/main.go", "../main.go")
+
+	db := testDB(t)
+	var logs strings.Builder
+	ix := NewIndexer(db, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	// main.go + skills/integration-tests/SKILL.md = 2; both symlinks skipped.
+	n, err := ix.IndexWorktree(t.Context(), 1, "sha1", root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("indexed %d files, want 2", n)
+	}
+	for _, f := range mustSearchAll(t, db) {
+		if strings.HasPrefix(f.Path, ".claude/") {
+			t.Errorf("symlink indexed: %s", f.Path)
+		}
+	}
+	if logs.Len() != 0 {
+		t.Errorf("symlinks should be skipped silently, logged: %s", logs.String())
 	}
 }
 

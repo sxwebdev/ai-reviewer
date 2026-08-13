@@ -64,12 +64,12 @@ func Discover(sources []Source) []Skill {
 			continue
 		}
 		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
+			// No e.IsDir() gate: entries may be symlinks to skill directories, which
+			// ReadDir reports as non-dirs. os.Stat below follows the link and rejects
+			// anything that does not hold a readable SKILL.md.
 			mdPath := filepath.Join(src.Dir, e.Name(), "SKILL.md")
 			info, err := os.Stat(mdPath)
-			if err != nil || info.IsDir() {
+			if err != nil || !info.Mode().IsRegular() {
 				continue
 			}
 			name, desc := parseFrontmatter(mdPath)
