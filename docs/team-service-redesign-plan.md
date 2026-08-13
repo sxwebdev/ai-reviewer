@@ -38,6 +38,7 @@
 | «MR, где ревьюер — я»                   | Список repositories, сгруппированных по teams                                |
 | SQLite `state.db` в `~/.ai-reviewer`    | **PostgreSQL** (pgx + pgxgen), схема в `sql/migrations`                      |
 | Собственная job-очередь в SQLite        | **River** (`riverqueue/river`) поверх Postgres: unique jobs, retries, leader |
+| Публикация и Slack — inline в потоке    | **Вся отложенная работа — джобы River** (`publish_review`, `slack_send`, …)  |
 | Web UI + ручное approve/reject/publish  | Automation-first: валидные findings публикуются автоматически                |
 | `serve` = локальный UI + воркер         | `serve` = production-сервис на `/mx` (health/metrics/graceful/ops)           |
 | watch-daemon по назначенным MR          | River periodic job `scan` + periodic job `digest` (09:00 / 16:30 MSK)        |
@@ -99,7 +100,7 @@ binary/vendor/generated, scrubbing секретов; провайдер Claude C
 | `internal/jobs`     | Своя durable-очередь в SQLite + scheduler + worker        | **Переписать**           | Заменяется River-воркерами (тот же путь пакета, новое содержимое) |
 | `internal/skills`   | Discovery Claude-скиллов для выбора в UI                  | **Удалить**              | Фича существует только ради per-review выбора в UI                |
 | `screenshots/`      | Промо-скриншоты web UI                                    | **Удалить**              | Продукта с UI больше нет                                          |
-| `internal/coverage` | Запуск тестов репозитория, LCOV/coverprofile              | **Сохранить, выключено** | Исполняет чужой код на общем хосте — см. §20.3                    |
+| `internal/coverage` | Запуск тестов репозитория, LCOV/coverprofile              | **Сохранить, выключено** | Исполняет чужой код на общем хосте — см. §20.4                    |
 
 ### 2.2 Файлы/функции внутри сохраняемых пакетов
 
@@ -142,13 +143,13 @@ binary/vendor/generated, scrubbing секретов; провайдер Claude C
 | Компонент                                                                                                                                                         | Статус                                                    |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `internal/review`: passes, skeptic, validator, line_mapper, diff_parser/render, prompts, risk, completeness, verifiers, finding/fingerprint                       | **Сохранить.** Меняются только источники данных (см. §10) |
-| `internal/llm` (Claude CLI wrapper, schema, json*extract, proc*\*)                                                                                                | **Сохранить**, добавить детерминированную сборку auth-env |
+| `internal/llm` (Claude CLI wrapper, `schema.go`, `json_extract.go`, `proc_*.go`)                                                                                   | **Сохранить**, добавить детерминированную сборку auth-env |
 | `internal/gitlab` (клиент, retry, пагинация, ref-парсер, position)                                                                                                | **Сохранить**, расширить REST + добавить GraphQL (см. §9) |
 | `internal/git` (mirror + worktree, http.extraHeader-аутентификация)                                                                                               | **Сохранить**, переориентировать на ephemeral-каталог     |
 | `internal/security` (Redactor, Mask, Truncate)                                                                                                                    | **Сохранить**, сменить точку интеграции slog → zap        |
 | `internal/toolchain`                                                                                                                                              | **Сохранить**                                             |
 | `internal/version`, `cmd/ai-reviewer`                                                                                                                             | **Сохранить**                                             |
-| Тесты движка (validator, line*mapper, pipeline, skeptic, prompts, diff*_, risk, verifier_, completeness, identifiers, suppressed, reflect, orchestrator, context) | **Сохранить** (адаптировать сигнатуры)                    |
+| Тесты движка (`validator`, `line_mapper`, `pipeline`, `skeptic`, `prompts`, `diff_*`, `risk`, `verifier_*`, `completeness`, `identifiers`, `suppressed`, `reflect`, `orchestrator`, `context`) | **Сохранить** (адаптировать сигнатуры)                    |
 
 ---
 
@@ -171,11 +172,12 @@ internal/
   domain/       Snapshot, Team, классификаторы (чистый пакет, без I/O)
   store/        pgxpool + сгенерированные pgxgen-репозитории + обёртки транзакций
   models/       сгенерированные pgxgen-модели
-  jobs/         River: client-сервис, воркеры (scan / review / digest / cleanup), periodic
+  jobs/         River: client-сервис, воркеры (scan / review / publish_review / digest /
+                slack_send / cleanup), periodic-джобы, enqueue-API
   scheduler/    Daily-расписание 09:00 / 16:30 Europe/Moscow (river.PeriodicSchedule)
   gitlab/       REST v4 + GraphQL + маркеры + публикация findings
   slack/        API-клиент (users.list, chat.postMessage, auth.test) + Block Kit builder
-  match/        GitLab user → Slack user (matcher + кэш в Postgres + ephemeral индексы)
+  match/        GitLab user → Slack user (matcher + in-memory справочник с TTL и индексами)
   git/          ephemeral mirror + worktree
   llm/          Client interface + Claude CLI + ClaudeAuth (детерминированный env)
   review/       движок (без изменений по сути)
@@ -199,15 +201,32 @@ Postgres хранит **операционное состояние сервис
 
 - какой head SHA каждого MR уже отревьюен и с каким результатом;
 - какие findings опубликованы (для дедупликации и аудита);
-- журнал прогонов дайджеста;
-- кэш соответствий GitLab-пользователь → Slack-пользователь;
+- журнал прогонов дайджеста и подготовленные к отправке сообщения;
 - очередь и состояние джобов (таблицы River).
+
+Производных данных, которые дёшево пересчитываются из внешних систем, в базе нет —
+см. «Чего в базе намеренно нет» в §5.2.
 
 GitLab остаётся источником правды о самих MR (состояние, дифф, треды, конфликты) — база их не дублирует.
 
 ### 5.2 Схема (`sql/migrations`)
 
+Минимальная версия — **PostgreSQL 16**. Нативная `uuidv7()` появилась только в PG 18, поэтому
+функция создаётся отдельной миграцией (тот же приём, что `0000_uuidv7.up.sql` в `observe-ai`);
+на PG 18+ миграция становится no-op.
+
 ```sql
+-- 0000_uuidv7.up.sql  — без неё DEFAULT uuidv7() падает на PG < 18
+CREATE OR REPLACE FUNCTION uuidv7() RETURNS uuid AS $$
+    -- UUID v7: 48 бит времени в мс + версия/вариант + случайный хвост
+    SELECT encode(
+        set_bit(set_bit(overlay(
+            uuid_send(gen_random_uuid())
+            PLACING substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+            FROM 1 FOR 6
+        ), 52, 1), 53, 1), 'hex')::uuid;
+$$ LANGUAGE sql VOLATILE;
+
 -- 0001_reviews.up.sql
 CREATE TABLE mr_reviews (
     id             uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -218,8 +237,10 @@ CREATE TABLE mr_reviews (
     head_sha       text        NOT NULL,
     base_sha       text        NOT NULL DEFAULT '',
     start_sha      text        NOT NULL DEFAULT '',
-    status         text        NOT NULL,          -- succeeded | failed | dry_run
-    published      boolean     NOT NULL DEFAULT false,
+    -- Единственный источник правды о стадии. `published` отдельной колонкой нет:
+    -- она выводится из status='succeeded' и разъезжалась бы с ним.
+    status         text        NOT NULL
+                   CHECK (status IN ('reviewed','succeeded','dry_run','failed')),
     findings_count int         NOT NULL DEFAULT 0,
     risk_level     text        NOT NULL DEFAULT '',
     summary        text        NOT NULL DEFAULT '',
@@ -228,12 +249,19 @@ CREATE TABLE mr_reviews (
     cost_usd       numeric(12,6) NOT NULL DEFAULT 0,
     duration_ms    bigint      NOT NULL DEFAULT 0,
     error          text        NOT NULL DEFAULT '',
+    attempt        int         NOT NULL DEFAULT 1,  -- номер попытки для этого SHA
     created_at     timestamptz NOT NULL DEFAULT now()
 );
--- «этот SHA уже успешно отревьюен» — единственный запрос горячего пути
+-- «этот SHA уже отревьюен» — единственный запрос горячего пути.
+-- Строки со status='failed' в индекс не входят: их может быть несколько (по одной
+-- на попытку), и именно они питают счётчик неудач в §6.5.
 CREATE UNIQUE INDEX mr_reviews_success_uniq
     ON mr_reviews (project_id, mr_iid, head_sha)
     WHERE status <> 'failed';
+-- Счётчик неудачных попыток по SHA: дешёвый COUNT для backoff (§6.5).
+CREATE INDEX mr_reviews_failed_idx
+    ON mr_reviews (project_id, mr_iid, head_sha, created_at)
+    WHERE status = 'failed';
 
 CREATE TABLE mr_findings (
     id           uuid PRIMARY KEY DEFAULT uuidv7(),
@@ -253,35 +281,60 @@ CREATE TABLE mr_findings (
     published_at timestamptz,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
--- дедуп по MR: один и тот же finding не публикуется повторно на новых SHA
+-- Дедуп по MR: один и тот же finding не публикуется повторно на новых SHA.
+-- Вставка ВСЕГДА идёт с `ON CONFLICT (project_id, mr_iid, fingerprint) DO NOTHING`:
+-- дубликат — это ожидаемый исход (движок мог не отфильтровать его, если чтение
+-- дискуссий деградировало), а не повод уронить персистенцию всего ревью.
 CREATE UNIQUE INDEX mr_findings_fp_uniq ON mr_findings (project_id, mr_iid, fingerprint);
 
 -- 0002_digest.up.sql
 CREATE TABLE digest_runs (
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
     team        text        NOT NULL,
-    slot        text        NOT NULL,       -- '09:00' | '16:30'
+    slot        text        NOT NULL,       -- '09:00' | '16:30' | 'manual'
     run_date    date        NOT NULL,       -- дата в Europe/Moscow
-    status      text        NOT NULL,       -- sent | dry_run | failed | partial
-    messages    int         NOT NULL DEFAULT 0,
+    -- attempt: 0 — плановый прогон слота; 1,2,… — явные ручные повторы.
+    -- Именно он делает `ai-reviewer digest --force` возможным без снятия
+    -- уникальности, которая защищает от дублей при N репликах.
+    attempt     int         NOT NULL DEFAULT 0,
+    status      text        NOT NULL
+                CHECK (status IN ('built','sent','partial','dry_run','failed')),
+    parts       int         NOT NULL DEFAULT 0,
     mr_count    int         NOT NULL DEFAULT 0,
     error       text        NOT NULL DEFAULT '',
     created_at  timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX digest_runs_slot_uniq ON digest_runs (team, run_date, slot);
+CREATE UNIQUE INDEX digest_runs_slot_uniq ON digest_runs (team, run_date, slot, attempt);
 
--- 0003_slack_users.up.sql  (кэш матчинга; переживает рестарт, обновляется по TTL)
-CREATE TABLE slack_user_links (
-    gitlab_user_id  bigint PRIMARY KEY,
-    gitlab_username text NOT NULL,
-    slack_user_id   text NOT NULL DEFAULT '',
-    match_kind      text NOT NULL,       -- email | username | name | manual | ambiguous | not_found
-    updated_at      timestamptz NOT NULL DEFAULT now()
+-- Одна строка = одно сообщение Slack (дайджест может дробиться на части).
+-- Payload хранится здесь, а не в аргументах джобы: Block Kit крупный, а
+-- river_job.args не место для килобайт JSON.
+CREATE TABLE digest_messages (
+    id            uuid PRIMARY KEY DEFAULT uuidv7(),
+    digest_run_id uuid NOT NULL REFERENCES digest_runs(id) ON DELETE CASCADE,
+    part_no       int  NOT NULL,
+    parts_total   int  NOT NULL,
+    channel       text NOT NULL,
+    payload       jsonb NOT NULL,           -- готовые Block Kit блоки
+    status        text NOT NULL,            -- pending | sending | sent | failed | dry_run
+    slack_ts      text NOT NULL DEFAULT '', -- ts отправленного сообщения
+    error         text NOT NULL DEFAULT '',
+    sent_at       timestamptz,
+    created_at    timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX digest_messages_part_uniq ON digest_messages (digest_run_id, part_no);
+
 ```
 
 Плюс собственные таблицы River (`river_job`, `river_leader`, `river_queue`, `river_client*`),
 применяемые через `rivermigrate` — своих миграций для них не пишем.
+
+**Чего в базе намеренно нет:** соответствий GitLab-пользователь → Slack-пользователь.
+Это производные данные, полностью восстановимые из `users.list` за секунды, нужные ровно два
+раза в сутки. Таблица дала бы staleness (человек сменил display name или деактивировался —
+строка продолжает тегать не того), TTL-логику и инвалидацию в обмен на ноль выигрыша.
+Кэш живёт в процессе (§13.2), несопоставленные пользователи видны через
+`slack_user_match_total{result}` и лог — этого достаточно для эксплуатации.
 
 ### 5.3 pgxgen
 
@@ -318,22 +371,149 @@ ai-reviewer migrations create  -p ./sql/migrations -name add_x
 
 ### 6.2 Джобы
 
-| Kind      | Триггер                           | Очередь   | Уникальность                            | MaxAttempts | Timeout |
-| --------- | --------------------------------- | --------- | --------------------------------------- | ----------- | ------- |
-| `scan`    | periodic `review.scan_interval`   | `default` | по kind (in-flight)                     | 3           | 10m     |
-| `review`  | из `scan` и из CLI `review`       | `review`  | `ByArgs` (project_id, mr_iid, head_sha) | **1**       | 30m     |
-| `digest`  | periodic `Daily{09:00,16:30 MSK}` | `default` | `ByArgs` (team, slot, date)             | 3           | 10m     |
-| `cleanup` | periodic 1h                       | `default` | по kind                                 | 1           | 5m      |
+**Правило: любая отложенная работа — это River-джоба.** Ничего фоновой природы не выполняется
+«просто в горутине»: ни отправка в Slack, ни публикация комментариев, ни уборка.
+Всё, что может упасть по сети и должно быть повторено, живёт в очереди — durable,
+с ретраями, наблюдаемое через `river_job` и метрики.
 
-`review.MaxAttempts = 1` осознанно: упавшее ревью уже сожгло токены, автоповтор утраивает расход;
-следующий `scan` всё равно снова поставит джобу, если SHA так и не отревьюен
-(тот же приём, что в `observe-ai` для `analyze`).
+| Kind             | Триггер                                         | Очередь   | Уникальность                                     | MaxAttempts | Timeout |
+| ---------------- | ----------------------------------------------- | --------- | ------------------------------------------------ | ----------- | ------- |
+| `scan`           | periodic `review.scan_interval`                 | `default` | `ByState` in-flight, по kind                     | 3           | 2m      |
+| `scan_repo`      | из `scan`                                       | `default` | `ByArgs` (project_path), `ByState` in-flight     | 3           | 10m     |
+| `review`         | из `scan_repo`, из CLI `review`                 | `review`  | `ByArgs` (project_id, mr_iid, head_sha)          | **1**       | 30m     |
+| `publish_review` | из `review` (в одной транзакции), из `scan_repo` | `publish` | `ByArgs` (review_id), `ByState` in-flight        | 10          | 5m      |
+| `digest`         | periodic `Daily{09:00,16:30 MSK}`, CLI `digest` | `default` | `ByArgs` (team, slot, run_date, attempt)         | 3           | 10m     |
+| `slack_send`     | из `digest`                                     | `slack`   | `ByArgs` (digest_message_id), `ByState` in-flight | 10          | 2m      |
+| `cleanup`        | periodic 1h                                     | `default` | `ByState` in-flight, по kind                     | 1           | 5m      |
+
+`ByState` везде задаётся **явно** списком in-flight-состояний (`Available`, `Pending`,
+`Running`, `Retryable`, `Scheduled`) — как `uniqueInFlightStates()` в `observe-ai`. Дефолтный
+набор River включает `Completed`, и с ним повторная постановка после успешного завершения
+молча превращалась бы в no-op: для `publish_review` это означало бы, что добор публикации
+после исчерпания попыток невозможен.
+
+### 6.3 Граф джоб
+
+```text
+periodic scan ──► scan_repo (одна джоба на репозиторий)
+                     ├──► review (per MR) ──► publish_review (findings + маркер)
+                     │        └─ пишет mr_reviews / mr_findings и ставит
+                     │           publish_review В ТОЙ ЖЕ ТРАНЗАКЦИИ
+                     └──► publish_review — добор ревью со status='reviewed'
+
+periodic digest ──► строит Block Kit, пишет digest_runs + digest_messages
+                     └──► slack_send (одна джоба на одно сообщение)
+
+periodic cleanup ──► удаляет осиротевшие worktree'ы и старые mirror'ы
+```
+
+**Почему `scan` разделён на два уровня.** Один проход по всем командам и репозиториям — это
+сотни GitLab-запросов; при 40 репозиториях и деградации GitLab он не укладывается в таймаут,
+режется на середине и после ретрая повторяет ту же работу с начала, из-за чего репозитории в
+хвосте списка не сканируются никогда. Поэтому `scan` — дешёвая джоба-диспетчер (читает конфиг,
+ставит по джобе на репозиторий, таймаут 2m), а вся сетевая работа живёт в `scan_repo` со своим
+таймаутом, ретраем и снапшот-кэшем в пределах одного репозитория. Заодно репозитории
+обрабатываются параллельно, а сбой одного не трогает остальные (частичный результат — норма, §35).
+
+Граница правила «всё отложенное — джоба»: джобой становится **работа, которую нужно повторить
+при сбое** (публикация, доставка, уборка). Обычные чтения-входы джобы остаются внутри неё —
+`digest` синхронно ходит в GitLab за MR и в Slack за `users.list` ровно так же, как `review`
+синхронно ходит за диффом. Плодить джобу на каждый сетевой вызов не надо.
+
+**Почему публикация вынесена из `review`.** У `review` `MaxAttempts = 1` (упавшее ревью уже
+сожгло токены, автоповтор утраивает расход — тот же приём, что в `observe-ai` для `analyze`).
+Но публикация — это сетевые вызовы GitLab, которые обязаны ретраиться: транзиентный 502 на
+третьем из пяти findings не должен стоить целого прогона LLM. Поэтому `review` завершается
+записью результата в БД, а публикацией занимается отдельная джоба с `MaxAttempts = 10`.
+Идемпотентность: `publish_review` публикует только те findings, у которых `note_id IS NULL`,
+и пишет `note_id`/`published_at` сразу после каждого успешного POST; summary-заметка с маркером
+идёт последней и тоже отмечается в `mr_reviews`. Повторный запуск после падения досылает
+недостающее и ничего не дублирует.
+
+**Постановка `publish_review` — в той же транзакции, что и запись ревью.** River умеет
+`client.InsertTx(ctx, tx, args, opts)`, поэтому `review` открывает транзакцию, пишет
+`mr_reviews` + `mr_findings` и вставляет джобу публикации одним коммитом. Без этого крэш
+между коммитом и вставкой оставлял бы ревью навсегда неопубликованным: `scan_repo` видит,
+что head SHA уже отревьюен, и не ставит ни `review`, ни `publish_review`.
+
+Второй рубеж на случай, если публикация всё же осталась незавершённой (исчерпаны 10 попыток,
+джоба снята вручную, БД восстановлена из бэкапа): `scan_repo` в конце прохода ищет ревью
+своего репозитория со `status='reviewed'` старше 15 минут и ставит для них `publish_review`.
+Дорогая часть при этом не повторяется — только доставка.
+
+**Почему отправка в Slack — отдельная джоба.** Slack — самый частый источник транзиентных
+ошибок (rate limit Tier 2, 5xx, таймауты). Собрать дайджест (десятки GitLab-запросов + матчинг)
+и отправить сообщение — операции с разной ценой повтора: пересобирать дайджест ради одного
+`ratelimited` бессмысленно. `digest` строит payload и складывает его в `digest_messages`,
+`slack_send` доставляет ровно одно сообщение и ретраится с backoff, уважая `Retry-After`.
 
 `cleanup` удаляет осиротевшие worktree'ы в `review.workdir` (после SIGKILL) и старые mirror'ы.
 
-Размер пула воркеров очереди `review` = `review.max_parallel`.
+Размеры пулов: очередь `review` = `review.max_parallel`, `publish` и `slack` — по 1–2 воркера
+(последовательная доставка предсказуемее для rate limit), `default` — 2.
 
-### 6.3 Расписание дайджеста
+### 6.4 Идемпотентность `slack_send`
+
+У `chat.postMessage` нет ключа идемпотентности, поэтому окно «POST прошёл, но воркер умер до
+записи результата» закрывается состоянием в БД:
+
+```sql
+-- Шаг 1: claim. CTE снимает предыдущий статус до апдейта — RETURNING отдаёт уже
+-- новые значения, поэтому «старое» состояние нужно прочитать отдельно.
+WITH prev AS (
+    SELECT id, status FROM digest_messages WHERE id = $1 FOR UPDATE
+), claimed AS (
+    UPDATE digest_messages m
+       SET status = 'sending'
+      FROM prev
+     WHERE m.id = prev.id AND prev.status IN ('pending', 'sending')
+    RETURNING m.id
+)
+SELECT prev.status AS status_before,
+       (SELECT count(*) FROM claimed) > 0 AS claimed
+  FROM prev;
+```
+
+```text
+2. status_before='sent'                → джоба no-op (успех, идемпотентность)
+   status_before IN ('failed','dry_run') → джоба no-op (успех, ничего не досылаем)
+   status_before='pending'              → обычная первая отправка
+   status_before='sending'              → повтор после крэша, см. ниже
+3. POST chat.postMessage
+4. UPDATE digest_messages SET status='sent', slack_ts=$2, sent_at=now() WHERE id=$1
+```
+
+Если на шаге 1 обнаружен `sending` (значит предыдущая попытка умерла между 3 и 4) — сообщение
+**отправляется повторно**, с warning в лог и метрикой `slack_resend_uncertain_total`.
+Это осознанный выбор в пользу дубликата: лишнее сообщение в канале — шум, а пропавший дайджест
+означает, что команда не увидела, что от неё ждут действий. Решение локализовано в одном месте
+и покрыто тестом.
+
+### 6.5 Ограничение повторов для «ядовитого» MR
+
+`review.MaxAttempts = 1` бережёт токены только внутри одной джобы: `scan_repo` каждые
+`scan_interval` заново видит неотревьюенный SHA и ставит её снова. Для MR, на котором ревью
+падает детерминированно (репозиторий не клонируется по правам, дифф не парсится, модель
+стабильно не отдаёт schema-valid JSON), это 288 полных прогонов LLM в сутки — ровно тот расход,
+ради предотвращения которого и выбран `MaxAttempts = 1`.
+
+Поэтому `scan_repo` перед постановкой считает неудачи по `(project_id, mr_iid, head_sha)`
+в `mr_reviews` (индекс `mr_reviews_failed_idx`) и применяет backoff:
+
+```text
+0 неудач  → ставить сразу
+1         → не раньше чем через 15m после последней
+2         → 1h
+3         → 6h
+≥4        → не ставить вовсе; ждать новый head SHA
+```
+
+Пороги фиксированные, в конфиг не выносятся. Достигнув потолка, MR перестаёт стоить денег,
+но остаётся видимым: `ai_reviews_failed_total{reason}` растёт, а в логе — предупреждение с
+`project_id`/`mr_iid`/`head_sha` и текстом последней ошибки. Новый push меняет head SHA,
+счётчик обнуляется сам собой.
+
+### 6.6 Расписание дайджеста
 
 `river.PeriodicSchedule` — это интерфейс `{ Next(current time.Time) time.Time }` (проверено в
 `river@v0.40.0/periodic_job.go`), поэтому кастомное расписание подключается напрямую:
@@ -351,8 +531,9 @@ func (d Daily) Next(current time.Time) time.Time
 (`time.LoadLocation("Europe/Moscow")`), локальная TZ контейнера не используется;
 в `main` добавляется `import _ "time/tzdata"`, чтобы база таймзон была вшита в бинарь.
 
-`digest_runs` с уникальным индексом `(team, run_date, slot)` даёт второй слой идемпотентности
-и журнал для отладки/метрик.
+`digest_runs` с уникальным индексом `(team, run_date, slot, attempt)` даёт второй слой
+идемпотентности и журнал для отладки/метрик: плановый прогон всегда `attempt = 0`, поэтому
+две реплики не могут задвоить слот, а ручной повтор (§15) занимает следующий `attempt`.
 
 ---
 
@@ -372,11 +553,28 @@ func (d Daily) Next(current time.Time) time.Time
 
 ```go
 type GitLabConfig struct {
-    BaseURL string        `yaml:"base_url" validate:"required,url" usage:"GitLab base URL"`
-    Token   Secret        `yaml:"token" secret:"true" vault:"true" validate:"required" usage:"PAT service account (scope api)"`
+    BaseURL string        `yaml:"base_url" env:"GITLAB_BASE_URL" validate:"required,url" usage:"GitLab base URL"`
+    Token   Secret        `yaml:"token" env:"GITLAB_TOKEN" secret:"true" vault:"true" validate:"required" usage:"PAT service account (scope api)"`
     Timeout time.Duration `yaml:"timeout" default:"30s"`
 }
 ```
+
+**Тег `env:` на каждом поле, которое операторы задают снаружи, обязателен.** Без него xconfig
+выводит имя из Go-полей через `SplitNameByWords`, и результат неочевиден: поле `GitLab.Token`
+даёт `AI_REVIEWER_GIT_LAB_TOKEN`, а `Claude.Auth.OAuthToken` — `AI_REVIEWER_LLM_CLAUDE_AUTH_O_AUTH_TOKEN`
+(«GitLab» → `Git`+`Lab`, «OAuthToken» → `O`+`Auth`+`Token`). Текущий код уже лечит это явными
+тегами (`env:"GITLAB_HOST"` в `internal/config/config.go`), а деривация задокументирована в
+`internal/config/schema.go` — поведение проверено, не предположение. Явный тег
+короткозамыкает имя, к нему добавляется только префикс: `env:"GITLAB_TOKEN"` →
+`AI_REVIEWER_GITLAB_TOKEN`.
+
+Это же правило спасает Vault: `xconfigvault` берёт ключ секрета из `Meta["env"]`, иначе из
+`EnvName()`, поэтому без тегов пришлось бы класть секреты в Vault под ключами вида
+`AI_REVIEWER_LLM_CLAUDE_AUTH_O_AUTH_TOKEN`. Имена env и ключи Vault совпадают по построению.
+
+Отдельно: `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN` — это переменная, из которой **сервис читает**
+секрет. Переменная `CLAUDE_CODE_OAUTH_TOKEN` без префикса, которую понимает сам `claude`,
+в окружении сервиса не участвует: её выставляет `ClaudeAuth` только для subprocess (§12.2).
 
 Все резолвленные секреты дополнительно регистрируются в `security.RegisterSecret`, поэтому
 маскируются и в тексте ошибок, и в выводе subprocess claude, и в логах.
@@ -408,16 +606,23 @@ postgres:
 
 jobs:
   drain_timeout: 60s # graceful drain River на shutdown
-  review_queue_size: 2 # = review.max_parallel
+  queues: # размеры пулов воркеров по очередям
+    default: 2
+    # очередь review намеренно отсутствует: её размер задаёт review.max_parallel —
+    # одна ручка, а не две расходящиеся
+    publish: 1 # последовательная публикация предсказуемее для rate limit
+    slack: 1
+  cleanup_interval: 1h
 
 gitlab:
-  base_url: https://gitlab.company.ru
-  token: "" # env AI_REVIEWER_GITLAB_TOKEN / Vault
+  base_url: https://gitlab.company.ru # env AI_REVIEWER_GITLAB_BASE_URL
+  token: "" # env AI_REVIEWER_GITLAB_TOKEN / Vault (тег env:"GITLAB_TOKEN")
   timeout: 30s
   graphql_enabled: true # точный review state ревьюеров
 
 slack:
-  token: "" # env AI_REVIEWER_SLACK_TOKEN / Vault
+  token: "" # env AI_REVIEWER_SLACK_TOKEN / Vault (тег env:"SLACK_TOKEN")
+  directory_ttl: 15m # TTL кэша users.list в памяти процесса
   user_map: {} # необязательный override: gitlab_username → SLACK_USER_ID
 
 llm:
@@ -428,8 +633,9 @@ llm:
     model: sonnet
     auth:
       mode: oauth-token # existing-login | oauth-token | api-key
-      oauth_token: "" # env AI_REVIEWER_LLM_CLAUDE_AUTH_OAUTH_TOKEN / Vault
-      api_key: "" # env AI_REVIEWER_LLM_CLAUDE_AUTH_API_KEY / Vault
+      # теги env:"CLAUDE_CODE_OAUTH_TOKEN" / env:"ANTHROPIC_API_KEY"
+      oauth_token: "" # env AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN / Vault
+      api_key: "" # env AI_REVIEWER_ANTHROPIC_API_KEY / Vault
     permission_mode: dontAsk
     agent_mode: true
     allowed_tools:
@@ -444,7 +650,7 @@ llm:
 
 review:
   scan_interval: 5m
-  max_parallel: 2
+  max_parallel: 2 # единственная ручка параллелизма ревью = размер пула очереди review
   max_comments: 12
   severity_threshold: medium
   preferred_comment_language: auto
@@ -500,15 +706,21 @@ teams:
 Часть — тегами `validate` (`required`, `url`, `oneof`, `dive`), часть — доменной проверкой
 (ошибки агрегируются и печатаются списком):
 
-1. `teams` не пуст; 2. имена уникальны (case-insensitive); 3. у каждой команды непустой
-   `repositories`; 4. валидный `slack_channel`; 5. каждый repository — валидный GitLab path либо
-   числовой id; 6. один repository не в двух командах (иначе ошибка с обоими именами);
-2. `gitlab.base_url` — абсолютный http(s) URL; 8. `gitlab.token` непустой;
-3. `llm.claude.auth.mode` ∈ {existing-login, oauth-token, api-key} и соответствующий секрет
-   непуст (для `existing-login` секреты не требуются, а заданные — ошибка конфигурации);
-4. `slack.token` непустой, если `slack_send_enabled` или заданы каналы; 11. `scan_interval ≥ 1m`,
-   `max_parallel ≥ 1`, `max_comments ≥ 1`; 12. существующие проверки pipeline-режимов и verifier'ов;
-5. `time.LoadLocation("Europe/Moscow")` успешна; 14. Postgres DSN собирается и коннект проходит.
+- `teams` не пуст;
+- имена команд уникальны (case-insensitive);
+- у каждой команды непустой `repositories`;
+- у каждой команды валидный `slack_channel`;
+- каждый repository — валидный GitLab path либо числовой id;
+- один repository не принадлежит двум командам (иначе ошибка с обоими именами);
+- `gitlab.base_url` — абсолютный http(s) URL;
+- `gitlab.token` непустой;
+- `llm.claude.auth.mode` ∈ {`existing-login`, `oauth-token`, `api-key`} и соответствующий
+  секрет непуст (для `existing-login` секреты не требуются, а заданные — ошибка конфигурации);
+- `slack.token` непустой, если включён `slack_send_enabled` или заданы каналы;
+- `review.scan_interval ≥ 1m`, `review.max_parallel ≥ 1`, `review.max_comments ≥ 1`;
+- существующие проверки pipeline-режимов и verifier'ов;
+- `time.LoadLocation("Europe/Moscow")` успешна;
+- Postgres DSN собирается и коннект проходит.
 
 ---
 
@@ -690,30 +902,63 @@ unresolved-треды, и review-маркер, и fingerprints, и контек�
 
 `fp` — существующий `review.Fingerprint(projectID, mrIID, filePath, category, title)`.
 Он **не зависит от head SHA**, поэтому один и тот же finding не спамится после каждого пуша.
-Перед ревью строится `ExistingFingerprints` = (fingerprints из `mr_findings`) ∪ (fp-маркеры
-из дискуссий) и передаётся в движок — механизм уже существует и покрыт тестом
-(`validator_test.go`), меняется только источник.
+
+Перед ревью строится `ExistingFingerprints` и передаётся в движок — механизм уже существует
+и покрыт тестом (`validator_test.go`), меняется только источник:
+
+```sql
+SELECT fingerprint FROM mr_findings
+ WHERE project_id = $1 AND mr_iid = $2
+   AND note_id IS NOT NULL          -- ТОЛЬКО реально опубликованные
+```
+
+плюс fp-маркеры, вычитанные из дискуссий MR.
+
+**Условие `note_id IS NOT NULL` обязательно.** Дедуп должен означать «этот finding уже висит
+в GitLab», а не «мы его когда-то посчитали». Без него любой прогон в dry-run записывает
+findings с `note_id = NULL`, и после включения публикации движок сочтёт их дубликатами и не
+опубликует **никогда**: fingerprint не зависит от head SHA, так что новые пуши ситуацию не
+исправят. По той же причине findings ревью, у которого публикация не доехала, не блокируют
+повторную попытку — их дошлёт `publish_review`.
 
 ### 10.4 Порядок и atomic success
 
 ```text
 1. LLM pipeline отработал без ошибки
 2. детерминированная валидация выполнена
-3. INSERT mr_reviews (status='running'|'dry_run') + findings
-4. если publish включён — публикация findings, каждый со своим fp-маркером,
-   note_id/published_at пишутся сразу после успешного POST
-5. ПОСЛЕДНЕЙ — summary-заметка с review-маркером
-6. UPDATE mr_reviews SET status='succeeded'
+   ── ОДНА ТРАНЗАКЦИЯ (конец джобы review) ──
+3. INSERT mr_reviews (status='reviewed'|'dry_run')
+   INSERT mr_findings ... ON CONFLICT (project_id, mr_iid, fingerprint) DO NOTHING
+4. если publish включён — client.InsertTx(tx, publish_review{review_id})
+   COMMIT
+
+── джоба publish_review (MaxAttempts=10, идемпотентная) ──
+5. публикация findings, у которых note_id IS NULL, каждый со своим fp-маркером;
+   note_id/published_at пишутся сразу после каждого успешного POST
+6. ПОСЛЕДНЕЙ — summary-заметка с review-маркером
+7. UPDATE mr_reviews SET status='succeeded'
 ```
 
-Крэш между 4 и 6 → нет ни маркера, ни `succeeded` → следующий `scan` поставит джобу снова,
-но уже опубликованные findings отсеются по `mr_findings`/fp-маркерам. Ложного «успеха» не бывает:
-`succeeded` ставится последним. Упавшее ревью пишет `status='failed'` + `error`, инкрементит
-`ai_reviews_failed_total`, не блокирует остальные MR и повторяется на следующем скане.
+Разрыв на любом шаге безопасен:
 
-**Dry-run** (`ai_review_publish_enabled: false`): пункты 4–5 пропускаются, но
-`mr_reviews(status='dry_run')` пишется — поэтому повторного ревью того же SHA каждые 5 минут
-не происходит. Именно БД закрывает эту дыру.
+- крэш до COMMIT → в БД нет ничего, следующий скан ревьюит SHA заново;
+- крэш после COMMIT → джоба публикации уже лежит в очереди: она вставлена той же транзакцией,
+  поэтому «ревью записано, но публиковать некому» невозможно;
+- крэш внутри 5 → повтор джобы досылает только неопубликованные findings (`note_id IS NULL`),
+  дублей нет;
+- крэш между 5 и 6 → нет ни маркера, ни `succeeded`; повтор джобы досылает summary;
+- исчерпание попыток `publish_review` → `mr_reviews` остаётся в `reviewed`; `scan_repo`
+  подбирает такие ревью старше 15 минут и ставит `publish_review` заново (§6.3) — дорогая
+  часть не повторяется, дешёвая доводится до конца;
+- ложного «успеха» не бывает: `succeeded` ставится последним.
+
+Упавшее ревью пишет `status='failed'` + `error`, инкрементит `ai_reviews_failed_total`,
+не блокирует остальные MR и повторяется на следующем скане — с backoff по числу неудач
+для этого SHA (§6.5), чтобы детерминированно ломающийся MR не жёг токены бесконечно.
+
+**Dry-run** (`ai_review_publish_enabled: false`): шаг 4 не выполняется, `publish_review`
+не ставится, но `mr_reviews(status='dry_run')` пишется — поэтому повторного ревью того же SHA
+каждые 5 минут не происходит. Именно БД закрывает эту дыру.
 
 ---
 
@@ -721,7 +966,7 @@ unresolved-треды, и review-маркер, и fingerprints, и контек�
 
 | Вход движка              | Было (SQLite)            | Стало                                                        |
 | ------------------------ | ------------------------ | ------------------------------------------------------------ |
-| `ExistingFingerprints`   | `db.ListFindingsByMR`    | `mr_findings` ∪ fp-маркеры из дискуссий GitLab               |
+| `ExistingFingerprints`   | `db.ListFindingsByMR`    | `mr_findings` c `note_id IS NOT NULL` ∪ fp-маркеры дискуссий |
 | `PriorReview`            | Прошлые записи `reviews` | `mr_reviews`/`mr_findings` + наши треды и ответы людей в них |
 | interdiff                | `prev.head_sha` из БД    | `mr_reviews.head_sha` → `git diff prev..head` в worktree     |
 | `RelatedFiles`           | FTS5 (`internal/index`)  | **удаляется**; в agent mode Claude ищет сам (Grep/Glob)      |
@@ -821,21 +1066,25 @@ type Result struct { Status Status; SlackID, Display string } // Matched | Ambig
 Порядок:
 
 1. **Явный override** из `slack.user_map` (`gitlab_username → SLACK_USER_ID`) — escape-hatch;
-2. **Кэш** `slack_user_links` в Postgres (переживает рестарт, обновляется по TTL);
-3. **Email** — нормализованный (trim + lowercase) email GitLab-пользователя против Slack-индекса;
-4. **Username/имя** — GitLab `username` против Slack `name`/`display_name`/`real_name`,
+2. **Email** — нормализованный (trim + lowercase) email GitLab-пользователя против Slack-индекса;
+3. **Username/имя** — GitLab `username` против Slack `name`/`display_name`/`real_name`,
    затем GitLab `name` против `real_name`/`display_name`; сравнение регистронезависимое,
    с trim и схлопыванием пробелов, без агрессивного fuzzy;
-5. **Ambiguous** (>1 кандидата) — случайный выбор не делается: `Ambiguous` + warning + метрика,
+4. **Ambiguous** (>1 кандидата) — случайный выбор не делается: `Ambiguous` + warning + метрика,
    в дайджесте выводится текстом;
-6. **Not found** — `John Smith (@john)` без mention; дайджест всё равно отправляется.
+5. **Not found** — `John Smith (@john)` без mention; дайджест всё равно отправляется.
 
-Внутри прогона — один `users.list`, из него строятся индексы `email→user`,
-`display_name→[]user`, `real_name→[]user`, `handle→[]user`.
+**Кэш — только в памяти процесса, в базе ничего не хранится.** Slack-клиент держит справочник
+воркспейса с TTL `slack.directory_ttl` (по умолчанию 15m) за `singleflight`: параллельные джобы
+`digest` разных команд в 09:00 делят одну загрузку `users.list`, а не дёргают её каждая.
+Из справочника строятся индексы `email→user`, `display_name→[]user`, `real_name→[]user`,
+`handle→[]user`. После рестарта кэш пуст — перезагрузка занимает секунды и на корректность
+не влияет, зато нет ни staleness, ни инвалидации, ни миграции.
 
 **Ограничение**: GitLab REST отдаёт чужой `email` только админскому токену; у обычного
-service-токена доступен лишь `public_email`, часто пустой. Поэтому шаг 3 сработает не всегда —
-ради этого и добавлены `user_map` и кэш.
+service-токена доступен лишь `public_email`, часто пустой. Поэтому шаг 2 сработает не всегда —
+ради этого и добавлен `user_map`. Несопоставленные пользователи наблюдаемы через
+`slack_user_match_total{result}` и лог.
 
 ### 13.3 Block Kit и лимиты
 
@@ -867,13 +1116,29 @@ merge conflicts, упавший пайплайн. Порядок строк вн
 
 Все MR — кликабельные ссылки (`web_url`). Лимиты соблюдаются билдером: ≤50 блоков на сообщение,
 ≤3000 символов в `text` секции. При превышении — разбиение на пронумерованные части
-(`MR Digest — Payments (1/3)`), **без молчаливого усечения**.
+(`MR Digest — Payments (1/3)`), **без молчаливого усечения**. Каждая часть — отдельная строка
+`digest_messages` и отдельная джоба `slack_send`, поэтому падение доставки третьей части
+не отменяет уже отправленные и не требует пересборки дайджеста.
 
-### 13.4 Dry-run и отсутствие шума
+### 13.4 Отправка идёт через River
+
+Ни один вызов `chat.postMessage` не делается «по ходу дела»: `digest` только строит payload и
+складывает его в `digest_messages(status='pending')`, а доставку выполняет джоба `slack_send`
+(одна на сообщение) с ретраями, backoff, уважением `Retry-After` и идемпотентностью по §6.4.
+Единственное сетевое обращение к Slack вне очереди — `auth.test`/`conversations.info` в `doctor`,
+и это синхронная диагностика по требованию пользователя, а не фоновая работа.
+
+### 13.5 Dry-run и отсутствие шума
 
 `slack_send_enabled: false`: полностью выполняются сканирование, классификация, матчинг и сборка
-Block Kit payload; не вызывается только `chat.postMessage`, payload логируется как preview,
-в `digest_runs` пишется `status='dry_run'`.
+Block Kit payload; строки `digest_messages` создаются со `status='dry_run'`, payload логируется
+как preview, джобы `slack_send` **не ставятся**, в `digest_runs` пишется `status='dry_run'`.
+Полноценный dry-run: всё, кроме сетевого вызова, выполнено и осмотрено.
+
+Статусы `digest_runs` по ходу прогона: `built` — payload собран и разложен по
+`digest_messages`, джобы доставки поставлены; `sent` — все части подтверждены;
+`partial` — часть частей не доставлена (или часть репозиториев не опрошена, §35);
+`dry_run` — сборка без отправки; `failed` — прогон не дошёл до сборки.
 
 Сканер **не пишет в Slack** по каждому MR: Slack — слой уведомлений о действиях людей,
 findings живут в GitLab.
@@ -948,9 +1213,12 @@ merge_requests_with_conflicts_total{team}          (gauge)
 merge_requests_with_failed_pipeline_total{team}    (gauge)
 slack_digest_runs_total{team,result}
 slack_messages_sent_total{team}
-slack_send_errors_total{team}
+slack_send_errors_total{team,reason}            (ratelimited|api_error|network)
+slack_resend_uncertain_total{team}              (повтор после крэша между POST и записью)
 slack_user_match_total{result}                  (matched|not_found|ambiguous)
 river_jobs_total{kind,state}                    (из журнала River)
+river_job_duration_seconds{kind}                (histogram)
+river_job_retries_total{kind}
 ```
 
 ### 14.4 Health / readiness
@@ -965,20 +1233,47 @@ river_jobs_total{kind,state}                    (из журнала River)
 ## 15. CLI
 
 ```bash
-ai-reviewer serve                       # production: mx lifecycle, ops, River (scan + digest)
-ai-reviewer scan   [--team <name>]      # one-shot: поставить джобы ревью по конфигурации
-ai-reviewer digest [--team <name>]      # one-shot Slack digest
-ai-reviewer review <ref> [--publish]    # ручное ревью одного MR тем же пайплайном
-ai-reviewer doctor                      # диагностика
-ai-reviewer migrations up|down|create   # миграции (app + River)
+ai-reviewer serve                              # production: mx lifecycle, ops, River (все воркеры)
+ai-reviewer scan   [--team <name>]             # поставить джобу scan
+ai-reviewer digest [--team <name>] [--force]   # поставить джобу digest
+ai-reviewer review <ref> [--publish] [--wait]  # поставить джобу review для одного MR
+ai-reviewer review <ref> --local [--publish]   # выполнить ревью в этом процессе (отладка)
+ai-reviewer doctor                             # диагностика
+ai-reviewer migrations up|down|create          # миграции (app + River)
 ```
 
 `<ref>` сохраняет форматы `internal/gitlab/ref.go` (тесты остаются): полный URL MR,
 `group/subgroup/repo!123`, `project-id:iid`.
 
-`review` использует **тот же** pipeline и тот же publisher, что и джоба — второй реализации нет
-(CLI-путь выполняет ту же функцию воркера синхронно). По умолчанию действует
-`service.ai_review_publish_enabled`; `--publish`/`--no-publish` переопределяют для конкретного запуска.
+**CLI ставит джобы, а не делает работу.** `scan`, `digest`, `review` вставляют соответствующую
+River-джобу и печатают её id; выполняет её работающий `serve`. `--wait` опрашивает джобу
+(`client.JobGet`) до терминального состояния и печатает отчёт.
+
+**`--publish` живёт в аргументах джобы, а не в конфиге процесса.** Иначе флаг было бы
+невозможно доставить до воркера, и хуже того: если `scan_repo` уже поставил джобу для этого
+SHA, ручная вставка схлопнулась бы в no-op по unique job, а отработавшая джоба
+опубликовала бы по глобальному флагу — команда молча не сделала бы то, о чём просили.
+Поле `Publish *bool` в args **не входит** в ключ уникальности (`river:"unique"` стоит только
+на `project_id`/`mr_iid`/`head_sha`), поэтому дедупликация сохраняется, а поведение при
+схлопывании определено явно: CLI сравнивает свой запрос с найденной джобой и, если та уже
+выполняется без публикации, печатает предупреждение и предлагает `--wait` либо
+`--local --publish`. Если флаг не задан, действует `service.ai_review_publish_enabled`.
+
+**`--local` не участвует в дедупликации и поэтому ограничен.** Он выполняет функцию воркера
+прямо в процессе CLI (тот же код, второй реализации пайплайна нет) — это нужно для отладки и
+одноразовых прогонов без развёрнутого сервиса, но unique job его не защищает: одновременный
+`--local` и сканерный прогон дали бы два параллельных прогона LLM и двух публикаторов,
+которые оба видят `note_id IS NULL` и запостят findings дважды. Поэтому перед стартом
+`--local` берёт advisory-lock `pg_try_advisory_lock(hashtext('review:<project>:<iid>:<sha>'))`
+и, не получив его, завершается с сообщением «этот SHA уже ревьюится, используйте --wait».
+Локальный прогон пишет `mr_reviews`/`mr_findings` и ставит `publish_review` ровно так же, как
+джоба, — расхождения состояний не возникает.
+
+**`digest` за уже отправленный слот.** Плановый прогон занимает `attempt = 0`; повторный
+запуск без флага получает отказ с понятным текстом («дайджест payments за 2026-08-13 09:00
+уже отправлен, повтор — `--force`»), а не ошибку уникального индекса. `--force` вставляет
+джобу со следующим `attempt`, что даёт новую строку `digest_runs`, новые `digest_messages`
+и честный журнал повторов.
 
 Удаляются: `sync`, `daemon`, алиас `start`, `--auto-review/--auto-draft/--auto-publish`,
 `--open`, `--foreground`, проверки SQLite/FTS5 в doctor.
@@ -1036,15 +1331,20 @@ CMD ["serve"]
 docker run --rm \
   -e AI_REVIEWER_GITLAB_TOKEN=... \
   -e AI_REVIEWER_SLACK_TOKEN=... \
-  -e AI_REVIEWER_LLM_CLAUDE_AUTH_OAUTH_TOKEN=... \   # либо ..._API_KEY
+  -e AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN=... \   # либо AI_REVIEWER_ANTHROPIC_API_KEY
   -e AI_REVIEWER_POSTGRES_HOST=... -e AI_REVIEWER_POSTGRES_PASSWORD=... \
   -v $PWD/config.yaml:/etc/ai-reviewer/config.yaml:ro \
   ai-reviewer:latest serve --config /etc/ai-reviewer/config.yaml
 ```
 
+Имена переменных — это префикс `AI_REVIEWER_` плюс значение тега `env:` соответствующего
+поля (§7.1). Полагаться на автоматическую деривацию из имён Go-полей нельзя: она даёт
+`AI_REVIEWER_GIT_LAB_TOKEN` вместо ожидаемого `AI_REVIEWER_GITLAB_TOKEN`.
+
 Либо через Vault: `VAULT_ENABLED=true`, `VAULT_ADDR`, `VAULT_SECRET_PATH`,
 `VAULT_AUTH_KIND=kubernetes`, `VAULT_KUBE_ROLE` — секреты подтягиваются плагином при старте
-и обновляются фоном (`VAULT_REFRESH_INTERVAL`).
+и обновляются фоном (`VAULT_REFRESH_INTERVAL`). Ключи секретов в Vault совпадают с именами
+env-переменных выше.
 
 Kubernetes: `Deployment` (реплики ≥1, конкуренцию снимает River), `ConfigMap` для `config.yaml`,
 `Secret`/Vault для токенов, **init-контейнер** `ai-reviewer migrations up`,
@@ -1072,7 +1372,14 @@ Claude CLI — через fake-executable (`os.Args[0]` + `TestHelperProcess`, �
 
 - нет записи `mr_reviews` → ревью требуется; запись с текущим SHA → skip; со старым SHA → re-review;
 - упавшее ревью → `status='failed'`, следующий скан повторяет;
+- backoff по неудачам (§6.5): 1 неудача → пауза 15m, 2 → 1h, 3 → 6h, ≥4 → джоба не ставится;
+  новый head SHA обнуляет счётчик;
 - dry-run пишет `status='dry_run'` и не приводит к повторному ревью;
+- дедуп берёт только опубликованные findings: строка с `note_id IS NULL` (dry-run или
+  недоехавшая публикация) **не** попадает в `ExistingFingerprints`, и после включения
+  публикации finding публикуется;
+- повторная вставка finding с существующим fingerprint не роняет персистенцию ревью
+  (`ON CONFLICT DO NOTHING`);
 - порядок публикации: summary-маркер последним (проверка последовательности вызовов fake-API);
 - маркеры: парсинг v1, несколько маркеров → берётся свежий, незнакомая версия → игнор без паники;
 - finding с существующим fp (в БД или в маркере) не публикуется повторно.
@@ -1107,13 +1414,43 @@ Claude CLI — через fake-executable (`os.Args[0]` + `TestHelperProcess`, �
 **Slack matcher**
 
 - точный email; нормализация регистра; fallback username; fallback имя; ambiguous (без случайного
-  выбора); not found (дайджест всё равно уходит); override `user_map` побеждает; кэш исключает
-  повторный HTTP-запрос.
+  выбора); not found (дайджест всё равно уходит); override `user_map` побеждает;
+- справочник: повторный матч не делает второй `users.list`; параллельные джобы `digest` разных
+  команд делят одну загрузку (singleflight); по истечении `directory_ttl` справочник
+  перезагружается.
 
 **Флаги dry-run**
 
-- `slack_send_enabled=false`: дайджест собран полностью, `chat.postMessage` не вызван;
-- `ai_review_publish_enabled=false`: ревью выполнено, валидация пройдена, ни один GitLab-write не вызван.
+- `slack_send_enabled=false`: дайджест собран полностью, строки `digest_messages` созданы со
+  `status='dry_run'`, джобы `slack_send` не поставлены, `chat.postMessage` не вызван;
+- `ai_review_publish_enabled=false`: ревью выполнено, валидация пройдена, джоба `publish_review`
+  не поставлена, ни один GitLab-write не вызван.
+
+**Джобы публикации и отправки**
+
+- `publish_review` публикует только findings с `note_id IS NULL`; повтор после падения на
+  середине не дублирует уже опубликованное;
+- `publish_review` пишет summary-заметку последней и только затем `status='succeeded'`;
+- джоба публикации вставляется в той же транзакции, что и запись ревью: откат транзакции
+  не оставляет джобу, а коммит гарантирует её наличие (тест на `InsertTx` с принудительным
+  rollback);
+- `scan_repo` подбирает ревью со `status='reviewed'` старше 15 минут и ставит
+  `publish_review`, не запуская LLM;
+- `slack_send` при `status='sent'` — no-op (идемпотентность); при `failed`/`dry_run` — тоже
+  no-op, ничего не досылается;
+- `slack_send` при `status='sending'` (крэш между POST и записью) — повторная отправка +
+  инкремент `slack_resend_uncertain_total`;
+- `ratelimited` от Slack → ретрай с уважением `Retry-After`, дайджест не пересобирается;
+- падение доставки одной части не отменяет уже отправленные части.
+
+**CLI**
+
+- `--publish` доезжает до воркера через args джобы и не входит в ключ уникальности;
+- при схлопывании в существующую джобу без публикации CLI печатает предупреждение,
+  а не молча завершается успехом;
+- `--local` при активной джобе на тот же SHA не стартует (advisory-lock) и сообщает об этом;
+- `digest` за уже отправленный слот без `--force` даёт понятный отказ, а не ошибку
+  уникального индекса; с `--force` создаёт прогон со следующим `attempt`.
 
 **Claude auth**
 
@@ -1131,13 +1468,19 @@ Claude CLI — через fake-executable (`os.Args[0]` + `TestHelperProcess`, �
 **Конкуренция (River)**
 
 - две вставки `ReviewArgs` с одинаковым `(project, iid, sha)` → одна джоба (unique);
-- повторная вставка после завершения предыдущей разрешена;
-- `digest_runs` уникальность `(team, run_date, slot)` не даёт задвоить дайджест.
+- повторная вставка после завершения предыдущей разрешена (`ByState` — только in-flight,
+  без `Completed`), иначе добор `publish_review` был бы невозможен;
+- `digest_runs` уникальность `(team, run_date, slot, attempt)` не даёт задвоить плановый слот
+  и при этом допускает явный повтор;
+- две вставки `DigestArgs` за один слот → одна джоба; две вставки `SlackSendArgs` с одним
+  `digest_message_id` → одна джоба;
+- CLI `review <ref>` при уже выполняющемся ревью того же SHA не создаёт вторую джобу.
 
 **Partial failures**
 
 - 10 репозиториев, один отдаёт 500 → остальные 9 обработаны, дайджест помечен
-  `⚠️ Partial data: failed to inspect 1 repository.`;
+  `⚠️ Partial data: failed to inspect 1 repository.`, `digest_runs.status='partial'`;
+- падение `scan_repo` одного репозитория не мешает остальным (отдельные джобы);
 - классификация ошибок: fatal (401/403/конфиг) vs retryable (429/5xx) vs partial.
 
 **Block Kit**
@@ -1184,7 +1527,10 @@ API key / Team / Enterprise / cloud-provider аутентификацию.
 Новые: GitLab — источник правды о MR, Postgres — операционное состояние сервиса;
 изоляция команд; детерминированный Claude auth; success-маркер пишется последним;
 Slack — слой уведомлений, а не хранилище состояния; конкуренцию реплик снимает River
-(unique jobs + leader election), ручных локов не пишем.
+(unique jobs + leader election), ручных локов не пишем; **вся отложенная работа — River-джоба**
+(публикация в GitLab, отправка в Slack, уборка): никаких «фоновых горутин» и никаких сетевых
+записей во внешние системы вне очереди. Обратная сторона правила: чтения-входы джобы остаются
+внутри неё, джоба на каждый сетевой вызов не заводится.
 
 Существующие аналитические документы (`docs/competitive-analysis-*.md`, `docs/gopls-mcp-analysis.md`)
 сохраняются как есть — это история анализа, а не описание архитектуры.
@@ -1193,21 +1539,21 @@ Slack — слой уведомлений, а не хранилище состо
 
 ## 19. Этапы работ
 
-| Этап | Содержание                                                                                                                                                | Готовность подтверждается                        |
-| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| 0    | Зависимости: `+tkcrm/mx`, `+jackc/pgx/v5`, `+riverqueue/river(+riverpgxv5,rivertype)`, `+xconfigvault`, `+go-playground/validator`, `−modernc.org/sqlite` | `go mod tidy`, сборка                            |
-| 1    | `internal/config`: новая схема (teams/slack/service/postgres/jobs/ops/log), `Secret`, Vault, валидация; удаление schema/patch/template                    | `config_test.go` зелёный                         |
-| 2    | Удаление personal-слоя: `state`, `server`, `ui`, `index`, `skills` + связанные сервисы/тесты                                                              | `go build ./...`                                 |
-| 3    | `sql/migrations` + `sql/pgxgen.yaml` + `internal/store`/`internal/models`; команда `migrations`                                                           | `make migrateup` на локальном Postgres           |
-| 4    | Логгер: миграция на `mx/logger`, `security.NewRedactingCore`, вычистка `slog`                                                                             | `redaction_test.go` на zap-core                  |
-| 5    | `internal/domain` + расширение `internal/gitlab` (approvals, versions, notes/discussions POST, маркеры, GraphQL)                                          | тесты классификаторов, маркеров, GraphQL-фолбэка |
-| 6    | `internal/llm/auth.go` (ClaudeAuth) + проброс в ClaudeCLI                                                                                                 | `llm/auth_test.go`                               |
-| 7    | `internal/service/review.go`: снапшот → pipeline → publisher → БД/маркер                                                                                  | `service/review_test.go` на fake GitLab          |
-| 8    | `internal/slack` + `internal/match` + `internal/service/digest.go`                                                                                        | `httptest`-тесты Slack, matcher                  |
-| 9    | `internal/jobs` на River (scan/review/digest/cleanup) + `internal/scheduler/daily.go` + `internal/metrics`                                                | тесты Daily и unique-джоб                        |
-| 10   | `internal/app` + mx launcher; `internal/cli`: serve/scan/review/digest/doctor/migrations                                                                  | ручной прогон всех команд                        |
-| 11   | Dockerfile, docker-compose (postgres), k8s-пример, README, CLAUDE.md                                                                                      | сборка образа, `claude --version` внутри         |
-| 12   | Финальная зачистка: dead code, grep-проверки, `make fmt test lint build`                                                                                  | все команды зелёные                              |
+| Этап | Содержание                                                                                                                                                        | Готовность подтверждается                                                |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| 0    | Зависимости: `+tkcrm/mx`, `+jackc/pgx/v5`, `+riverqueue/river(+riverpgxv5,rivertype)`, `+xconfigvault`, `+go-playground/validator`, `−modernc.org/sqlite`         | `go mod tidy`, сборка                                                    |
+| 1    | `internal/config`: новая схема (teams/slack/service/postgres/jobs/ops/log), `Secret`, Vault, валидация; удаление schema/patch/template                            | `config_test.go` зелёный                                                 |
+| 2    | Удаление personal-слоя: `state`, `server`, `ui`, `index`, `skills` + связанные сервисы/тесты                                                                      | `go build ./...`                                                         |
+| 3    | `sql/migrations` + `sql/pgxgen.yaml` + `internal/store`/`internal/models`; команда `migrations`                                                                   | `make migrateup` на локальном Postgres                                   |
+| 4    | Логгер: миграция на `mx/logger`, `security.NewRedactingCore`, вычистка `slog`                                                                                     | `redaction_test.go` на zap-core                                          |
+| 5    | `internal/domain` + расширение `internal/gitlab` (approvals, versions, notes/discussions POST, маркеры, GraphQL)                                                  | тесты классификаторов, маркеров, GraphQL-фолбэка                         |
+| 6    | `internal/llm/auth.go` (ClaudeAuth) + проброс в ClaudeCLI                                                                                                         | `llm/auth_test.go`                                                       |
+| 7    | `internal/service/review.go`: снапшот → pipeline → БД; publisher как отдельная идемпотентная операция                                                             | `service/review_test.go` + тесты publish на fake GitLab                  |
+| 8    | `internal/slack` + `internal/match` + `internal/service/digest.go` (сборка payload в `digest_messages`, без отправки)                                             | `httptest`-тесты Slack, matcher                                          |
+| 9    | `internal/jobs` на River: `scan`/`review`/`publish_review`/`digest`/`slack_send`/`cleanup` + `internal/scheduler/daily.go` + `internal/metrics` | тесты Daily, unique-джоб и идемпотентности `slack_send`/`publish_review` |
+| 10   | `internal/app` + mx launcher; `internal/cli`: serve/scan/review/digest/doctor/migrations (CLI ставит джобы, `--wait`/`--local`)                                   | ручной прогон всех команд                                                |
+| 11   | Dockerfile, docker-compose (postgres), k8s-пример, README, CLAUDE.md                                                                                              | сборка образа, `claude --version` внутри                                 |
+| 12   | Финальная зачистка: dead code, grep-проверки, `make fmt test lint build`                                                                                          | все команды зелёные                                                      |
 
 ---
 
@@ -1263,12 +1609,22 @@ GitLab self-managed ограничивает запросы на пользов�
 - [ ] personal mode удалён (нет UI, нет approve/reject/draft/publish-подтверждения, нет `reviews_for_me`)
 - [ ] SQLite удалён (`modernc.org/sqlite` отсутствует в `go.mod`, `internal/state` удалён)
 - [ ] PostgreSQL + pgxgen: схема, миграции, репозитории; `migrations up/down/create` работают
-- [ ] River: `scan`/`review`/`digest`/`cleanup`, unique jobs, periodic на лидере, graceful drain
+- [ ] PostgreSQL ≥ 16; `uuidv7()` создаётся миграцией `0000`, `migrations up` проходит на чистой БД
+- [ ] River: `scan`/`scan_repo`/`review`/`publish_review`/`digest`/`slack_send`/`cleanup`,
+      unique jobs с явным in-flight `ByState`, periodic на лидере, graceful drain
+- [ ] `publish_review` ставится в одной транзакции с записью ревью; `scan_repo` добирает
+      зависшие `reviewed`
+- [ ] backoff по неудачам ревью для одного SHA (15m / 1h / 6h / стоп)
+- [ ] вся отложенная работа идёт через River: отправка в Slack, публикация в GitLab и уборка
+      worktree'ов — джобы, а не фоновые горутины
+- [ ] `publish_review` и `slack_send` идемпотентны и ретраятся без дублей
 - [ ] ≥2 реплики: один MR не ревьюится дважды, дайджест уходит один раз (тесты + ручная проверка)
 - [ ] team config + группировка репозиториев реализованы и провалидированы fail-fast
 - [ ] автоматический re-review при смене head SHA работает; dry-run не зацикливается
 - [ ] Claude Code CLI сохранён; `existing-login`, `oauth-token`, `api-key` работают, выбор детерминирован
-- [ ] секреты: YAML → env → Vault, тип `Secret`, redaction в zap-логах
+- [ ] секреты: YAML → env → Vault, тип `Secret`, redaction в zap-логах; у каждого
+      задаваемого снаружи поля есть явный тег `env:`, и документированные имена переменных
+      совпадают с реально читаемыми (проверено тестом на derived-имена)
 - [ ] Slack digest, user matching, unresolved threads, conflicts, **упавшие пайплайны**,
       review requirements реализованы
 - [ ] 09:00 / 16:30 Europe/Moscow реализованы и покрыты тестами независимо от TZ машины
