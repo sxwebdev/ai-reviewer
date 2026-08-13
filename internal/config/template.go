@@ -28,7 +28,7 @@ gitlab:
 
 llm:
   provider: "claude-cli"
-  model: "claude-sonnet-5"   # claude-opus-4-8 | claude-sonnet-5 | claude-haiku-4-5-20251001 | claude-fable-5
+  model: "claude-sonnet-5"   # claude-opus-5 | claude-sonnet-5 | claude-haiku-4-5-20251001 | claude-fable-5
   timeout: "15m"
   claude:
     bin: "claude"

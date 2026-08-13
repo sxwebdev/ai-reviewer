@@ -27,12 +27,12 @@ func TestTemplatesRender(t *testing.T) {
 	mr := &state.MergeRequest{ID: 3, IID: 42, Title: "Test MR", WebURL: "https://gitlab.test/mr/42",
 		SourceBranch: "feat", TargetBranch: "main", HeadSHA: "5fff58b17ea2", CreatedAt: 1700000000000}
 	rev := &state.Review{ID: "rev1", RiskLevel: "high", OverallRecommendation: "request_changes",
-		Summary: "a summary", CostUSD: 0.93, LLMModel: "claude-opus-4-8", DurationMS: 72000}
+		Summary: "a summary", CostUSD: 0.93, LLMModel: "claude-opus-5", DurationMS: 72000}
 	// Header switches + run-form skills exercise the new template branches
 	// (model select .ID/.Label, agentic select, skills fieldset).
 	hdrUI := UIConfig{Host: "h", AgentMode: true, PipelineMode: "standard",
 		PipelineModes: []string{"cheap", "standard", "deep"},
-		Models:        []ModelChoice{{ID: "claude-opus-4-8", Label: "Opus 4.8"}, {ID: "claude-sonnet-5", Label: "Sonnet 5"}}}
+		Models:        []ModelChoice{{ID: "claude-opus-5", Label: "Opus 5"}, {ID: "claude-sonnet-5", Label: "Sonnet 5"}}}
 	find := &state.Finding{ID: "f1", Severity: "blocking", Category: "correctness", Title: "bug",
 		Body: "details", FilePath: "internal/eval/eval.go", NewLine: &line, Status: "proposed",
 		ValidationError: "approximate location", EditedAt: 1700000001000}

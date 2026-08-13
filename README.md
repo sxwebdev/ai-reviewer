@@ -180,7 +180,7 @@ than tokens.
 make build   # build the binary
 make test    # go test -race ./...
 make lint    # golangci-lint
-make serve   # build and run the web UI
+make start   # build and run the web UI
 ```
 
 Architecture: `internal/{config,state,security,gitlab,git,index,llm,review,

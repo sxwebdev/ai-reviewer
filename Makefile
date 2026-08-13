@@ -9,7 +9,7 @@ LDFLAGS     := -s -w \
 	-X $(VERSION_PKG).Commit=$(COMMIT) \
 	-X $(VERSION_PKG).Date=$(DATE)
 
-.PHONY: build test lint run serve tidy fmt clean
+.PHONY: build test lint run start tidy fmt clean
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/$(BINARY)
@@ -32,7 +32,7 @@ tidy:
 run: build
 	./bin/$(BINARY) $(ARGS)
 
-serve: build
+start: build
 	./bin/$(BINARY) serve
 
 clean:

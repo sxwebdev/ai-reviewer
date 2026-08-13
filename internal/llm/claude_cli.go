@@ -193,7 +193,7 @@ func claudeErrHint(detail string) string {
 	case strings.Contains(detail, errMaxStructuredOutputRetries):
 		return "the model couldn't produce schema-valid output; the wrapper retries once without --json-schema — if it persists, try review.agent_mode: false"
 	case strings.Contains(detail, "model"):
-		return "check llm.model (use an alias like `opus`/`sonnet` or a full ID like `claude-opus-4-8`)"
+		return "check llm.model (use an alias like `opus`/`sonnet` or a full ID like `claude-opus-5`)"
 	default:
 		return ""
 	}

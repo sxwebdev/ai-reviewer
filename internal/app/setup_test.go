@@ -170,7 +170,7 @@ func TestApplyConfigValidatesAndSwaps(t *testing.T) {
 	old := a.Bundle()
 	res, err := a.ApplyConfig(t.Context(), map[string]string{
 		"review.pipeline.mode": "deep",
-		"llm.model":            "claude-opus-4-8",
+		"llm.model":            "claude-opus-5",
 		"review.max_comments":  "20",
 	})
 	if err != nil {
@@ -180,13 +180,13 @@ func TestApplyConfigValidatesAndSwaps(t *testing.T) {
 		t.Error("no restart-required field was changed")
 	}
 	cfg := a.Config()
-	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "claude-opus-4-8" || cfg.Review.MaxComments != 20 {
+	if cfg.Review.Pipeline.Mode != "deep" || cfg.LLM.Model != "claude-opus-5" || cfg.Review.MaxComments != 20 {
 		t.Errorf("settings not applied: mode %q model %q max %d", cfg.Review.Pipeline.Mode, cfg.LLM.Model, cfg.Review.MaxComments)
 	}
 	if a.Bundle() == old {
 		t.Error("bundle was not rebuilt")
 	}
-	if a.uiConfig().PipelineMode != "deep" || a.uiConfig().LLMModel != "claude-opus-4-8" {
+	if a.uiConfig().PipelineMode != "deep" || a.uiConfig().LLMModel != "claude-opus-5" {
 		t.Errorf("uiConfig stale: %+v", a.uiConfig())
 	}
 }
@@ -347,7 +347,7 @@ func TestApplyConfigEnvShadow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := a.ApplyConfig(t.Context(), map[string]string{"llm.model": "claude-opus-4-8"})
+	res, err := a.ApplyConfig(t.Context(), map[string]string{"llm.model": "claude-opus-5"})
 	if err != nil {
 		t.Fatalf("env-shadow should be a warning, not an error: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestApplyConfigEnvShadow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `model: "claude-opus-4-8"`) {
+	if !strings.Contains(string(raw), `model: "claude-opus-5"`) {
 		t.Error("chosen model not persisted to the file")
 	}
 }

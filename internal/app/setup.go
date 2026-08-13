@@ -516,7 +516,7 @@ func pipelineModes(cfg *config.Config) []string {
 // stockModels are the version-pinned models offered by the header switch. IDs
 // are passed verbatim to the claude CLI (--model); labels are display-only.
 var stockModels = []server.ModelChoice{
-	{ID: "claude-opus-4-8", Label: "Opus 4.8"},
+	{ID: "claude-opus-5", Label: "Opus 5"},
 	{ID: "claude-sonnet-5", Label: "Sonnet 5"},
 	{ID: "claude-haiku-4-5-20251001", Label: "Haiku 4.5"},
 	{ID: "claude-fable-5", Label: "Fable 5"},

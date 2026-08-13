@@ -13,7 +13,7 @@ make build          # build to bin/ai-reviewer (embeds version via -ldflags)
 make test           # go test -race ./...
 make lint           # golangci-lint run ./...
 make fmt            # gofmt -s -w .
-make serve          # build + run the local web UI
+make start          # build + run the local web UI
 
 go test -race ./internal/review/...           # one package
 go test -race -run TestValidate ./internal/review   # one test
