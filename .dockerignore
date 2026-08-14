@@ -1,0 +1,40 @@
+# Keep the build context to what `go build ./cmd/ai-reviewer` actually needs:
+# the module files, internal/, cmd/ and sql/ (migrations are embedded).
+
+# VCS and IDE state
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+# Build output and local artefacts
+bin/
+*.test
+*.out
+coverage*
+
+# Local configuration and secrets — these must never reach an image layer, not
+# even a discarded build stage.
+.env
+.env.*
+config.yaml
+config.*.yaml
+!config.example.yaml
+
+# Documentation, examples and local infrastructure: none of it is compiled, and
+# every byte here is a byte uploaded to the daemon on every build.
+docs/
+dev/
+assets/
+docker-compose.yml
+.env.example
+README.md
+CLAUDE.md
+LICENSE
+Dockerfile
+.dockerignore
+
+# Claude Code / agent scratch state
+.claude/
+CLAUDE.local.md

@@ -40,7 +40,7 @@
 | Собственная job-очередь в SQLite        | **River** (`riverqueue/river`) поверх Postgres: unique jobs, retries, leader |
 | Публикация и Slack — inline в потоке    | **Вся отложенная работа — джобы River** (`publish_review`, `slack_send`, …)  |
 | Web UI + ручное approve/reject/publish  | Automation-first: валидные findings публикуются автоматически                |
-| `serve` = локальный UI + воркер         | `serve` = production-сервис на `/mx` (health/metrics/graceful/ops)           |
+| `serve` = локальный UI + воркер         | `start` = production-сервис на `/mx` (health/metrics/graceful/ops)           |
 | watch-daemon по назначенным MR          | River periodic job `scan` + periodic job `digest` (09:00 / 16:30 MSK)        |
 | Токен в `config.yaml`                   | **YAML → env → Vault** (`xconfigvault`), тип `config.Secret`                 |
 | `log/slog` + redacting slog-handler     | **`mx/logger` (zap)** + redaction как `zapcore.Core`-обёртка                 |
@@ -99,8 +99,15 @@ binary/vendor/generated, scrubbing секретов; провайдер Claude C
 | `internal/index`    | FTS5-индексация worktree                                  | **Удалить**              | Зависела от SQLite FTS5; замена — поиск Claude Code               |
 | `internal/jobs`     | Своя durable-очередь в SQLite + scheduler + worker        | **Переписать**           | Заменяется River-воркерами (тот же путь пакета, новое содержимое) |
 | `internal/skills`   | Discovery Claude-скиллов для выбора в UI                  | **Удалить**              | Фича существует только ради per-review выбора в UI                |
-| `screenshots/`      | Промо-скриншоты web UI                                    | **Удалить**              | Продукта с UI больше нет                                          |
+| `screenshots/`      | ~~Промо-скриншоты web UI~~ → см. поправку ниже            | **Сохранить как `assets/`** | Это не скриншоты UI, а логотип приложения                      |
 | `internal/coverage` | Запуск тестов репозитория, LCOV/coverprofile              | **Сохранить, выключено** | Исполняет чужой код на общем хосте — см. §20.4                    |
+
+> **Поправка от 2026-08-14.** Строка про `screenshots/` в этой таблице была ошибкой в самом
+> плане: `promo.webp` — не скриншот web UI, а **логотип приложения** (гофер с лупой над
+> диффом), и он стоит `<img>`-ом в шапке README. К удалённому интерфейсу он отношения не
+> имеет и удалён быть не должен. Файл восстановлен, ссылка в README восстановлена, а
+> каталог переименован в `assets/` — имя `screenshots/` и было причиной, по которой его
+> удалили не глядя. В `.dockerignore` он исключён из контекста сборки, как `docs/`.
 
 ### 2.2 Файлы/функции внутри сохраняемых пакетов
 
@@ -166,7 +173,7 @@ sql/
   pgxgen.yaml        — конфигурация генерации моделей и репозиториев
 
 internal/
-  cli/          urfave/cli v3: serve, scan, review, digest, doctor, migrations
+  cli/          urfave/cli v3: start, scan, review, digest, doctor, migrations
   app/          composition root: конфиг → клиенты → сервисы → mx launcher
   config/       xconfig-схема (teams/gitlab/slack/llm/review/postgres/ops/log), Secret, Vault
   domain/       Snapshot, Team, классификаторы (чистый пакет, без I/O)
@@ -212,8 +219,31 @@ GitLab остаётся источником правды о самих MR (со
 ### 5.2 Схема (`sql/migrations`)
 
 Минимальная версия — **PostgreSQL 16**. Нативная `uuidv7()` появилась только в PG 18, поэтому
-функция создаётся отдельной миграцией (тот же приём, что `0000_uuidv7.up.sql` в `observe-ai`);
-на PG 18+ миграция становится no-op.
+функция создаётся шимом; на PG 18+ он становится no-op — `pg_catalog` просматривается раньше
+`search_path`, так что неквалифицированный `uuidv7()` связывается со встроенной функцией.
+
+> **Поправка от 2026-08-13 (по итогам реализации).** Заголовки `0000_uuidv7.up.sql`,
+> `0001_reviews.up.sql`, `0002_digest.up.sql` ниже — структура изложения, а **не** структура
+> файлов. Вся схема лежит в одной миграции `0001_init`: из промежуточных состояний ничего никогда
+> не разворачивалось, и дробление записало бы историю, которой не было. Всё последующее получает
+> собственную нумерованную пару (`make migratecreate`); `0001_init` после первого применения
+> где-либо править нельзя. Фактическая схема также содержит статус `abandoned` в `mr_reviews`,
+> колонку `publish_attempts` и индекс `mr_findings_unpublished_idx` — см.
+> `sql/migrations/0001_init.up.sql`.
+>
+> **Поправка от 2026-08-14.** `CHECK (status IN (…))` в схеме **нет** — ни в одной таблице.
+> Закрытые наборы значений живут в `internal/dbtypes` (`ReviewStatus`, `DigestRunStatus`,
+> `MessageStatus`): их `Value()` — тот самый метод, который pgx вызывает при кодировании
+> параметра, — отвергает всё остальное, а четыре обёртки в `internal/store` (`CreateReview`,
+> `CreateDigestRun`, `SetDigestRunStatus`, `CreateDigestMessage`) остаются единственным
+> параметризованным путём записи статуса. Литералы в `.sql` проверяет `TestSQLStatusLiterals`,
+> отсутствие обходных путей — `TestNoDirectStatusWrites`. Одно правило в одном месте вместо
+> двух, которые пришлось бы держать в согласии.
+>
+> Там же: `cost_usd numeric(12,6)` отображается в Go на `decimal.Decimal`
+> (`shopspring/decimal`), а не на `float64`. Регистрировать кодек в pgx не требуется — он
+> использует `driver.Valuer`/`sql.Scanner` самого типа. Сравнивать такие значения нужно
+> через `.Equal`, а не `==`.
 
 ```sql
 -- 0000_uuidv7.up.sql  — без неё DEFAULT uuidv7() падает на PG < 18
@@ -354,6 +384,22 @@ ai-reviewer migrations create  -p ./sql/migrations -name add_x
 
 В production миграции запускаются **init-контейнером**, не на старте приложения
 (иначе гонка реплик). Локально — `postgres.migrate_on_start: true`.
+
+> **Поправка от 2026-08-14.** Сделано наоборот: `postgres.migrate_on_start` включён
+> **по умолчанию**, и приложение накатывает на старте обе миграции — свою схему, затем
+> River. Отдельного init-контейнера и шага в CI больше нет ни в `docker-compose.yml`,
+> ни в деплойных артефактах.
+>
+> Опасение про гонку реплик снято реализацией, а не проигнорировано: `App.Migrate`
+> держит один session advisory lock **поверх обоих** миграторов (`rivermigrate` своего
+> не берёт), поэтому стартующие одновременно реплики выстраиваются в очередь, а все
+> кроме первой не находят ничего непримененного. Ровно этот лок и был написан ради
+> init-контейнера, который «запускается на каждый под, а не на каждый роллаут», —
+> то есть требуемая гарантия уже была, а init-контейнер добавлял к ней только
+> отдельный шаг развёртывания.
+>
+> `migrate_on_start: false` остаётся поддержанным для деплоев, где ворклоаду запрещено
+> менять схему; в манифесте под это лежит закомментированный init-контейнер.
 
 ---
 
@@ -638,15 +684,10 @@ llm:
       api_key: "" # env AI_REVIEWER_ANTHROPIC_API_KEY / Vault
     permission_mode: dontAsk
     agent_mode: true
+    # Поправка от 2026-08-13: см. §12.3 — grant'ы Bash(git …) не реализованы,
+    # они дают запись и чтение произвольных файлов. Фактический дефолт:
     allowed_tools:
-      [
-        Read,
-        Grep,
-        Glob,
-        "Bash(git diff *)",
-        "Bash(git log *)",
-        "Bash(git show *)",
-      ]
+      ["Read(${worktree}/**)", "Grep(${worktree}/**)", "Glob(${worktree}/**)"]
 
 review:
   scan_interval: 5m
@@ -1032,8 +1073,17 @@ MR → ephemeral mirror/fetch → worktree на head SHA (detached) → cwd дл
 `GIT_CONFIG_*`), токен не попадает ни в URL клона, ни в конфиг зеркала, ни в argv.
 Корень кэша переносится в `review.workdir` (по умолчанию `/work`).
 
-Права Claude: `permission_mode: dontAsk` + узкий `allowed_tools` (`Read`, `Grep`, `Glob`,
-`Bash(git diff *)`, `Bash(git log *)`, `Bash(git show *)`). Никаких `Edit`/`Write`/`git push`.
+Права Claude: `permission_mode: dontAsk` + узкий `allowed_tools`. Никаких `Edit`/`Write`/`git push`.
+
+> **Поправка от 2026-08-13 (по итогам ревью реализации).** Список выше — `Read`, `Grep`, `Glob`,
+> `Bash(git diff *)`, `Bash(git log *)`, `Bash(git show *)` — **не** реализуйте: правила allowlist
+> сравниваются по префиксу, а `git diff` принимает `--output=<путь>` (запись в произвольный файл,
+> воспроизведено — файл создан при `permission_denials: []`) и `--no-index /etc/passwd /dev/null`
+> (чтение произвольного файла в обход любого ограничения пути на `Read`). `git show`/`git log`
+> принимают те же опции диффа. Фактический дефолт — только read-инструменты, ограниченные worktree:
+> `Read(${worktree}/**)`, `Grep(${worktree}/**)`, `Glob(${worktree}/**)`; см.
+> `internal/config/config.go` и `internal/llm/tools.go`. История и интердифф и так доходят до модели
+> через промпт, собранный Go из зеркала.
 Публикация в GitLab — исключительно Go-кодом после валидации.
 
 ### 12.4 Диагностика
@@ -1233,7 +1283,7 @@ river_job_retries_total{kind}
 ## 15. CLI
 
 ```bash
-ai-reviewer serve                              # production: mx lifecycle, ops, River (все воркеры)
+ai-reviewer start                              # production: mx lifecycle, ops, River (все воркеры)
 ai-reviewer scan   [--team <name>]             # поставить джобу scan
 ai-reviewer digest [--team <name>] [--force]   # поставить джобу digest
 ai-reviewer review <ref> [--publish] [--wait]  # поставить джобу review для одного MR
@@ -1242,11 +1292,17 @@ ai-reviewer doctor                             # диагностика
 ai-reviewer migrations up|down|create          # миграции (app + River)
 ```
 
+> **Поправка от 2026-08-14.** Команда называется `start`, а не `serve`. Алиаса `serve` нет
+> намеренно: сервис нигде не развёрнут, обратная совместимость никого не защищает, а два
+> имени одной команды пришлось бы синхронно держать в Dockerfile, k8s-манифесте, Makefile и
+> документации. В строке 43 выше `serve` слева — это команда *старого* персонального
+> инструмента, и она там так и остаётся.
+
 `<ref>` сохраняет форматы `internal/gitlab/ref.go` (тесты остаются): полный URL MR,
 `group/subgroup/repo!123`, `project-id:iid`.
 
 **CLI ставит джобы, а не делает работу.** `scan`, `digest`, `review` вставляют соответствующую
-River-джобу и печатают её id; выполняет её работающий `serve`. `--wait` опрашивает джобу
+River-джобу и печатают её id; выполняет её работающий `start`. `--wait` опрашивает джобу
 (`client.JobGet`) до терминального состояния и печатает отчёт.
 
 **`--publish` живёт в аргументах джобы, а не в конфиге процесса.** Иначе флаг было бы
@@ -1278,6 +1334,12 @@ SHA, ручная вставка схлопнулась бы в no-op по uniqu
 Удаляются: `sync`, `daemon`, алиас `start`, `--auto-review/--auto-draft/--auto-publish`,
 `--open`, `--foreground`, проверки SQLite/FTS5 в doctor.
 
+> **Поправка от 2026-08-14.** Имя `start` удалено вместе с персональным алиасом, но затем
+> переиспользовано: так теперь называется production-процесс (бывший `serve`). Наследник у
+> имени другой — вместо локального watch-демона это mx-лайфцикл с River и ops-сервером.
+> `sync` и `daemon` преемников не имеют и остаются удалёнными; это проверяет
+> `TestCommandTreeCoversThePlan`.
+
 **Новый doctor**: конфиг (все правила §7.3); Postgres (коннект + применённость миграций +
 таблицы River); GitLab connectivity/auth (`GET /user`) и доступность GraphQL; доступность каждого
 сконфигурированного repository (`GET /projects/:key`, параллельно, с указанием нерезолвнутых);
@@ -1290,6 +1352,14 @@ Slack `auth.test` + членство бота в каждом канале; та
 ---
 
 ## 16. Docker / Kubernetes
+
+> **Поправка от 2026-08-14.** Kubernetes-манифеста в репозитории нет и быть не должно:
+> топология развёртывания принадлежит тому, кто разворачивает. Так же удалён вендоренный
+> apk-ключ — ключ забирается при сборке. И версия Claude Code больше не пиннится: образ
+> ставит текущую, то есть пересборка и есть способ обновить агента. Плата названа явно —
+> две сборки одного коммита могут получить разных агентов, а `claude --version` внутри
+> контейнера остаётся единственным свидетельством, какой именно приехал.
+
 
 ### 16.1 Dockerfile
 
@@ -1315,7 +1385,7 @@ COPY --from=build /out/ai-reviewer /usr/local/bin/ai-reviewer
 USER app
 WORKDIR /work
 ENTRYPOINT ["ai-reviewer"]
-CMD ["serve"]
+# без CMD: команду называет вызывающий (в compose — `command: ["start"]`)
 ```
 
 Детали по актуальной документации Claude Code: на musl нужны `bash`, `curl`, `libgcc`,
@@ -1334,7 +1404,7 @@ docker run --rm \
   -e AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN=... \   # либо AI_REVIEWER_ANTHROPIC_API_KEY
   -e AI_REVIEWER_POSTGRES_HOST=... -e AI_REVIEWER_POSTGRES_PASSWORD=... \
   -v $PWD/config.yaml:/etc/ai-reviewer/config.yaml:ro \
-  ai-reviewer:latest serve --config /etc/ai-reviewer/config.yaml
+  ai-reviewer:latest start --config /etc/ai-reviewer/config.yaml
 ```
 
 Имена переменных — это префикс `AI_REVIEWER_` плюс значение тега `env:` соответствующего
@@ -1551,8 +1621,8 @@ Slack — слой уведомлений, а не хранилище состо
 | 7    | `internal/service/review.go`: снапшот → pipeline → БД; publisher как отдельная идемпотентная операция                                                             | `service/review_test.go` + тесты publish на fake GitLab                  |
 | 8    | `internal/slack` + `internal/match` + `internal/service/digest.go` (сборка payload в `digest_messages`, без отправки)                                             | `httptest`-тесты Slack, matcher                                          |
 | 9    | `internal/jobs` на River: `scan`/`review`/`publish_review`/`digest`/`slack_send`/`cleanup` + `internal/scheduler/daily.go` + `internal/metrics` | тесты Daily, unique-джоб и идемпотентности `slack_send`/`publish_review` |
-| 10   | `internal/app` + mx launcher; `internal/cli`: serve/scan/review/digest/doctor/migrations (CLI ставит джобы, `--wait`/`--local`)                                   | ручной прогон всех команд                                                |
-| 11   | Dockerfile, docker-compose (postgres), k8s-пример, README, CLAUDE.md                                                                                              | сборка образа, `claude --version` внутри                                 |
+| 10   | `internal/app` + mx launcher; `internal/cli`: start/scan/review/digest/doctor/migrations (CLI ставит джобы, `--wait`/`--local`)                                   | ручной прогон всех команд                                                |
+| 11   | Dockerfile, docker-compose, README, CLAUDE.md                                                                                                                   | сборка образа, `claude --version` внутри                                 |
 | 12   | Финальная зачистка: dead code, grep-проверки, `make fmt test lint build`                                                                                          | все команды зелёные                                                      |
 
 ---

@@ -1,13 +1,17 @@
 package git
 
 import (
-	"io"
-	"log/slog"
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 func gitRun(t *testing.T, dir string, args ...string) string {
@@ -36,7 +40,7 @@ func initSourceRepo(t *testing.T) (dir, sha string) {
 }
 
 func testCache(t *testing.T) *Cache {
-	return NewCache(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewCache(t.TempDir(), discardLog())
 }
 
 func TestEnsureMirrorAndWorktree(t *testing.T) {
@@ -74,6 +78,165 @@ func TestEnsureMirrorAndWorktree(t *testing.T) {
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Errorf("worktree should be removed after cleanup, stat err=%v", err)
 	}
+}
+
+// concurrentMirrorFetches is the size of the reviewer's reproduction: 6
+// simultaneous fetches of one mirror whose remote had advanced failed 5 times
+// out of 6, in every one of 12 rounds.
+const concurrentMirrorFetches = 6
+
+// TestEnsureMirrorSerializesConcurrentFetches is the regression for the
+// measured failure. One scan enqueues a review per candidate MR of a
+// repository, so N reviews of one project reach EnsureMirror within
+// milliseconds of each other; without exclusion `git fetch` loses the race on
+// the ref it is updating ("cannot lock ref … is at X but expected Y") and the
+// losers silently drop to a diff-only review.
+func TestEnsureMirrorSerializesConcurrentFetches(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src, _ := initSourceRepo(t)
+	c := testCache(t)
+	ctx := t.Context()
+
+	// Warm the mirror, then advance the remote so every fetch below really has a
+	// ref to move — an up-to-date fetch writes nothing and cannot collide.
+	if _, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", ""); err != nil {
+		t.Fatalf("warm the mirror: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte("package main\n\nfunc main() { println(2) }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, src, "commit", "-aqm", "advance")
+
+	start := make(chan struct{})
+	errs := make(chan error, concurrentMirrorFetches)
+	var wg sync.WaitGroup
+	for range concurrentMirrorFetches {
+		wg.Go(func() {
+			<-start
+			_, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", "")
+			errs <- err
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	failed := 0
+	for err := range errs {
+		if err != nil {
+			failed++
+			t.Errorf("concurrent EnsureMirror failed: %v", err)
+		}
+	}
+	if failed > 0 {
+		t.Fatalf("%d of %d concurrent fetches failed; the mirror is not serialized", failed, concurrentMirrorFetches)
+	}
+}
+
+// TestEnsureMirrorSerializesTheColdClone covers the other half: the cold path
+// is a TOCTOU between the Stat and the clone, and the loser of the race sees
+// "destination path already exists and is not an empty directory" — then
+// proceeds against a mirror that is still being populated.
+func TestEnsureMirrorSerializesTheColdClone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src, _ := initSourceRepo(t)
+	c := testCache(t)
+	ctx := t.Context()
+
+	start := make(chan struct{})
+	errs := make(chan error, concurrentMirrorFetches)
+	var wg sync.WaitGroup
+	for range concurrentMirrorFetches {
+		wg.Go(func() {
+			<-start
+			_, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", "")
+			errs <- err
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent cold clone failed: %v", err)
+		}
+	}
+}
+
+// TestCacheTakesTheInjectedLockerPerRepository pins the seam the composition
+// root wires: the in-process semaphore only covers one replica, so a shared
+// workdir needs the cross-process lock too — and it must be keyed on the
+// repository, not on anything narrower.
+func TestCacheTakesTheInjectedLockerPerRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src, sha := initSourceRepo(t)
+	lk := &recordingLocker{}
+	c := NewCache(t.TempDir(), discardLog(), WithLocker(lk))
+	ctx := t.Context()
+
+	if _, err := c.EnsureMirror(ctx, src, "https://gitlab.test", "group/repo", ""); err != nil {
+		t.Fatalf("mirror: %v", err)
+	}
+	if _, cleanup, err := c.AddWorktree(ctx, "https://gitlab.test", "group/repo", sha); err != nil {
+		t.Fatalf("worktree: %v", err)
+	} else {
+		cleanup()
+	}
+
+	const want = "git-mirror:gitlab.test/group/repo"
+	if len(lk.keys) < 2 {
+		t.Fatalf("the locker was taken %d time(s): %q; mirror and worktree operations must both take it", len(lk.keys), lk.keys)
+	}
+	for _, k := range lk.keys {
+		if k != want {
+			t.Errorf("locked %q, want %q — the key must identify the repository", k, want)
+		}
+	}
+	if lk.held.Load() != 0 {
+		t.Errorf("%d lock(s) were never released", lk.held.Load())
+	}
+}
+
+// TestEnsureMirrorRespectsContextWhileQueued proves the wait is cancellable: a
+// review whose deadline expires behind another review's fetch must return, not
+// occupy a worker slot until the fetch finishes.
+func TestEnsureMirrorRespectsContextWhileQueued(t *testing.T) {
+	c := NewCache(t.TempDir(), discardLog())
+
+	// Hold the repository lock, then try to take it with a cancelled context.
+	unlock, err := c.lockRepo(t.Context(), "https://gitlab.test", "group/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := c.EnsureMirror(ctx, "https://example.invalid/x.git", "https://gitlab.test", "group/repo", ""); !errors.Is(err, context.Canceled) {
+		t.Errorf("EnsureMirror err = %v, want context.Canceled", err)
+	}
+}
+
+// recordingLocker is a Locker that records the keys it was asked for.
+type recordingLocker struct {
+	mu   sync.Mutex
+	keys []string
+	held atomic.Int64
+}
+
+func (l *recordingLocker) Lock(_ context.Context, key string) (func(), error) {
+	l.mu.Lock()
+	l.keys = append(l.keys, key)
+	l.mu.Unlock()
+	l.held.Add(1)
+	return func() { l.held.Add(-1) }, nil
 }
 
 func TestDiffRange(t *testing.T) {
@@ -200,4 +363,13 @@ func TestSanitizeHost(t *testing.T) {
 	if got := sanitizeHost("https://gitlab.example.com/"); got != "gitlab.example.com" {
 		t.Errorf("sanitizeHost = %q", got)
 	}
+}
+
+// discardLog is a logger that emits nothing below fatal, so test output stays
+// clean while the code under test keeps a non-nil logger.
+func discardLog() logger.Logger {
+	return logger.New(logger.WithConfig(logger.Config{
+		Level:  logger.LogLevelFatal,
+		Format: logger.LoggerFormatJSON,
+	}))
 }

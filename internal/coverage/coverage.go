@@ -4,9 +4,9 @@
 // diff's added lines. The result is a fact — "these added lines are not
 // executed by any test" — replacing LLM guesses about missing tests.
 //
-// The package depends only on internal/toolchain and the standard library;
-// callers hand it plain data (changed files, added line numbers) so it never
-// imports review/state/gitlab.
+// The package depends only on internal/toolchain, internal/security and the
+// standard library; callers hand it plain data (changed files, added line
+// numbers) so it never imports review/state/gitlab.
 package coverage
 
 import (
@@ -15,6 +15,8 @@ import (
 	"os/exec"
 	"sort"
 	"time"
+
+	"github.com/sxwebdev/ai-reviewer/internal/security"
 )
 
 // FileProfile is per-line coverage for one file. A line PRESENT in Hits is an
@@ -30,14 +32,21 @@ type Profile map[string]*FileProfile
 
 // Runner abstracts command execution so provider tests never need real
 // toolchains. dir is the working directory; env entries are appended to the
-// inherited environment.
+// filtered environment ExecRunner builds.
 type Runner func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error)
 
 // ExecRunner is the production Runner.
+//
+// The environment is an allowlist, not os.Environ(): this package runs the
+// repository's own tests and, with coverage.node.install, its package manager's
+// lifecycle scripts. That is attacker-supplied code executing inside a process
+// tree whose parent holds the service's GitLab PAT, Slack token and Postgres
+// password. security.ToolchainEnv keeps the build and cache settings a
+// toolchain needs and leaves the credentials behind.
 func ExecRunner(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(security.ToolchainEnv(os.Environ()), env...)
 	return cmd.CombinedOutput()
 }
 

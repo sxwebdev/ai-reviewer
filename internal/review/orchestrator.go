@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/tkcrm/mx/logger"
 )
 
 // ReviewInput is everything the engine needs to review one MR at a head sha.
@@ -46,9 +46,6 @@ type ReviewInput struct {
 	// re-review focuses on the interdiff and honours prior dispositions.
 	PriorReview *PriorReview
 
-	// RelatedFiles are FTS-suggested investigation leads (agent mode).
-	RelatedFiles []RelatedFile
-
 	// Risk is the deterministic risk assessment (nil when disabled); it points
 	// the passes at hot spots and is persisted alongside the review.
 	Risk *RiskReport
@@ -57,21 +54,11 @@ type ReviewInput struct {
 	// opt-in measurement did not run); facts for the passes and the skeptic.
 	Coverage *coverage.Report
 
-	Memory  []MemoryRule
 	Profile *Profile
 
 	ExistingFingerprints map[string]bool
 	PipelineStatus       string
 	ExistingDiscussions  int
-
-	// UserContext is free-form reviewer-supplied context typed at run time. It is
-	// rendered verbatim into a dedicated prompt section (it is the user's own
-	// input to their own LLM, so it is not scrubbed; it is not written to logs).
-	UserContext string
-
-	// Skills are Claude skill names the reviewer selected for this run. They are
-	// named in the prompt and enabled on the CLI (agent mode only).
-	Skills []string
 
 	// Agent mode.
 	WorkDir      string
@@ -102,11 +89,11 @@ type Result struct {
 // Engine runs the LLM review pipeline.
 type Engine struct {
 	client llm.Client
-	log    *slog.Logger
+	log    logger.Logger
 }
 
 // NewEngine builds an Engine.
-func NewEngine(client llm.Client, log *slog.Logger) *Engine {
+func NewEngine(client llm.Client, log logger.Logger) *Engine {
 	return &Engine{client: client, log: log}
 }
 
@@ -154,7 +141,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 			r, cost, err := e.checkCompleteness(complCtx, in)
 			complCost, complDur, complErr = cost, time.Since(start), err
 			if err != nil {
-				e.log.Warn("completeness audit failed", "err", err)
+				e.log.Warnw("completeness audit failed", "err", err)
 			} else {
 				completeness = r
 			}
@@ -180,7 +167,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		start := time.Now()
 		reflected, reflectCost, err := e.selfReflect(ctx, in, merged)
 		if err != nil {
-			e.log.Warn("self-reflection failed; keeping original findings", "err", err)
+			e.log.Warnw("self-reflection failed; keeping original findings", "err", err)
 		} else {
 			merged = applyReflect(merged, reflected, e.log)
 		}
@@ -246,7 +233,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		reports = append(reports, rep)
 	}
 
-	e.log.Info("review complete",
+	e.log.Infow("review complete",
 		"passes", len(specs), "raw_findings", len(merged.Findings), "validated", len(findings),
 		"risk", merged.RiskLevel, "cost_usd", merged.CostUSD)
 
@@ -269,7 +256,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 //     add — post findings whose file+title key was not in the pre-reflect set
 //     (hallucinated additions, reworded titles) are dropped in Go, not trusted
 //     to the prompt instruction.
-func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewResponse {
+func applyReflect(pre, post *llm.ReviewResponse, log logger.Logger) *llm.ReviewResponse {
 	key := func(f llm.Finding) string {
 		return strings.ToLower(strings.TrimSpace(f.FilePath)) + "\x00" + normalizeTitle(f.Title)
 	}
@@ -288,7 +275,7 @@ func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewRe
 	for _, f := range post.Findings {
 		k := key(f)
 		if !preKeys[k] {
-			log.Warn("self-reflection added a new finding; dropping (verification may only remove or demote)",
+			log.Warnw("self-reflection added a new finding; dropping (verification may only remove or demote)",
 				"file", f.FilePath, "title", f.Title)
 			continue
 		}
@@ -304,7 +291,7 @@ func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewRe
 		if SeverityRank(NormalizeSeverity(f.Severity)) < SeverityRank("blocking") || postKeys[key(f)] {
 			continue
 		}
-		log.Warn("self-reflection removed a blocking finding; restoring demoted for human check",
+		log.Warnw("self-reflection removed a blocking finding; restoring demoted for human check",
 			"file", f.FilePath, "title", f.Title)
 		f.Confidence = min(f.Confidence, 0.5)
 		f.RequiresHumanCheck = true

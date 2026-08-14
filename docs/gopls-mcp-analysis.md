@@ -63,11 +63,20 @@ gopls в роли MCP-сервера делает ровно то, что дел
 
 Кратко, по результатам разбора кода (ссылки — на реальные места):
 
-- **Agent-mode = ФС-доступ к read-only worktree на head SHA.** `claude` запускается с `cmd.Dir = worktree` и фиксированным списком read-only tools: `Read, Grep, Glob, Bash(git diff/log/show *)` — см. [claude_cli.go:103-117](internal/llm/claude_cli.go#L103-L117), дефолты в [internal/config/config.go](internal/config/config.go). MCP **нигде не используется** (репозиторный grep по `mcp` — 0 совпадений).
-- **Investigation-протокол**: [prompts.go](internal/review/prompts.go) (`writeInvestigationSection`) прямо инструктирует агента _«grep'ай вызывающих изменённых экспортируемых символов, проверяй интерфейсы/контракты, читай полный файл»_. Это ровно те задачи, где семантика gopls бьёт grep.
-- **Related files** подбираются FTS-эвристикой: [internal/service/context.go](internal/service/context.go) (`findRelatedFiles`) строит BM25 OR-запрос по частым идентификаторам из изменённых строк. Лексика, не семантика.
-- **Skeptic** ([internal/review/skeptic.go](internal/review/skeptic.go)) — agent-mode вызов, который пытается **опровергнуть** находки, читая реальный код worktree (`Read/Grep/Glob/git`). Это главный кандидат на усиление семантикой.
-- **Verifier-плагины** ([verifier_go_build.go](internal/review/verifier_go_build.go), [verifier_go_vet.go](internal/review/verifier_go_vet.go), [verifier_gotest.go](internal/review/verifier_gotest.go)) детерминированно запускают Go-тулчейн и могут **снимать** ложные claim'ы о невозможности компиляции (`go_build` → `VerdictDrop` на чистой сборке). Это детерминированный слой, не LLM.
+- **Agent-mode = ФС-доступ к read-only worktree на head SHA.** `claude` запускается с `cmd.Dir = worktree` и настраиваемым списком read-only tools — см. [claude_cli.go](../internal/llm/claude_cli.go), дефолты в [internal/config/config.go](../internal/config/config.go). MCP **нигде не используется** (репозиторный grep по `mcp` — 0 совпадений).
+
+  > **Поправка (2026-08-13).** На момент написания список был
+  > `Read, Grep, Glob, Bash(git diff/log/show *)` — без ограничения пути у трёх первых правил
+  > и с `Bash(git …)`, которое из-за префиксного сопоставления давало запись
+  > (`git diff --output=<path>`) и чтение любого файла (`git diff --no-index`). Текущий дефолт —
+  > `Read(${worktree}/**)`, `Grep(${worktree}/**)`, `Glob(${worktree}/**)`, без `Bash`:
+  > worktree стал границей, а не просто рабочей директорией. Для оценки MCP это ничего не меняет
+  > (сервер gopls был бы отдельным tool-каналом), но упоминания `git`-инструментов ниже по тексту
+  > читать с этой поправкой.
+- **Investigation-протокол**: [prompts.go](../internal/review/prompts.go) (`writeInvestigationSection`) прямо инструктирует агента _«grep'ай вызывающих изменённых экспортируемых символов, проверяй интерфейсы/контракты, читай полный файл»_. Это ровно те задачи, где семантика gopls бьёт grep.
+- **Related files** подбираются FTS-эвристикой: [internal/service/context.go](../internal/service/context.go) (`findRelatedFiles`) строит BM25 OR-запрос по частым идентификаторам из изменённых строк. Лексика, не семантика.
+- **Skeptic** ([internal/review/skeptic.go](../internal/review/skeptic.go)) — agent-mode вызов, который пытается **опровергнуть** находки, читая реальный код worktree (`Read/Grep/Glob/git`). Это главный кандидат на усиление семантикой.
+- **Verifier-плагины** ([verifier_go_build.go](../internal/review/verifier_go_build.go), [verifier_go_vet.go](../internal/review/verifier_go_vet.go), [verifier_gotest.go](../internal/review/verifier_gotest.go)) детерминированно запускают Go-тулчейн и могут **снимать** ложные claim'ы о невозможности компиляции (`go_build` → `VerdictDrop` на чистой сборке). Это детерминированный слой, не LLM.
 - **Quality reports** (риск, completeness, coverage) — репорты, а не находки на строках; персистятся как `reviews.*_json`. Естественное место для нового vulncheck-репорта.
 - **Инварианты** (CLAUDE.md): Go владеет валидацией и позициями (не модель); верификаторы по умолчанию **не исполняют код репозитория**; всё, что исполняет код или ходит в сеть, — **явный opt-in**; никаких правок MR; localhost-only.
 
@@ -97,13 +106,13 @@ gopls-инструменты добавляются в allow-list `claude` (`mcp
 
 - **Проблема сейчас**: investigation-протокол просит агента `grep` вызывающих. Grep лексический: пропускает алиас-импорты (`import f "…/foo"`), dot-import, ловит одноимённые символы из других пакетов, совпадения в строках/комментариях. Для вопроса «изменённая сигнатура/поведение экспортируемой функции сломает вызывающих?» это источник и ложных срабатываний, и пропусков.
 - **С gopls**: `go_symbol_references({file, name})` возвращает типизированные ссылки по всему воркспейсу (включая `lib.Bar` из импортируемого пакета). Прямо усиливает correctness/contracts-проходы и skeptic.
-- **Где**: [prompts.go](internal/review/prompts.go) `writeInvestigationSection` (сменить формулировку с «grep callers» на «используй `go_symbol_references` для Go-символов»), доступно в проходах и в [skeptic.go](internal/review/skeptic.go).
+- **Где**: [prompts.go](../internal/review/prompts.go) `writeInvestigationSection` (сменить формулировку с «grep callers» на «используй `go_symbol_references` для Go-символов»), доступно в проходах и в [skeptic.go](../internal/review/skeptic.go).
 
 ### 6.2. `go_diagnostics` → усиление детерминированного верификатора ⭐ (высокая)
 
 - **Проблема сейчас**: `go_build` verifier ловит только claim'ы о невозможности компиляции и запускает полный `go build`/`go test -c` на каждый такой claim (кэш по пакету, таймаут 120с). `go_vet` — отдельный запуск.
 - **С gopls**: `go_diagnostics` отдаёт ошибки парсинга/сборки + анализаторов из резидентного language server — быстрее (инкрементально, один прогрев воркспейса на все запросы) и богаче (набор анализаторов gopls шире, чем `go vet`). Два применения:
-  - **5B (детерминированно)**: новый верификатор `gopls_diagnostics` — на чистой диагностике снимать ложные compile-claim'ы (как `go_build`), а реальные диагностики файла — аннотировать (как `go_vet`). Уровень доверия — как у `go_build`/`go_vet` (type-check, без исполнения тестов) → **можно в дефолтный безопасный tier**, с той же оговоркой «любой сбой окружения ⇒ Keep», что уже есть в [verifier.go](internal/review/verifier.go).
+  - **5B (детерминированно)**: новый верификатор `gopls_diagnostics` — на чистой диагностике снимать ложные compile-claim'ы (как `go_build`), а реальные диагностики файла — аннотировать (как `go_vet`). Уровень доверия — как у `go_build`/`go_vet` (type-check, без исполнения тестов) → **можно в дефолтный безопасный tier**, с той же оговоркой «любой сбой окружения ⇒ Keep», что уже есть в [verifier.go](../internal/review/verifier.go).
   - **5A (агентом)**: skeptic может подтверждать/опровергать баг-claim'ы, спрашивая `go_diagnostics` по файлу, вместо запуска `go build` вручную.
 - **Тонкость доверия**: gopls type-check запускает `go list`/загрузку пакетов; это не исполнение бизнес-кода репозитория (в отличие от `go_test`), но с cgo/`//go:generate` в общем случае граница тоньше — стоит подтвердить эмпирически (§10). По умолчанию — тот же tier, что `go_build`.
 
@@ -115,12 +124,12 @@ gopls-инструменты добавляются в allow-list `claude` (`mcp
 
 ### 6.4. `go_package_api` → компактный контекст контрактов/зависимостей (средняя–высокая)
 
-- **Проблема сейчас**: чтобы понять API вызываемого пакета (свой монорепный или сторонний), агент читает целые файлы; бюджет full-file ограничен ([context.go](internal/review/context.go) `ContextBudget`, 256 КБ).
+- **Проблема сейчас**: чтобы понять API вызываемого пакета (свой монорепный или сторонний), агент читает целые файлы; бюджет full-file ограничен ([context.go](../internal/review/context.go) `ContextBudget`, 256 КБ).
 - **С gopls**: `go_package_api({packagePaths})` — компактное резюме экспортируемого API + doc-комментарии. Токен-эффективнее полного файла и точнее для вопроса «правильно ли дифф использует эту функцию/сигнатуру?». Снимает давление на full-file-бюджет и помогает проходу «contracts».
 
 ### 6.5. `go_file_context` / `go_search` → семантическая замена FTS «related files» (средняя)
 
-- **Проблема сейчас**: [findRelatedFiles](internal/service/context.go) — BM25 по совпадению идентификаторов (лексика). Даёт «шумные» лиды.
+- **Проблема сейчас**: [findRelatedFiles](../internal/service/context.go) — BM25 по совпадению идентификаторов (лексика). Даёт «шумные» лиды.
 - **С gopls**: `go_file_context` — _реальные_ межфайловые зависимости внутри пакета; `go_search` — fuzzy-поиск символа по воркспейсу+зависимостям. Семантически точнее.
 - **Важная оговорка**: FTS остаётся нужен — ревьюер **полиглотный** (в проекте есть `py_syntax`, `tsc` верификаторы). gopls помогает только Go-файлам. То есть это дополнение для Go-диффов, не замена FTS вообще.
 
@@ -138,7 +147,7 @@ gopls-инструменты добавляются в allow-list `claude` (`mcp
 Каждое ревью — свежий worktree на head SHA. gopls (detached) на первый tool-call делает **холодный type-check всего модуля** — секунды на среднем репо, до минут и много памяти на большом монорепо. Пайплайн же делает **fan-out**: 5 проходов + батчи skeptic + completeness → десятки процессов `claude`.
 
 - **Наивно (detached, per-claude-call)**: `claude` спавнит свой `gopls mcp` (stdio, cwd=worktree) на каждый вызов → **N холодных type-check'ов одного head SHA**. Дорого.
-- **Лучше (serve, один на worktree)**: ai-reviewer сам поднимает **один** `gopls serve -mcp.listen=localhost:PORT` на worktree (жизненный цикл — рядом с cleanup в [internal/git/repo_cache.go](internal/git/repo_cache.go)), прогревает и отдаёт всем проходам **один HTTP MCP-endpoint**. Все проходы делят тёплый кэш type-check. Это и есть неочевидная причина, по которой attached/serve-режим полезен нам — **не** ради буферов, а ради **амортизации прогрева между параллельными проходами**. Localhost-сокет вписывается в localhost-only-постуру проекта.
+- **Лучше (serve, один на worktree)**: ai-reviewer сам поднимает **один** `gopls serve -mcp.listen=localhost:PORT` на worktree (жизненный цикл — рядом с cleanup в [internal/git/repo_cache.go](../internal/git/repo_cache.go)), прогревает и отдаёт всем проходам **один HTTP MCP-endpoint**. Все проходы делят тёплый кэш type-check. Это и есть неочевидная причина, по которой attached/serve-режим полезен нам — **не** ради буферов, а ради **амортизации прогрева между параллельными проходами**. Localhost-сокет вписывается в localhost-only-постуру проекта.
 - **Гейтинг**: включать gopls только если дифф трогает `.go` (для не-Go MR не платить прогрев вообще).
 
 ### 7-B. Модель доверия / инвариант «верификаторы не исполняют код по умолчанию»
@@ -178,15 +187,15 @@ gopls помогает только Go. Не-Go MR (Python/TS/прочее) ни
 `review.vulncheck.enabled` (по умолчанию off, как coverage). Гейт: дифф трогает `.go`/`go.mod`. Запуск `govulncheck`/`go_vulncheck` по worktree, результат → `reviews.vulncheck_json`, показ в UI рядом с risk/completeness/coverage. Не зависит от LLM, не трогает инварианты находок. Самый чистый первый шаг.
 
 **Этап 2 — `gopls_diagnostics` верификатор (5B, высокая отдача).**
-Новый верификатор в [internal/review/verifier\*.go](internal/review/verifier.go): на чистой gopls-диагностике снимать ложные compile-claim'ы (как `go_build`), реальные диагностики файла — аннотировать (как `go_vet`). Уровень доверия — дефолтный безопасный tier (сначала подтвердить границу type-check vs исполнение, §10). Может со временем заменить/дополнить `go_build`+`go_vet` одним быстрым резидентным источником.
+Новый верификатор в [internal/review/verifier\*.go](../internal/review/verifier.go): на чистой gopls-диагностике снимать ложные compile-claim'ы (как `go_build`), реальные диагностики файла — аннотировать (как `go_vet`). Уровень доверия — дефолтный безопасный tier (сначала подтвердить границу type-check vs исполнение, §10). Может со временем заменить/дополнить `go_build`+`go_vet` одним быстрым резидентным источником.
 
 **Этап 3 — Agent-facing MCP для проверочных проходов (5A, наибольший потолок, дороже).**
-Включить безопасное read-подмножество gopls-tools в allow-list **только** для skeptic ([skeptic.go](internal/review/skeptic.go)) и, опционально, contracts-прохода — там, где семантическая точность важнее всего, а число вызовов меньше, чем полный fan-out. Модель процессов — **serve-на-worktree** (§7-A). Обновить investigation-протокол в [prompts.go](internal/review/prompts.go): «для Go-символов используй `go_symbol_references`/`go_package_api` вместо grep». Гейт по `.go`.
+Включить безопасное read-подмножество gopls-tools в allow-list **только** для skeptic ([skeptic.go](../internal/review/skeptic.go)) и, опционально, contracts-прохода — там, где семантическая точность важнее всего, а число вызовов меньше, чем полный fan-out. Модель процессов — **serve-на-worktree** (§7-A). Обновить investigation-протокол в [prompts.go](../internal/review/prompts.go): «для Go-символов используй `go_symbol_references`/`go_package_api` вместо grep». Гейт по `.go`.
 
 **Этап 4 (опционально) — расширить 5A на все проходы.**
 Только если измерения (§10) покажут, что serve-амортизация делает стоимость приемлемой. Заменить FTS-related-files на `go_file_context`/`go_search` для Go-файлов, оставив FTS для не-Go.
 
-Интеграционная точка для 5A уже понятна: рядом с `--allowedTools` в [claude_cli.go:103-117](internal/llm/claude_cli.go#L103-L117) добавить `--mcp-config <inline-json>` (+ при желании `--strict-mcp-config`), новое поле в `ClaudeConfig`/`ClaudeOptions`. Флаги `--mcp-config`/`--strict-mcp-config` в установленном `claude` CLI **подтверждены** (`claude --help`).
+Интеграционная точка для 5A уже понятна: рядом с `--allowedTools` в [claude_cli.go:103-117](../internal/llm/claude_cli.go#L103-L117) добавить `--mcp-config <inline-json>` (+ при желании `--strict-mcp-config`), новое поле в `ClaudeConfig`/`ClaudeOptions`. Флаги `--mcp-config`/`--strict-mcp-config` в установленном `claude` CLI **подтверждены** (`claude --help`).
 
 ---
 
@@ -244,7 +253,7 @@ symgraph — компилируемый Rust MCP-сервер, который с
 Там, где **агрегация гасит неточность** и не нужна пер-ребёрная корректность — это репорты, не находки на строке:
 
 - **Полиглотные hotspot/coupling-репорты**: `churn` (волатильность), `coupling-score`, `god-struct`, `module-graph` (fan-in/out, циклы), `dispatch-sites`. Ложатся на существующий паттерн **quality reports** (рядом с детерминированным `ComputeRisk`) — и, в отличие от gopls-диагностики, работают для **не-Go** MR. Ранжирование по имени терпимо к схлопыванию имён (оно усредняется).
-- **Быстрый символьный поиск/навигация как замена/дополнение FTS** ([findRelatedFiles](internal/service/context.go)) для языков, где нет LSP: `search` (FTS5 + семантический bm25) и `file` (символы файла) — лиды для агента, не истина.
+- **Быстрый символьный поиск/навигация как замена/дополнение FTS** ([findRelatedFiles](../internal/service/context.go)) для языков, где нет LSP: `search` (FTS5 + семантический bm25) и `file` (символы файла) — лиды для агента, не истина.
 - Как **эксперимент** для не-Go языков — там, где сейчас у агента вообще только grep, даже неточный граф расширяет охват (но подавать как «возможно связано», с той же оговоркой о низкой уверенности).
 
 ### 11.5. gopls vs symgraph vs «идеал»

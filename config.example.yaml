@@ -1,0 +1,154 @@
+# ai-reviewer — example configuration.
+#
+# Sources, in increasing priority: this file → environment (AI_REVIEWER_*) →
+# Vault. Every field below can be set from the environment; the variable name is
+# AI_REVIEWER_ + the field's `env:` tag (see internal/config/config.go).
+#
+# Vault keys are those SAME full names, prefix included: xconfigvault looks a
+# field up by the name the env plugin stamped on it, so gitlab.token lives in
+# Vault under AI_REVIEWER_GITLAB_TOKEN.
+#
+# Secrets are left empty here on purpose: put them in the environment or Vault,
+# never in a file that lives in git.
+
+log:
+  level: info # debug | info | warn | error | fatal | panic
+  format: json # json | console
+
+ops: # mx ops server: /livez, /readyz, /metrics
+  enabled: true
+  healthy: { enabled: true, port: "10000" }
+  metrics: { enabled: true, port: "10000" }
+  # /debug/pprof is off by default and stays that way until the ops port has an
+  # ingress restriction: the shipped NetworkPolicy is egress-only, so a profiler
+  # here would hand heap and goroutine dumps to anything that can reach the pod.
+  profiler: { enabled: false, port: "10000" }
+
+service:
+  # Both switches are off by default: a fresh deployment observes and records
+  # without writing anything to GitLab or Slack until an operator opts in.
+  slack_send_enabled: false
+  ai_review_publish_enabled: false
+
+postgres:
+  host: localhost
+  port: "5432"
+  database: ai_reviewer
+  username: "" # AI_REVIEWER_POSTGRES_USERNAME (env and Vault key alike)
+  password: "" # AI_REVIEWER_POSTGRES_PASSWORD
+  ssl_mode: require
+  # Apply pending migrations (this schema, then River's) at startup. Safe with
+  # any number of replicas — one advisory lock is held across both migrators, so
+  # they serialise. Set false only if something else applies the schema.
+  migrate_on_start: true
+
+jobs:
+  drain_timeout: 60s # graceful River drain on shutdown
+  queues: # worker pool size per queue
+    default: 2
+    # The `review` queue is deliberately absent: its size is review.max_parallel,
+    # so review concurrency has one knob rather than two that can drift apart.
+    publish: 1 # serial publication is more predictable against rate limits
+    slack: 1
+  cleanup_interval: 1h
+
+gitlab:
+  base_url: https://gitlab.example.com # AI_REVIEWER_GITLAB_BASE_URL
+  token: "" # AI_REVIEWER_GITLAB_TOKEN
+  timeout: 30s
+  graphql_enabled: true # exact reviewer review states in one call per project
+  max_attempts: 4
+  max_retry_after: 60s
+
+slack:
+  token: "" # AI_REVIEWER_SLACK_TOKEN
+  directory_ttl: 15m # in-process TTL of the users.list cache
+  user_map: {} # optional override: gitlab_username -> SLACK_USER_ID
+
+llm:
+  provider: claude-cli
+  timeout: 15m
+  claude:
+    bin: claude
+    model: sonnet
+    auth:
+      mode: existing-login # existing-login | oauth-token | api-key
+      # Note the names: the env tags are the bare variables claude itself
+      # understands, so prefixed they read AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN /
+      # AI_REVIEWER_ANTHROPIC_API_KEY rather than AI_REVIEWER_LLM_CLAUDE_AUTH_*.
+      oauth_token: "" # AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN
+      api_key: "" # AI_REVIEWER_ANTHROPIC_API_KEY
+    permission_mode: dontAsk
+    agent_mode: true
+    # Read-only and scoped: ${worktree} is substituted per review with the
+    # detached checkout claude runs in, which makes the worktree a boundary
+    # rather than just a working directory.
+    #
+    # There are deliberately no Bash(git …) rules. A rule is a prefix match, and
+    # every git subcommand that takes diff options accepts --output=<path> (an
+    # arbitrary-file write, which can manufacture a "clean build" verdict for the
+    # deterministic verifiers) and --no-index <any file> (an arbitrary-file read
+    # that walks around the path scope). History and the interdiff already reach
+    # the model through the prompt, assembled by Go from the mirror.
+    allowed_tools:
+      ["Read(${worktree}/**)", "Grep(${worktree}/**)", "Glob(${worktree}/**)"]
+    # Extra parent-environment variables the subprocess may inherit, on top of
+    # the built-in allowlist (PATH, HOME, TZ, LANG/LC_*, proxy and CA settings,
+    # claude's own switches). The service's secrets are never inherited.
+    passthrough_env: []
+
+review:
+  scan_interval: 5m
+  max_parallel: 2 # the only review concurrency knob; sizes the review queue
+  max_comments: 12
+  severity_threshold: medium
+  preferred_comment_language: auto
+  workdir: /work # ephemeral mirrors and worktrees
+  # Excluded from the prompt AND from the finding-eligible set, on both sides of
+  # a rename. This is the default; setting the key replaces the list rather than
+  # adding to it.
+  ignore_globs:
+    [
+      vendor/**,
+      node_modules/**,
+      dist/**,
+      build/**,
+      "*.generated.*",
+      "*.pb.go",
+      "*.min.js",
+    ]
+  pipeline:
+    mode: standard # cheap | standard | deep | custom
+    max_parallel: 2
+    verify_mode: skeptic # skeptic | reflect | off
+    verify_max_findings: 24
+    # go_build/go_vet/py_syntax never execute repository code. tsc and go_test
+    # do, so they stay an explicit opt-in.
+    verifiers: [go_build, go_vet, py_syntax]
+    completeness: auto
+  context:
+    include_full_files: true
+    max_file_lines: 500
+    hunk_window_lines: 60
+    max_total_kb: 256
+    include_commits: true
+    include_discussions: true
+    max_discussion_kb: 4
+    prior_review: true
+    interdiff_max_kb: 32
+  risk:
+    enabled: true
+    history_commits: 500
+  coverage:
+    enabled: false # runs the reviewed repository's tests — explicit opt-in
+
+teams:
+  - name: payments
+    slack_channel: C012345678
+    ai_review: { enabled: true }
+    repositories: [backend/payments, backend/billing, frontend/checkout]
+
+  - name: platform
+    slack_channel: C987654321
+    ai_review: { enabled: true }
+    repositories: [platform/auth, platform/gateway]

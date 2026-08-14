@@ -135,6 +135,8 @@ Dockerfile-dev
 config.yaml
 config.*.yaml
 !config.template.yaml
+# The documented reference configuration — must be in the repo.
+!config.example.yaml
 
 data
 

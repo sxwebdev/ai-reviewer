@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
 )
 
@@ -50,7 +51,11 @@ func runGoCmd(ctx context.Context, timeout time.Duration, goBin, workDir, rootRe
 	defer cancel()
 	cmd := exec.CommandContext(ctx, goBin, args...)
 	cmd.Dir = absRoot
-	cmd.Env = os.Environ()
+	// Never os.Environ(): this runs the merge request's own toolchain
+	// configuration, and go_test executes the merge request's code outright, so
+	// an inherited environment would hand the service's GitLab, Slack, Postgres
+	// and Claude credentials to whatever an author committed.
+	cmd.Env = security.ToolchainEnv(os.Environ())
 	out, err := cmd.CombinedOutput()
 	return out, err == nil
 }

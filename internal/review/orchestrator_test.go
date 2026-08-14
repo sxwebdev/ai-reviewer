@@ -1,8 +1,6 @@
 package review
 
 import (
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 
@@ -24,7 +22,7 @@ func TestEngineReviewPipeline(t *testing.T) {
 		CostUSD: 0.01,
 	}
 	fake := llm.NewFake(resp)
-	eng := NewEngine(fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	eng := NewEngine(fake, discardLog())
 
 	in := ReviewInput{
 		ProjectPath: "group/repo", ProjectID: 1, MRIID: 5,
@@ -32,7 +30,6 @@ func TestEngineReviewPipeline(t *testing.T) {
 		SourceBranch: "feat", TargetBranch: "main",
 		Files:   files,
 		Refs:    testRefs,
-		Memory:  []MemoryRule{{Type: "repo_rule", Title: "Context", Body: "Pass ctx to DB."}},
 		Profile: DefaultProfile(),
 	}
 	res, err := eng.Review(t.Context(), in)
@@ -53,12 +50,9 @@ func TestEngineReviewPipeline(t *testing.T) {
 		t.Errorf("cost not propagated: %v", res.CostUSD)
 	}
 
-	// The prompt must carry MR metadata and the memory rule.
+	// The prompt must carry the MR metadata.
 	if !strings.Contains(fake.LastRequest.Prompt, "group/repo") {
 		t.Error("prompt missing project path")
-	}
-	if !strings.Contains(fake.LastRequest.Prompt, "Pass ctx to DB") {
-		t.Error("prompt missing review memory rule")
 	}
 	if fake.LastRequest.JSONSchema == "" {
 		t.Error("review should request strict JSON schema")
