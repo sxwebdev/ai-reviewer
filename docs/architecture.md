@@ -165,8 +165,13 @@ a team that never finds out something was waiting. Those resends are counted by
 Digest mentions come from matching GitLab users to Slack accounts, in this
 order:
 
-1. **`slack.user_map` override** — `gitlab_username → SLACK_USER_ID`. It never
-   consults the directory, so it keeps working while `users.list` is down.
+1. **`slack.user_map` override** — `gitlab_username → Slack id | @handle | email`.
+   A **user id** is answered without consulting the directory, so it keeps working
+   while `users.list` is down — which is the case the override exists for. A
+   handle or an email costs one directory read and is the form you can look up by
+   hand. An override that does not resolve stops there and is logged: it is a
+   configuration mistake, and falling through to the name probes below would hide
+   it behind a plausible-looking mention.
 2. **Email** — the GitLab user's email, normalised, against the Slack email
    index.
 3. **Username / display name** — GitLab `username` against Slack

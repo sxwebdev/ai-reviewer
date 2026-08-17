@@ -108,12 +108,15 @@ func TestSecondMatchReusesTheDirectory(t *testing.T) {
 func TestOverrideDoesNotLoadTheDirectory(t *testing.T) {
 	t.Parallel()
 
-	m, hits := newMatcher(t, map[string]string{"john": "U42"})
+	// A full-length id, because the form is what decides whether the directory is
+	// consulted: the pattern requires U/W plus eight, and a short "U42" is a handle,
+	// which resolves through the directory and would make this test assert nothing.
+	m, hits := newMatcher(t, map[string]string{"john": "UOFFLINE01"})
 	got, err := m.Match(t.Context(), match.GitLabUser{Username: "john", Name: "John Smith"})
 	if err != nil {
 		t.Fatalf("Match: %v", err)
 	}
-	if got.SlackID != "U42" {
+	if got.SlackID != "UOFFLINE01" {
 		t.Errorf("Match = %+v, want the override", got)
 	}
 	if n := hits.Load(); n != 0 {

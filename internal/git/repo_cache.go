@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -280,7 +281,7 @@ func (c *Cache) runOut(ctx context.Context, name string, args ...string) (string
 		if errors.As(err, &ee) {
 			detail = ": " + security.Mask(strings.TrimSpace(string(ee.Stderr)))
 		}
-		return "", fmt.Errorf("%s%s", err, detail)
+		return "", fmt.Errorf("%w%s", err, detail)
 	}
 	return string(out), nil
 }
@@ -343,9 +344,67 @@ func (c *Cache) run(ctx context.Context, dir string, extraEnv []string, name str
 	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %s", err, security.Mask(strings.TrimSpace(string(out))))
+		// %w, not %s: Signalled has to reach the *exec.ExitError underneath, and
+		// "the child was killed" is a different fact from "git refused the work".
+		return fmt.Errorf("%w: %s", err, security.Mask(strings.TrimSpace(string(out))))
 	}
 	return nil
+}
+
+// Signalled reports whether a git invocation ended because a *shutdown* signal
+// killed the process, rather than because git rejected the work or because
+// something else killed the child.
+//
+// It exists for one case, and that case is not hypothetical: a terminal delivers
+// Ctrl-C to the whole process group, so our git children die of SIGINT the instant
+// the operator asks the service to stop — before, by microseconds, our own
+// cancellation reaches the code that reads the error. Read as an ordinary git
+// failure it made review degrade to diff-only and then start a full LLM pass while
+// the process was already shutting down.
+//
+// Only the three signals a shutdown actually delivers count. They mirror
+// launcher.ShutdownSiganl()'s set, spelled out here rather than imported so this
+// package keeps no dependency on mx — keep the two in step. "Killed by any signal"
+// was too wide in the direction that costs money: the OOM killer SIGKILLing a
+// fetch of a large mirror is infrastructure trouble, and the caller turns a true
+// answer into a discarded attempt row — no backoff entry, a `canceled` metric and
+// the same doomed head SHA re-reviewed at full price on every scan. Narrowing
+// loses no real shutdown: when the stop arrives through our own context,
+// exec.CommandContext kills the child with SIGKILL, but ctx.Err() is then
+// context.Canceled and interruptedByShutdown's other half already covers it.
+//
+// Reading the signal number needs syscall.WaitStatus, because ExitCode() flattens
+// every signal — and a never-started child — to -1. syscall is acceptable here:
+// darwin and linux are the only targets (the image is Alpine) and both spell
+// WaitStatus the same way.
+func Signalled(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	// This guard belongs to the ee.Sys() call below and must not be separated from
+	// it: Sys() is promoted from ExitError's embedded *os.ProcessState and
+	// dereferences that pointer, so an ExitError built by hand — no process ever
+	// ran, no state attached — panics there, and nothing in production code may
+	// panic. Wait always attaches a state, which is why the real code path never
+	// takes this branch.
+	if ee.ProcessState == nil {
+		return false
+	}
+	// ee.Sys() reads the embedded ProcessState the guard above just checked. The
+	// comma-ok form cannot fail on darwin or linux; it is here so a future GOOS
+	// whose Sys() returns something other than a WaitStatus degrades to "not a
+	// shutdown" instead of panicking.
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() {
+		return false
+	}
+	switch ws.Signal() {
+	case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
+		return true
+	default:
+		return false
+	}
 }
 
 // sanitizeHost turns a host URL into a safe single directory name.

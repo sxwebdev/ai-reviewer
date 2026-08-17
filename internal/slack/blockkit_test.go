@@ -11,29 +11,28 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/slack"
 )
 
-// sampleDigest is the digest from plan §13.3.
+// sampleDigest is a two-project digest: one person owing reviews, two owing work
+// on their own merge requests, and one person on both hooks.
 func sampleDigest() slack.DigestData {
 	return slack.DigestData{
 		Team: "Payments",
-		ReviewsNeeded: []slack.ReviewerGroup{{
-			Reviewer: slack.Mention{SlackID: "U123"},
-			MRs: []slack.ReviewItem{
-				{
-					Project: "payments", IID: 481, Title: "Add payment retries",
-					WebURL: "https://gl/payments/-/merge_requests/481",
-					Author: slack.Mention{SlackID: "U456"}, Waiting: 18 * time.Hour,
-				},
-				{
-					Project: "billing", IID: 932, Title: "Invoice export",
-					WebURL: "https://gl/billing/-/merge_requests/932",
-					Author: slack.Mention{SlackID: "U789"}, Waiting: 5 * time.Hour,
+		People: []slack.PersonDigest{
+			{
+				Person: slack.Mention{SlackID: "U123"},
+				ToReview: []slack.ReviewItem{
+					{
+						Project: "payments", IID: 481, Title: "Add payment retries",
+						WebURL: "https://gl/payments/-/merge_requests/481", Waiting: 18 * time.Hour,
+					},
+					{
+						Project: "billing", IID: 932, Title: "Invoice export",
+						WebURL: "https://gl/billing/-/merge_requests/932", Waiting: 5 * time.Hour,
+					},
 				},
 			},
-		}},
-		AuthorActions: []slack.AuthorGroup{
 			{
-				Author: slack.Mention{SlackID: "U456"},
-				MRs: []slack.AuthorItem{{
+				Person: slack.Mention{SlackID: "U456"},
+				Own: []slack.AuthorItem{{
 					Project: "payments", IID: 475, Title: "Cache invalidation",
 					WebURL:            "https://gl/payments/-/merge_requests/475",
 					UnresolvedThreads: 3, MergeConflicts: true, PipelineFailed: true,
@@ -41,8 +40,8 @@ func sampleDigest() slack.DigestData {
 				}},
 			},
 			{
-				Author: slack.Mention{SlackID: "U789"},
-				MRs: []slack.AuthorItem{{
+				Person: slack.Mention{SlackID: "U789"},
+				Own: []slack.AuthorItem{{
 					Project: "checkout", IID: 122, Title: "Search filters",
 					WebURL:         "https://gl/checkout/-/merge_requests/122",
 					PipelineFailed: true,
@@ -68,23 +67,20 @@ func TestBuildDigestLayout(t *testing.T) {
 		t.Errorf("fallback text = %q", m.Text)
 	}
 
+	// One block per person, and every row is one line: no "by <author>" second
+	// line, no per-person section heading, no separate Reviews/Author sections.
 	want := []string{
 		"📋 MR Digest — Payments",
-		"*👀 Reviews needed*",
-		"<@U123> — 2 MRs\n" +
-			"• <https://gl/payments/-/merge_requests/481|payments !481 — Add payment retries>\n" +
-			"  by <@U456> · waiting 18h\n" +
-			"• <https://gl/billing/-/merge_requests/932|billing !932 — Invoice export>\n" +
-			"  by <@U789> · waiting 5h",
-		"*🛠 Author actions*",
-		"<@U456>\n" +
-			"• <https://gl/payments/-/merge_requests/475|payments !475 — Cache invalidation>\n" +
-			"  💬 3 unresolved threads\n" +
-			"  ⚠️ merge conflicts\n" +
-			"  ❌ <https://gl/payments/-/pipelines/9001|pipeline failed>",
-		"<@U789>\n" +
-			"• <https://gl/checkout/-/merge_requests/122|checkout !122 — Search filters>\n" +
-			"  ❌ <https://gl/checkout/-/pipelines/42|pipeline failed>",
+		// Both are hours old, so both are unmarked: the markers are for days.
+		"*<@U123>* · review 2\n" +
+			"▫️ <https://gl/payments/-/merge_requests/481|!481> _payments_ 18h — Add payment retries\n" +
+			"▫️ <https://gl/billing/-/merge_requests/932|!932> _billing_ 5h — Invoice export",
+		"*<@U456>* · yours 1\n" +
+			"🛠 <https://gl/payments/-/merge_requests/475|!475> _payments_ · 💬 3 threads · ⚠️ conflicts · " +
+			"❌ <https://gl/payments/-/pipelines/9001|pipeline> — Cache invalidation",
+		"*<@U789>* · yours 1\n" +
+			"🛠 <https://gl/checkout/-/merge_requests/122|!122> _checkout_ · " +
+			"❌ <https://gl/checkout/-/pipelines/42|pipeline> — Search filters",
 	}
 	got := blockTexts(t, m.Blocks)
 	if len(got) != len(want) {
@@ -105,54 +101,440 @@ func TestBuildDigestLayout(t *testing.T) {
 	}
 }
 
-func TestAuthorRowOrderIsFixed(t *testing.T) {
+// TestSinglePersonSeesBothHalvesTogether is the reason the two sections were
+// merged: someone with reviews to deliver *and* their own MRs to fix used to
+// appear twice, in two places, with no way to see their whole workload at once.
+func TestSinglePersonSeesBothHalvesTogether(t *testing.T) {
 	t.Parallel()
 
-	// Whatever the flags, the rows read threads → conflicts → pipeline so the
-	// digest looks the same every day.
 	d := slack.DigestData{
-		Team: "payments",
-		AuthorActions: []slack.AuthorGroup{{
-			Author: slack.Mention{SlackID: "U1"},
-			MRs: []slack.AuthorItem{{
-				Project: "payments", IID: 1, Title: "T",
-				UnresolvedThreads: 1, MergeConflicts: true, PipelineFailed: true,
-			}},
+		Team:    "payments",
+		Project: "payments",
+		People: []slack.PersonDigest{{
+			Person:   slack.Mention{SlackID: "U1"},
+			ToReview: []slack.ReviewItem{{IID: 10, Title: "CHAIN-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour}},
+			Own:      []slack.AuthorItem{{IID: 11, Title: "CHAIN-2 b", WebURL: "https://gl/11", UnresolvedThreads: 2}},
 		}},
 	}
-	got := blockTexts(t, slack.BuildDigest(d)[0].Blocks)
-	body := got[len(got)-1]
-	wantOrder := []string{"💬 1 unresolved thread", "⚠️ merge conflicts", "❌ pipeline failed"}
-	prev := -1
-	for _, row := range wantOrder {
-		i := strings.Index(body, row)
-		if i < 0 {
-			t.Fatalf("row %q missing from:\n%s", row, body)
-		}
-		if i <= prev {
-			t.Fatalf("row %q out of order in:\n%s", row, body)
-		}
-		prev = i
+	blocks := blockTexts(t, slack.BuildDigest(d)[0].Blocks)
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d, want header + one person block:\n%s", len(blocks), strings.Join(blocks, "\n---\n"))
 	}
-	// No pipeline URL: the row is still there, just not a link.
-	if strings.Contains(body, "|pipeline failed>") {
-		t.Errorf("pipeline row should not be a link without a URL:\n%s", body)
+	body := blocks[1]
+	if !strings.HasPrefix(body, "*<@U1>* · review 1 · yours 1\n") {
+		t.Errorf("head must state both halves:\n%s", body)
+	}
+	for _, want := range []string{"|!10>", "|!11>", "💬 2 threads"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%q missing:\n%s", want, body)
+		}
 	}
 }
 
-func TestAuthorRowsOmitWhatDoesNotApply(t *testing.T) {
+// TestReviewTailIsListedNotDropped: only the oldest few reviews get a full row,
+// but every remaining merge request is still linked. Compression must never lose
+// one.
+func TestReviewTailIsListedNotDropped(t *testing.T) {
+	t.Parallel()
+
+	const total = 15
+	p := slack.PersonDigest{Person: slack.Mention{SlackID: "U1"}}
+	for i := range total {
+		p.ToReview = append(p.ToReview, slack.ReviewItem{
+			IID:     int64(100 + i),
+			Title:   fmt.Sprintf("CHAIN-%d something", i),
+			WebURL:  fmt.Sprintf("https://gl/%d", 100+i),
+			Waiting: time.Duration(total-i) * 24 * time.Hour, // caller sorts; oldest first here
+		})
+	}
+	d := slack.DigestData{Team: "t", Project: "p", People: []slack.PersonDigest{p}}
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+
+	if got := strings.Count(body, " — CHAIN-"); got != 3 {
+		t.Errorf("detailed rows = %d, want 3 (the rest belong in the tail):\n%s", got, body)
+	}
+	if !strings.Contains(body, fmt.Sprintf("+%d more:", total-3)) {
+		t.Errorf("tail count missing:\n%s", body)
+	}
+	for i := range total {
+		if !strings.Contains(body, fmt.Sprintf("|!%d>", 100+i)) {
+			t.Fatalf("!%d is not in the digest at all:\n%s", 100+i, body)
+		}
+	}
+}
+
+// TestBigReviewTailIsSplitNotTruncated: a reviewer with 60 pending merge
+// requests renders a tail no single 3000-character section can hold. The tail
+// has to be split across sections — cutting it with an ellipsis drops merge
+// requests while the "+57 more" count still promises them, which is silent
+// data loss dressed up as compression.
+func TestBigReviewTailIsSplitNotTruncated(t *testing.T) {
+	t.Parallel()
+
+	// Realistic GitLab URLs: the tail is a list of links, so the URL length is
+	// what actually blows the section limit.
+	const total = 60
+	p := slack.PersonDigest{Person: slack.Mention{SlackID: "U1"}}
+	for i := range total {
+		iid := int64(1400 + i)
+		p.ToReview = append(p.ToReview, slack.ReviewItem{
+			Project: "blockchain-api",
+			IID:     iid,
+			Title:   fmt.Sprintf("CHAIN-%d fix the lookup", i),
+			WebURL: fmt.Sprintf(
+				"https://gitlab.example.com/backend/blockchain-api/-/merge_requests/%d", iid),
+			Waiting: time.Duration(total-i) * 24 * time.Hour,
+		})
+	}
+	// No DigestData.Project: a multi-project digest, where the tail carries the
+	// project label too and is therefore at its longest.
+	msgs := slack.BuildDigest(slack.DigestData{Team: "t", People: []slack.PersonDigest{p}})
+
+	var texts []string
+	for _, m := range msgs {
+		assertWithinLimits(t, slack.Builder{}, m)
+		texts = append(texts, blockTexts(t, m.Blocks)...)
+	}
+	joined := strings.Join(texts, "\n")
+
+	if !strings.Contains(joined, fmt.Sprintf("+%d more:", total-3)) {
+		t.Errorf("tail count missing:\n%s", joined)
+	}
+	// Every title here is short, so the only thing that can produce an ellipsis
+	// is a truncated section entry.
+	for i, m := range msgs {
+		for j, b := range m.Blocks {
+			if b.Type == "section" && strings.Contains(b.Text.Text, "…") {
+				t.Errorf("part %d block %d was truncated instead of split:\n%s", i+1, j, b.Text.Text)
+			}
+		}
+	}
+	for i := range total {
+		if !strings.Contains(joined, fmt.Sprintf("|!%d>", 1400+i)) {
+			t.Fatalf("!%d is not in the digest at all:\n%s", 1400+i, joined)
+		}
+	}
+}
+
+// TestTailStaysUnambiguous: the tail is compressed, not anonymous. It keeps the
+// age marker — a 110-day-old merge request must not look like a 2-day-old one —
+// and on a multi-project digest it keeps the project label, which is the only
+// thing telling two !1404s from different repositories apart.
+func TestTailStaysUnambiguous(t *testing.T) {
+	t.Parallel()
+
+	person := func() slack.PersonDigest {
+		p := slack.PersonDigest{Person: slack.Mention{SlackID: "U1"}}
+		for i := range 3 { // the detail rows, pushed aside
+			p.ToReview = append(p.ToReview, slack.ReviewItem{
+				Project: "alpha", IID: int64(i + 1), Title: "T",
+				WebURL: fmt.Sprintf("https://gl/%d", i+1), Waiting: 200 * 24 * time.Hour,
+			})
+		}
+		p.ToReview = append(p.ToReview,
+			slack.ReviewItem{
+				Project: "alpha", IID: 13, Title: "T", WebURL: "https://gl/13",
+				Waiting: 110 * 24 * time.Hour,
+			},
+			slack.ReviewItem{
+				Project: "beta", IID: 14, Title: "T", WebURL: "https://gl/14",
+				Waiting: 2 * 24 * time.Hour,
+			},
+		)
+		return p
+	}
+
+	tailOf := func(t *testing.T, d slack.DigestData) string {
+		t.Helper()
+		for _, line := range strings.Split(blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1], "\n") {
+			if strings.Contains(line, "+2 more:") {
+				return line
+			}
+		}
+		t.Fatalf("no tail line in the digest")
+		return ""
+	}
+
+	multi := tailOf(t, slack.DigestData{Team: "t", People: []slack.PersonDigest{person()}})
+	for _, want := range []string{"🔴 <https://gl/13|!13> _alpha_", "🟡 <https://gl/14|!14> _beta_"} {
+		if !strings.Contains(multi, want) {
+			t.Errorf("tail entry %q missing from:\n%s", want, multi)
+		}
+	}
+
+	single := tailOf(t, slack.DigestData{
+		Team: "t", Project: "alpha", People: []slack.PersonDigest{person()},
+	})
+	if strings.Contains(single, "_alpha_") {
+		t.Errorf("the tail must not repeat the project the title carries:\n%s", single)
+	}
+	for _, want := range []string{"🔴 <https://gl/13|!13>", "🟡 <https://gl/14|!14>"} {
+		if !strings.Contains(single, want) {
+			t.Errorf("tail entry %q missing from:\n%s", want, single)
+		}
+	}
+}
+
+// TestProjectLabelOnlyWhenItDisambiguates: on a one-repository team the project
+// was repeated on every single row. It stays on a multi-project digest, where it
+// is the only thing telling two !1404s apart.
+func TestProjectLabelOnlyWhenItDisambiguates(t *testing.T) {
+	t.Parallel()
+
+	person := slack.PersonDigest{
+		Person:   slack.Mention{SlackID: "U1"},
+		ToReview: []slack.ReviewItem{{Project: "blockchain-api", IID: 1, Title: "T", WebURL: "https://gl/1"}},
+		Own:      []slack.AuthorItem{{Project: "blockchain-api", IID: 2, Title: "T2", WebURL: "https://gl/2"}},
+	}
+
+	single := slack.BuildDigest(slack.DigestData{
+		Team: "team", Project: "blockchain-api", People: []slack.PersonDigest{person},
+	})[0]
+	if !strings.Contains(single.Text, "· blockchain-api") {
+		t.Errorf("a single-project digest must name it in the title: %q", single.Text)
+	}
+	if body := blockTexts(t, single.Blocks)[1]; strings.Contains(body, "blockchain-api") {
+		t.Errorf("rows must not repeat the project when the title carries it:\n%s", body)
+	}
+
+	multi := slack.BuildDigest(slack.DigestData{Team: "team", People: []slack.PersonDigest{person}})[0]
+	if strings.Contains(multi.Text, "blockchain-api") {
+		t.Errorf("a multi-project digest must not claim one project: %q", multi.Text)
+	}
+	if body := blockTexts(t, multi.Blocks)[1]; strings.Count(body, "_blockchain-api_") != 2 {
+		t.Errorf("every row of a multi-project digest needs its project:\n%s", body)
+	}
+}
+
+// TestAgeMarkers classify without filtering: nothing is hidden, but a reader can
+// see which end of the list is old. "waiting 38m" and "waiting 110d" used to be
+// rendered identically.
+func TestAgeMarkers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		wait time.Duration
+		want string
+	}{
+		{"fresh", 38 * time.Minute, "▫️ "},
+		{"just under two days", 47 * time.Hour, "▫️ "},
+		{"two days", 48 * time.Hour, "🟡 "},
+		{"just under a week", 6 * 24 * time.Hour, "🟡 "},
+		{"a week", 7 * 24 * time.Hour, "🔴 "},
+		{"a hundred days", 100 * 24 * time.Hour, "🔴 "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := slack.DigestData{
+				Team: "t", Project: "p",
+				People: []slack.PersonDigest{{
+					Person:   slack.Mention{SlackID: "U1"},
+					ToReview: []slack.ReviewItem{{IID: 1, Title: "T", WebURL: "https://gl/1", Waiting: tt.wait}},
+				}},
+			}
+			body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+			row := strings.Split(body, "\n")[1]
+			if !strings.HasPrefix(row, tt.want) {
+				t.Errorf("row = %q, want it to start with %q", row, tt.want)
+			}
+		})
+	}
+}
+
+// TestWaitingSuffix keeps the duration format, which now sits inside the row.
+func TestWaitingSuffix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		wait time.Duration
+		want string
+	}{
+		{"omitted when zero", 0, "|!1> — T"},
+		{"minutes", 45 * time.Minute, "|!1> 45m — T"},
+		{"rounds up to a minute", 20 * time.Second, "|!1> 1m — T"},
+		{"hours", 18 * time.Hour, "|!1> 18h — T"},
+		{"days past two", 72 * time.Hour, "|!1> 3d — T"},
+		{"still hours at 47", 47 * time.Hour, "|!1> 47h — T"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d := slack.DigestData{
+				Team: "t", Project: "p",
+				People: []slack.PersonDigest{{
+					Person:   slack.Mention{SlackID: "U1"},
+					ToReview: []slack.ReviewItem{{IID: 1, Title: "T", WebURL: "https://gl/1", Waiting: tt.wait}},
+				}},
+			}
+			body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+			if !strings.HasSuffix(body, tt.want) {
+				t.Errorf("body =\n%q\nwant suffix %q", body, tt.want)
+			}
+		})
+	}
+}
+
+// TestLongTitleIsShortenedToOneLine: titles here are commit-message length. A
+// 104-character one wrapped to three lines in Slack and undid one-row-per-MR.
+func TestLongTitleIsShortenedToOneLine(t *testing.T) {
+	t.Parallel()
+
+	const long = "CHAIN-190 create one outbox message per transaction/transfer instead of batched payload with first-id aggregate_id"
+	d := slack.DigestData{
+		Team: "t", Project: "p",
+		People: []slack.PersonDigest{{
+			Person:   slack.Mention{SlackID: "U1"},
+			ToReview: []slack.ReviewItem{{IID: 1, Title: long, WebURL: "https://gl/1"}},
+		}},
+	}
+	row := strings.Split(blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1], "\n")[1]
+
+	title := row[strings.Index(row, "— ")+len("— "):]
+	if n := utf8.RuneCountInString(title); n > 56 {
+		t.Errorf("title = %d runes (%q), want it shortened", n, title)
+	}
+	if !strings.HasSuffix(title, "…") {
+		t.Errorf("a shortened title must be marked: %q", title)
+	}
+	// The ticket key is what makes a shortened title still identifiable.
+	if !strings.HasPrefix(title, "CHAIN-190 ") {
+		t.Errorf("the ticket key must survive: %q", title)
+	}
+	// Cut at a word boundary, not mid-word.
+	if strings.HasSuffix(strings.TrimSuffix(title, "…"), " ") {
+		t.Errorf("trailing space before the ellipsis: %q", title)
+	}
+}
+
+// TestShortenedTitleIsCutCleanly pins the three ways the cut used to go wrong:
+// a second ellipsis on an already-ellipsised string, a cut landing inside an
+// HTML entity because escaping ran first, and a byte index compared against a
+// rune budget, which shortened Cyrillic titles far below their budget.
+func TestShortenedTitleIsCutCleanly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		title    string
+		minRunes int // a shortened title must still use most of its budget
+	}{
+		{
+			// One long word: nothing to cut back to, so the old code ellipsised
+			// truncateRunes' output a second time and rendered "xxxx……".
+			name: "single long word", title: strings.Repeat("x", 80), minRunes: 40,
+		},
+		{
+			// The "&" sits where the cut falls, so escaping before cutting left a
+			// literal "&am" in the row.
+			name:  "ampersand at the cut",
+			title: strings.Repeat("a", 51) + "&" + strings.Repeat("b", 30), minRunes: 40,
+		},
+		{
+			// Russian titles are normal here. The only word boundary is at rune 20,
+			// well inside the half-budget guard, so the title must be cut mid-word
+			// at the budget instead — the byte index made the guard accept it and
+			// threw away two thirds of the line.
+			name:  "cyrillic with an early word boundary",
+			title: strings.Repeat("ф", 20) + " " + strings.Repeat("б", 60), minRunes: 40,
+		},
+		{
+			name:  "cyrillic with a late word boundary",
+			title: strings.Repeat("ф", 40) + " " + strings.Repeat("б", 40), minRunes: 40,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := slack.DigestData{
+				Team: "t", Project: "p",
+				People: []slack.PersonDigest{{
+					Person:   slack.Mention{SlackID: "U1"},
+					ToReview: []slack.ReviewItem{{IID: 1, Title: tt.title, WebURL: "https://gl/1"}},
+				}},
+			}
+			row := strings.Split(blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1], "\n")[1]
+			parts := strings.SplitN(row, " — ", 2)
+			if len(parts) != 2 {
+				t.Fatalf("no title in the row: %q", row)
+			}
+			title := parts[1]
+
+			// The budget bounds what Slack draws, and it draws "&amp;" as one
+			// character, so the length is measured on the unescaped form.
+			display := strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">").Replace(title)
+			if n := utf8.RuneCountInString(display); n > 56 {
+				t.Errorf("title = %d runes (%q), want it shortened", n, title)
+			}
+			if n := utf8.RuneCountInString(display); n < tt.minRunes {
+				t.Errorf("title = %d runes (%q), want at least %d: the budget is there to be used",
+					n, title, tt.minRunes)
+			}
+			if !strings.HasSuffix(title, "…") {
+				t.Errorf("a shortened title must be marked: %q", title)
+			}
+			if strings.Contains(title, "……") {
+				t.Errorf("the cut is marked once, not twice: %q", title)
+			}
+			// Escaping must happen after the cut, or the row carries half an entity.
+			bare := strings.NewReplacer("&amp;", "", "&lt;", "", "&gt;", "").Replace(title)
+			if strings.ContainsAny(bare, "&<>") {
+				t.Errorf("cut through an escape sequence: %q", title)
+			}
+		})
+	}
+}
+
+func TestAuthorFlagOrderIsFixed(t *testing.T) {
 	t.Parallel()
 
 	d := slack.DigestData{
-		Team: "payments",
-		AuthorActions: []slack.AuthorGroup{{
-			Author: slack.Mention{SlackID: "U1"},
-			MRs:    []slack.AuthorItem{{Project: "payments", IID: 1, PipelineFailed: true, PipelineWebURL: "https://gl/p/1"}},
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			Own: []slack.AuthorItem{{
+				IID: 1, Title: "T", WebURL: "https://gl/1",
+				ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}, {Display: "Jane Doe (@jane)"}},
+				UnresolvedThreads:  1, MergeConflicts: true, PipelineFailed: true,
+				PipelineWebURL: "https://gl/p/9",
+			}},
 		}},
 	}
-	got := blockTexts(t, slack.BuildDigest(d)[0].Blocks)
-	body := got[len(got)-1]
-	want := "<@U1>\n• payments !1\n  ❌ <https://gl/p/1|pipeline failed>"
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+
+	// An unmatched reviewer is named without a ping, exactly like everywhere else.
+	if !strings.Contains(body, "🔁 changes requested by <@U9>, Jane Doe (@jane)") {
+		t.Errorf("changes-requested flag missing or misrendered:\n%s", body)
+	}
+	wantOrder := []string{"🔁 changes requested by", "💬 1 thread", "⚠️ conflicts", "❌ "}
+	prev := -1
+	for _, part := range wantOrder {
+		i := strings.Index(body, part)
+		if i < 0 {
+			t.Fatalf("%q missing from:\n%s", part, body)
+		}
+		if i <= prev {
+			t.Fatalf("%q out of order in:\n%s", part, body)
+		}
+		prev = i
+	}
+}
+
+func TestAuthorFlagsOmitWhatDoesNotApply(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			Own:    []slack.AuthorItem{{IID: 1, PipelineFailed: true, PipelineWebURL: "https://gl/p/1"}},
+		}},
+	}
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+	want := "*<@U1>* · yours 1\n🛠 !1 · ❌ <https://gl/p/1|pipeline>"
 	if body != want {
 		t.Errorf("body =\n%q\nwant\n%q", body, want)
 	}
@@ -162,27 +544,28 @@ func TestUnmatchedAndAmbiguousPeopleStillAppear(t *testing.T) {
 	t.Parallel()
 
 	d := slack.DigestData{
-		Team: "payments",
-		ReviewsNeeded: []slack.ReviewerGroup{
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{
 			{
-				Reviewer: slack.Mention{Display: "John Smith (@john)"},
-				MRs: []slack.ReviewItem{{
-					Project: "payments", IID: 1, Title: "T",
-					Author: slack.Mention{Display: "Ann Lee (@ann)", Ambiguous: true},
+				Person:   slack.Mention{Display: "John Smith (@john)"},
+				ToReview: []slack.ReviewItem{{IID: 1, Title: "T", WebURL: "https://gl/1"}},
+				Own: []slack.AuthorItem{{
+					IID: 3, Title: "T3", WebURL: "https://gl/3",
+					ChangesRequestedBy: []slack.Mention{{Display: "Ann Lee (@ann)", Ambiguous: true}},
 				}},
 			},
 			{
-				Reviewer: slack.Mention{}, // nothing known at all
-				MRs:      []slack.ReviewItem{{Project: "payments", IID: 2, Title: "T2"}},
+				Person:   slack.Mention{}, // nothing known at all
+				ToReview: []slack.ReviewItem{{IID: 2, Title: "T2", WebURL: "https://gl/2"}},
 			},
 		},
 	}
 	texts := strings.Join(blockTexts(t, slack.BuildDigest(d)[0].Blocks), "\n")
-	if !strings.Contains(texts, "John Smith (@john) — 1 MR") {
-		t.Errorf("unmatched reviewer missing:\n%s", texts)
+	if !strings.Contains(texts, "*John Smith (@john)* · review 1 · yours 1") {
+		t.Errorf("unmatched person missing:\n%s", texts)
 	}
 	if !strings.Contains(texts, "Ann Lee (@ann) ❓") {
-		t.Errorf("ambiguous author is not marked:\n%s", texts)
+		t.Errorf("ambiguous person is not marked:\n%s", texts)
 	}
 	if strings.Contains(texts, "<@>") {
 		t.Errorf("empty mention rendered:\n%s", texts)
@@ -190,8 +573,8 @@ func TestUnmatchedAndAmbiguousPeopleStillAppear(t *testing.T) {
 	if !strings.Contains(texts, "unknown user") {
 		t.Errorf("nameless person should still be listed:\n%s", texts)
 	}
-	// Both MRs are present — an unmatched user never drops a row.
-	for _, ref := range []string{"payments !1", "payments !2"} {
+	// Every MR is present — an unmatched user never drops a row.
+	for _, ref := range []string{"|!1>", "|!2>", "|!3>"} {
 		if !strings.Contains(texts, ref) {
 			t.Errorf("%s missing:\n%s", ref, texts)
 		}
@@ -240,9 +623,9 @@ func TestEmptyDigestProducesNoMessages(t *testing.T) {
 	t.Parallel()
 
 	empty := slack.DigestData{
-		Team:          "payments",
-		ReviewsNeeded: []slack.ReviewerGroup{{Reviewer: slack.Mention{SlackID: "U1"}}}, // no MRs
-		AuthorActions: []slack.AuthorGroup{{Author: slack.Mention{SlackID: "U1"}}},
+		Team: "payments",
+		// A person with nothing owed is not a reason to post.
+		People: []slack.PersonDigest{{Person: slack.Mention{SlackID: "U1"}}},
 	}
 	if msgs := slack.BuildDigest(empty); len(msgs) != 0 {
 		t.Fatalf("messages = %d, want none", len(msgs))
@@ -254,17 +637,16 @@ func TestEscapingKeepsMarkupOutOfText(t *testing.T) {
 
 	d := slack.DigestData{
 		Team: "payments",
-		ReviewsNeeded: []slack.ReviewerGroup{{
-			Reviewer: slack.Mention{Display: "A & B <script>"},
-			MRs: []slack.ReviewItem{{
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{Display: "A & B <script>"},
+			ToReview: []slack.ReviewItem{{
 				Project: "pay<ments", IID: 7, Title: "Fix a > b && c",
 				WebURL: "https://gl/p/-/mr/7?a=1|b=2",
-				Author: slack.Mention{Display: "x>y"},
 			}},
 		}},
 	}
-	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[2]
-	for _, raw := range []string{"A & B <script>", "a > b && c", "pay<ments", "x>y"} {
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+	for _, raw := range []string{"A & B <script>", "a > b && c", "pay<ments"} {
 		if strings.Contains(body, raw) {
 			t.Errorf("unescaped %q in:\n%s", raw, body)
 		}
@@ -278,78 +660,54 @@ func TestEscapingKeepsMarkupOutOfText(t *testing.T) {
 	}
 }
 
-func TestWaitingSuffix(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		wait time.Duration
-		want string
-	}{
-		{"omitted when zero", 0, "  by <@U2>"},
-		{"minutes", 45 * time.Minute, "  by <@U2> · waiting 45m"},
-		{"rounds up to a minute", 20 * time.Second, "  by <@U2> · waiting 1m"},
-		{"hours", 18 * time.Hour, "  by <@U2> · waiting 18h"},
-		{"days past two", 72 * time.Hour, "  by <@U2> · waiting 3d"},
-		{"still hours at 47", 47 * time.Hour, "  by <@U2> · waiting 47h"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			d := slack.DigestData{
-				Team: "t",
-				ReviewsNeeded: []slack.ReviewerGroup{{
-					Reviewer: slack.Mention{SlackID: "U1"},
-					MRs: []slack.ReviewItem{{
-						Project: "p", IID: 1, Title: "T",
-						Author: slack.Mention{SlackID: "U2"}, Waiting: tt.wait,
-					}},
-				}},
-			}
-			body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[2]
-			if !strings.HasSuffix(body, tt.want) {
-				t.Errorf("body =\n%q\nwant suffix %q", body, tt.want)
-			}
-		})
-	}
-}
-
 // TestSplitIntoNumberedPartsLosesNothing is the promise that a big digest is
 // split, never silently truncated.
 func TestSplitIntoNumberedPartsLosesNothing(t *testing.T) {
 	t.Parallel()
 
-	const (
-		reviewers = 60
-		authors   = 40
-	)
+	// Enough people that the compressed layout still overflows several messages —
+	// the compression is what makes a real team fit in one, so the split has to be
+	// exercised at a scale beyond it.
+	// Six reviews each, so every person also has a compressed tail: the tail is
+	// where merge requests used to disappear.
+	//
+	// Titles stay well under the one-line budget on purpose. Nothing here may be
+	// shortened, which makes any ellipsis in the output proof that a section was
+	// truncated rather than split.
+	const people = 200
 	d := slack.DigestData{Team: "Payments", FailedRepos: 2}
 	var wantRefs []string
-	for i := range reviewers {
-		g := slack.ReviewerGroup{Reviewer: slack.Mention{SlackID: fmt.Sprintf("UR%d", i)}}
-		for j := range 3 {
-			ref := fmt.Sprintf("rev%d-%d !%d%d", i, j, i, j)
-			g.MRs = append(g.MRs, slack.ReviewItem{
-				Project: fmt.Sprintf("rev%d-%d", i, j), IID: int64(i*10 + j),
-				Title:  strings.Repeat("long title ", 20),
-				WebURL: "https://gl/x", Author: slack.Mention{SlackID: "UA"},
-			})
-			_ = ref
-			wantRefs = append(wantRefs, fmt.Sprintf("rev%d-%d !%d", i, j, i*10+j))
+	for i := range people {
+		p := slack.PersonDigest{Person: slack.Mention{SlackID: fmt.Sprintf("UR%d", i)}}
+		// One reviewer is badly behind, so a single person's tail is longer than a
+		// section on its own. That is the case that used to be cut instead of split.
+		reviews := 6
+		if i == 0 {
+			reviews = 60
 		}
-		d.ReviewsNeeded = append(d.ReviewsNeeded, g)
-	}
-	for i := range authors {
-		g := slack.AuthorGroup{Author: slack.Mention{SlackID: fmt.Sprintf("UA%d", i)}}
+		for j := range reviews {
+			iid := int64(i*1000 + j)
+			p.ToReview = append(p.ToReview, slack.ReviewItem{
+				Project: fmt.Sprintf("rev%d-%d", i, j), IID: iid,
+				Title: fmt.Sprintf("CHAIN-%d review", j),
+				// Real GitLab URLs: the URL is most of a compressed row, so a short
+				// stand-in would hide the very overflow this test is about.
+				WebURL:  fmt.Sprintf("https://gitlab.example.com/backend/rev%d/-/merge_requests/%d", i, iid),
+				Waiting: time.Duration(j+1) * 24 * time.Hour,
+			})
+			wantRefs = append(wantRefs, fmt.Sprintf("|!%d>", iid))
+		}
 		for j := range 2 {
-			g.MRs = append(g.MRs, slack.AuthorItem{
-				Project: fmt.Sprintf("auth%d-%d", i, j), IID: int64(i*10 + j),
-				Title:             strings.Repeat("another long title ", 15),
-				UnresolvedThreads: 2, MergeConflicts: true, PipelineFailed: true,
+			iid := int64(i*1000 + 500 + j)
+			p.Own = append(p.Own, slack.AuthorItem{
+				Project: fmt.Sprintf("auth%d-%d", i, j), IID: iid,
+				Title:             fmt.Sprintf("CHAIN-%d own", j),
+				WebURL:            fmt.Sprintf("https://gitlab.example.com/backend/auth%d/-/merge_requests/%d", i, iid),
+				UnresolvedThreads: 2, MergeConflicts: true,
 			})
-			wantRefs = append(wantRefs, fmt.Sprintf("auth%d-%d !%d", i, j, i*10+j))
+			wantRefs = append(wantRefs, fmt.Sprintf("|!%d>", iid))
 		}
-		d.AuthorActions = append(d.AuthorActions, g)
+		d.People = append(d.People, p)
 	}
 
 	msgs := slack.BuildDigest(d)
@@ -369,10 +727,15 @@ func TestSplitIntoNumberedPartsLosesNothing(t *testing.T) {
 		if got := m.Blocks[0].Text.Text; got != "📋 "+wantTitle {
 			t.Errorf("header = %q, want %q", got, "📋 "+wantTitle)
 		}
-		assertWithinLimits(t, m)
+		assertWithinLimits(t, slack.Builder{}, m)
 		for _, s := range blockTexts(t, m.Blocks) {
 			all.WriteString(s)
 			all.WriteString("\n")
+		}
+		for j, b := range m.Blocks {
+			if b.Type == "section" && strings.Contains(b.Text.Text, "…") {
+				t.Errorf("part %d block %d was truncated instead of split:\n%s", i+1, j, b.Text.Text)
+			}
 		}
 	}
 
@@ -382,52 +745,40 @@ func TestSplitIntoNumberedPartsLosesNothing(t *testing.T) {
 			t.Fatalf("MR %q lost in the split", ref)
 		}
 	}
-	if strings.Contains(joined, "…") {
-		t.Error("a part was truncated instead of split")
-	}
-	// Every part that carries reviewer or author rows names the section it
-	// continues, so a part reads on its own.
-	for _, m := range msgs {
-		texts := blockTexts(t, m.Blocks)
-		if len(texts) < 2 {
-			continue
-		}
-		if !strings.Contains(strings.Join(texts, "\n"), "Reviews needed") &&
-			!strings.Contains(strings.Join(texts, "\n"), "Author actions") {
-			t.Errorf("part %d has no section heading:\n%s", m.Part, strings.Join(texts, "\n"))
-		}
-	}
 }
 
-// TestOneGroupSplitsAcrossSections covers a single reviewer with more MRs than
-// fit in one 3000-character section.
-func TestOneGroupSplitsAcrossSections(t *testing.T) {
+// TestOnePersonSplitsAcrossSections covers a single person with more merge
+// requests than fit in one 3000-character section. It uses pending reviews
+// rather than the person's own merge requests: reviews are the compressed side,
+// so this is where a section boundary is hard to place.
+func TestOnePersonSplitsAcrossSections(t *testing.T) {
 	t.Parallel()
 
-	g := slack.ReviewerGroup{Reviewer: slack.Mention{SlackID: "U1"}}
-	const mrs = 40
-	for i := range mrs {
-		g.MRs = append(g.MRs, slack.ReviewItem{
+	p := slack.PersonDigest{Person: slack.Mention{SlackID: "U1"}}
+	const reviews = 60
+	for i := range reviews {
+		p.ToReview = append(p.ToReview, slack.ReviewItem{
 			Project: "payments", IID: int64(i), Title: strings.Repeat("x", 100),
-			WebURL: "https://gl/p/-/merge_requests/" + fmt.Sprint(i),
-			Author: slack.Mention{SlackID: "U2"}, Waiting: time.Hour,
+			// A real GitLab URL, because the URL is most of a compressed row.
+			WebURL:  "https://gitlab.example.com/payments/backend/-/merge_requests/" + fmt.Sprint(i),
+			Waiting: time.Duration(reviews-i) * 24 * time.Hour,
 		})
 	}
-	msgs := slack.BuildDigest(slack.DigestData{Team: "t", ReviewsNeeded: []slack.ReviewerGroup{g}})
+	msgs := slack.BuildDigest(slack.DigestData{Team: "t", People: []slack.PersonDigest{p}})
 
 	var texts []string
 	for _, m := range msgs {
-		assertWithinLimits(t, m)
+		assertWithinLimits(t, slack.Builder{}, m)
 		texts = append(texts, blockTexts(t, m.Blocks)...)
 	}
 	joined := strings.Join(texts, "\n")
-	for i := range mrs {
-		if !strings.Contains(joined, fmt.Sprintf("payments !%d ", i)) {
+	for i := range reviews {
+		if !strings.Contains(joined, fmt.Sprintf("|!%d>", i)) {
 			t.Fatalf("MR !%d lost", i)
 		}
 	}
-	if !strings.Contains(joined, "<@U1> — 40 MRs _(continued)_") {
-		t.Errorf("a continued group must repeat whose MRs these are:\n%s", joined)
+	if !strings.Contains(joined, "*<@U1>* · review 60"+" _(continued)_") {
+		t.Errorf("a continued person must repeat whose merge requests these are:\n%s", joined)
 	}
 }
 
@@ -436,11 +787,10 @@ func TestLimitsHoldForAHugeDigest(t *testing.T) {
 
 	d := slack.DigestData{Team: strings.Repeat("very long team name ", 20)}
 	for i := range 200 {
-		d.ReviewsNeeded = append(d.ReviewsNeeded, slack.ReviewerGroup{
-			Reviewer: slack.Mention{SlackID: fmt.Sprintf("U%d", i)},
-			MRs: []slack.ReviewItem{{
+		d.People = append(d.People, slack.PersonDigest{
+			Person: slack.Mention{SlackID: fmt.Sprintf("U%d", i)},
+			ToReview: []slack.ReviewItem{{
 				Project: "p", IID: int64(i), Title: strings.Repeat("t", 300),
-				Author: slack.Mention{SlackID: "UA"},
 			}},
 		})
 	}
@@ -449,24 +799,24 @@ func TestLimitsHoldForAHugeDigest(t *testing.T) {
 		t.Fatalf("messages = %d, want several parts", len(msgs))
 	}
 	for _, m := range msgs {
-		assertWithinLimits(t, m)
+		assertWithinLimits(t, slack.Builder{}, m)
 	}
 }
 
 // TestSingleOversizedEntryIsCutVisibly is the one place a row can be shortened:
-// a single MR whose rendered text alone exceeds a section. It is marked, not
+// a single entry whose rendered text alone exceeds a section. It is marked, not
 // dropped.
 func TestSingleOversizedEntryIsCutVisibly(t *testing.T) {
 	t.Parallel()
 
 	b := slack.Builder{MaxSectionChars: 120}
 	d := slack.DigestData{
-		Team: "t",
-		ReviewsNeeded: []slack.ReviewerGroup{{
-			Reviewer: slack.Mention{SlackID: "U1"},
-			MRs: []slack.ReviewItem{{
-				Project: "payments", IID: 1, Title: strings.Repeat("y", 500),
-				Author: slack.Mention{SlackID: "U2"},
+		Team: "t", Project: "p",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			Own: []slack.AuthorItem{{
+				IID: 1, Title: "T",
+				ChangesRequestedBy: []slack.Mention{{Display: strings.Repeat("y", 500)}},
 			}},
 		}},
 	}
@@ -474,14 +824,14 @@ func TestSingleOversizedEntryIsCutVisibly(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("messages = %d, want 1", len(msgs))
 	}
-	body := blockTexts(t, msgs[0].Blocks)[2]
+	body := blockTexts(t, msgs[0].Blocks)[1]
 	if utf8.RuneCountInString(body) > 120 {
 		t.Errorf("section = %d runes, want ≤ 120", utf8.RuneCountInString(body))
 	}
 	if !strings.HasSuffix(body, "…") {
 		t.Errorf("a shortened row must be marked:\n%s", body)
 	}
-	if !strings.Contains(body, "payments !1") {
+	if !strings.Contains(body, "!1") {
 		t.Errorf("the MR itself must survive:\n%s", body)
 	}
 }
@@ -490,8 +840,11 @@ func TestHeaderIsClippedToSlacksLimit(t *testing.T) {
 	t.Parallel()
 
 	msgs := slack.BuildDigest(slack.DigestData{
-		Team:          strings.Repeat("n", 400),
-		AuthorActions: []slack.AuthorGroup{{Author: slack.Mention{SlackID: "U1"}, MRs: []slack.AuthorItem{{Project: "p", IID: 1}}}},
+		Team: strings.Repeat("n", 400),
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			Own:    []slack.AuthorItem{{Project: "p", IID: 1}},
+		}},
 	})
 	header := msgs[0].Blocks[0].Text.Text
 	if n := utf8.RuneCountInString(header); n > 150 {
@@ -502,20 +855,79 @@ func TestHeaderIsClippedToSlacksLimit(t *testing.T) {
 	}
 }
 
+// TestSectionsHonourAnyLimit sweeps the section limit. The two promises are owed
+// to whatever limit the builder was handed, not only to Slack's generous 3000:
+// no section may exceed it, and no entry may be cut to nothing to fit inside it.
+//
+// The bug this pins hid for a whole redesign because at 3000 the head arithmetic
+// leaves 2235 runes of slack, and the only test that shrank the limit measured
+// its sections against the 3000 constant.
+func TestSectionsHonourAnyLimit(t *testing.T) {
+	t.Parallel()
+
+	// A pathological display name and a tail, so both head forms — plain and
+	// " _(continued)_" — and both entry kinds are exercised at every limit.
+	p := slack.PersonDigest{Person: slack.Mention{Display: strings.Repeat("Very Long Name ", 12)}}
+	for i := range 20 {
+		p.ToReview = append(p.ToReview, slack.ReviewItem{
+			Project: "blockchain-api", IID: int64(1400 + i), Title: "CHAIN-7 fix the lookup",
+			WebURL:  fmt.Sprintf("https://gitlab.example.com/backend/blockchain-api/-/merge_requests/%d", 1400+i),
+			Waiting: time.Duration(i+1) * 24 * time.Hour,
+		})
+	}
+	for i := range 2 {
+		p.Own = append(p.Own, slack.AuthorItem{
+			Project: "wallet", IID: int64(70 + i), Title: "CHAIN-8 фикс отправки уведомлений",
+			WebURL:            fmt.Sprintf("https://gitlab.example.com/backend/wallet/-/merge_requests/%d", 70+i),
+			UnresolvedThreads: 3, MergeConflicts: true,
+		})
+	}
+	d := slack.DigestData{Team: "t", People: []slack.PersonDigest{p}}
+
+	// 1 floors to MinSectionChars; 59/60/61 straddle the limit below which a
+	// quarter of the section can no longer cover a continued head on its own.
+	for _, limit := range []int{1, 16, 17, 23, 31, 59, 60, 61, 120, 301, 1000, 3000} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			t.Parallel()
+
+			b := slack.Builder{MaxSectionChars: limit}
+			msgs := b.Build(d)
+			if len(msgs) == 0 {
+				t.Fatal("want messages")
+			}
+			for _, m := range msgs {
+				assertWithinLimits(t, b, m)
+			}
+			// Three detail rows, two own merge requests and at least one tail entry.
+			if n := countEntryLines(t, msgs); n < 6 {
+				t.Errorf("entry lines = %d, want at least 6", n)
+			}
+		})
+	}
+}
+
 func TestBuilderFloorsAbsurdLimits(t *testing.T) {
 	t.Parallel()
 
-	// A caller passing nonsense must not be able to make pagination spin.
+	// A caller passing nonsense must not be able to make pagination spin — and
+	// must not be able to make a merge request disappear. The floor is the limit
+	// the builder then works to, so it owes that limit the same two promises it
+	// owes 3000: never exceed it, never drop an entry to stay inside it. It used
+	// to do both here, because the continued head was bounded before its suffix
+	// was appended: the entry after it got a negative budget and was cut to "".
 	b := slack.Builder{MaxBlocks: 1, MaxSectionChars: 1}
 	msgs := b.Build(sampleDigest())
 	if len(msgs) == 0 {
 		t.Fatal("want messages")
 	}
 	for _, m := range msgs {
+		assertWithinLimits(t, b, m)
 		if len(m.Blocks) > 3 {
 			t.Errorf("blocks = %d, want ≤ 3", len(m.Blocks))
 		}
 	}
+	// sampleDigest: two reviews for U123, one merge request each for U456 and U789.
+	assertNoEntryLost(t, msgs, 4)
 }
 
 func TestMessagePostPayloadIsSerialisable(t *testing.T) {
@@ -544,20 +956,76 @@ func TestMessagePostPayloadIsSerialisable(t *testing.T) {
 	}
 }
 
-// assertWithinLimits checks the two Block Kit limits the builder owns.
-func assertWithinLimits(t *testing.T, m slack.Message) {
+// assertWithinLimits checks the two Block Kit limits the builder owns, against
+// the limits *this* builder works to rather than against Slack's constants.
+//
+// Measuring a shrunken Builder against MaxSectionChars (3000) made the helper
+// blind to a whole class of bug: a section 19 runes long against its own 16-rune
+// limit, with a merge request dropped to get there, sat inside a green test
+// through an entire redesign. The floors are part of the limit, so they are
+// applied here the same way the builder applies them.
+func assertWithinLimits(t *testing.T, b slack.Builder, m slack.Message) {
 	t.Helper()
-	if len(m.Blocks) > slack.MaxBlocksPerMessage {
-		t.Errorf("part %d has %d blocks, want ≤ %d", m.Part, len(m.Blocks), slack.MaxBlocksPerMessage)
+
+	maxBlocks, maxChars := slack.MaxBlocksPerMessage, slack.MaxSectionChars
+	if b.MaxBlocks > 0 {
+		maxBlocks = max(b.MaxBlocks, slack.MinBlocksPerMessage)
 	}
-	for i, b := range m.Blocks {
-		if b.Text == nil {
+	if b.MaxSectionChars > 0 {
+		maxChars = max(b.MaxSectionChars, slack.MinSectionChars)
+	}
+
+	if len(m.Blocks) > maxBlocks {
+		t.Errorf("part %d has %d blocks, want ≤ %d", m.Part, len(m.Blocks), maxBlocks)
+	}
+	for i, blk := range m.Blocks {
+		if blk.Text == nil {
 			continue
 		}
-		if n := utf8.RuneCountInString(b.Text.Text); b.Type == "section" && n > slack.MaxSectionChars {
-			t.Errorf("part %d block %d = %d chars, want ≤ %d", m.Part, i, n, slack.MaxSectionChars)
+		if n := utf8.RuneCountInString(blk.Text.Text); blk.Type == "section" && n > maxChars {
+			t.Errorf("part %d block %d = %d chars, want ≤ %d", m.Part, i, n, maxChars)
 		}
 	}
+}
+
+// assertNoEntryLost checks that every entry survived as its own non-empty line.
+func assertNoEntryLost(t *testing.T, msgs []slack.Message, wantEntries int) {
+	t.Helper()
+	if got := countEntryLines(t, msgs); got != wantEntries {
+		t.Errorf("entry lines = %d, want %d — one per merge request", got, wantEntries)
+	}
+}
+
+// countEntryLines counts the entry lines across every section and fails on a
+// blank one.
+//
+// Content assertions stop working at a shrunken limit — at 16 runes no line can
+// carry a whole link — but "one line per entry, none of them blank" holds at
+// every limit, and a blank line is exactly what a vanishing entry leaves behind:
+// the entry was cut to nothing and the newline before it stayed.
+func countEntryLines(t *testing.T, msgs []slack.Message) int {
+	t.Helper()
+
+	n := 0
+	for _, m := range msgs {
+		for _, blk := range m.Blocks {
+			if blk.Type != "section" {
+				continue
+			}
+			// The first line of a section is the group head; the rest are entries.
+			for i, line := range strings.Split(blk.Text.Text, "\n") {
+				if i == 0 {
+					continue
+				}
+				if strings.TrimSpace(line) == "" {
+					t.Errorf("part %d has a blank entry line — an entry was cut to nothing:\n%q",
+						m.Part, blk.Text.Text)
+				}
+				n++
+			}
+		}
+	}
+	return n
 }
 
 func blockTexts(t *testing.T, blocks []slack.Block) []string {

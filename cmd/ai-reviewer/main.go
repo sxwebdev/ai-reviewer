@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
 
 	"github.com/sxwebdev/ai-reviewer/internal/app"
 	"github.com/sxwebdev/ai-reviewer/internal/cli"
@@ -16,7 +15,6 @@ import (
 	"github.com/sxwebdev/xconfig/decoders/xconfigdotenv"
 	"github.com/sxwebdev/xconfig/decoders/xconfigyaml"
 	"github.com/sxwebdev/xconfig/plugins/loader"
-	"github.com/tkcrm/mx/launcher"
 	"github.com/tkcrm/mx/logger"
 )
 
@@ -53,13 +51,16 @@ func bootstrapLogger() (logger.ExtendedLogger, error) {
 }
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), launcher.ShutdownSiganl()...)
-	defer cancel()
-
 	l, err := bootstrapLogger()
 	if err != nil {
 		logger.Default().Fatalf("failed to build logger: %s", err)
 	}
+
+	// The logger comes first because the signal owner reports through it: a
+	// shutdown that says nothing is indistinguishable from one that is stuck, and
+	// the second signal has to be advertised at the moment the first arrives.
+	ctx, stop := app.ShutdownContext(context.Background(), l)
+	defer stop()
 
 	if err := cli.NewApp(l).Run(ctx, os.Args); err != nil {
 		l.Fatal(security.Mask(err.Error()))

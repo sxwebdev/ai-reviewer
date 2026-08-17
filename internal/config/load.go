@@ -39,14 +39,14 @@ type VaultConfig struct {
 	SecretPath    string `env:"VAULT_SECRET_PATH"`
 	KubeRole      string `env:"VAULT_KUBE_ROLE"`
 	KubeJWTPath   string `env:"VAULT_KUBE_JWT_PATH"`
-	KubeMountPath string `env:"VAULT_KUBE_MOUNT_PATH"`
-	AuthKind      string `env:"VAULT_AUTH_KIND" example:"kubernetes,token"`
+	KubeMountPath string `env:"VAULT_KUBE_MOUNT_PATH" default:"kubernetes"`
+	AuthKind      string `env:"VAULT_AUTH_KIND" default:"kubernetes" example:"kubernetes,token"`
 	// Token is a Secret like every other credential in the schema: it is the
 	// root of trust for all the others, and xconfigvault's own event callback
 	// logs e.Error on every auth failure, which is exactly where a bare string
 	// would surface.
 	Token           Secret        `env:"VAULT_TOKEN" secret:"true"`
-	RefreshInterval time.Duration `env:"VAULT_REFRESH_INTERVAL"`
+	RefreshInterval time.Duration `env:"VAULT_REFRESH_INTERVAL" default:"20s"`
 }
 
 // validate checks the Vault bootstrap in the same vocabulary as
@@ -92,16 +92,6 @@ func (c VaultConfig) validate() error {
 	return joinConfigErrors(errs)
 }
 
-// defaultVaultConfig mirrors DefaultConfig's approach: explicit defaults rather
-// than struct tags, so this struct loads under the same WithSkipDefaults rule.
-func defaultVaultConfig() VaultConfig {
-	return VaultConfig{
-		AuthKind:        "kubernetes",
-		KubeMountPath:   "kubernetes",
-		RefreshInterval: 20 * time.Second,
-	}
-}
-
 // LoadResult carries what the caller needs after a successful load.
 type LoadResult struct {
 	XConfig xconfig.Config
@@ -112,8 +102,12 @@ type LoadResult struct {
 	VaultClient *xconfigvault.Client
 }
 
-// Load reads the configuration into conf, which must already hold the defaults
-// (DefaultConfig()). Sources, in increasing priority: YAML → env → Vault.
+// Load reads the configuration into conf. Sources, in increasing priority: the
+// `default:` tags → YAML → env → Vault. A field explicitly present in the YAML
+// keeps its value even when it equals the zero value, which is what stops a
+// configured `false` from being refilled by a `true` default; see the package
+// doc. Callers pass Default() so the mx sub-configs mentioned in defaultOps are
+// already seeded.
 //
 // lg is used only for Vault lifecycle events; it is the bootstrap logger built
 // in main from a minimal pre-CLI load, since the real logger config is part of
@@ -168,9 +162,6 @@ func Load(ctx context.Context, lg logger.Logger, conf *Config, configPaths []str
 		xconfig.WithLoader(l),
 		xconfig.WithEnvPrefix(EnvPrefix),
 		xconfig.WithDisallowUnknownFields(),
-		// See the package doc: tag defaults would reset an explicit `false`.
-		xconfig.WithSkipDefaults(),
-		xconfig.WithSkipCustomDefaults(),
 		// urfave/cli owns os.Args; xconfig's flag plugin would fight it.
 		xconfig.WithSkipFlags(),
 		xconfig.WithPlugins(userPlugins...),
@@ -206,11 +197,9 @@ func loadVaultConfig(validatePlugin plugins.Plugin) (VaultConfig, error) {
 		return VaultConfig{}, fmt.Errorf("add .env: %w", err)
 	}
 
-	cfg := defaultVaultConfig()
+	var cfg VaultConfig
 	if _, err := xconfig.Load(&cfg,
 		xconfig.WithSkipFlags(),
-		xconfig.WithSkipDefaults(),
-		xconfig.WithSkipCustomDefaults(),
 		xconfig.WithLoader(vaultLoader),
 		xconfig.WithPlugins(validatePlugin),
 	); err != nil {

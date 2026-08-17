@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -200,11 +201,16 @@ func TestSnapshotReviewStatesFromGraphQL(t *testing.T) {
 		{"unreviewed", gitlab.ReviewStateUnreviewed, domain.ReviewStateUnreviewed, true},
 		{"reviewed", gitlab.ReviewStateReviewed, domain.ReviewStateReviewed, false},
 		{"approved", gitlab.ReviewStateApproved, domain.ReviewStateApproved, false},
-		{"requested changes before the last push", gitlab.ReviewStateRequestedChanges, domain.ReviewStateRequestedChanges, true},
-		// Enum values this build does not know must NOT read as "reviewed";
-		// they fall through to the REST heuristic, which nudges an untouched
-		// reviewer.
-		{"unknown enum degrades to the REST heuristic", gitlab.ReviewStateReviewStarted, domain.ReviewStateUnknown, true},
+		// The two states this build used to lose to the REST fallback. Both mean the
+		// reviewer still owes a verdict, and both were measured on a live project.
+		{"unapproved", gitlab.ReviewStateUnapproved, domain.ReviewStateUnapproved, true},
+		{"review started", gitlab.ReviewStateReviewStarted, domain.ReviewStateReviewStarted, true},
+		// The reviewer left no note here, so the verdict cannot be dated and the
+		// author is the one nudged — ClassifyAuthorActions reports the MR under them.
+		{"requested changes, undatable", gitlab.ReviewStateRequestedChanges, domain.ReviewStateRequestedChanges, false},
+		// An enum value this build does not know must NOT read as "reviewed"; it
+		// falls through to the REST heuristic, which nudges an untouched reviewer.
+		{"unknown enum degrades to the REST heuristic", gitlab.ReviewState("SOMETHING_NEW"), domain.ReviewStateUnknown, true},
 	}
 
 	for _, c := range cases {
@@ -323,7 +329,7 @@ func TestSnapshotRESTFallbackUsesApprovalsAndNotes(t *testing.T) {
 		}
 	})
 
-	t.Run("system notes are not activity", func(t *testing.T) {
+	t.Run("system notes never clear a reviewer", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t)
 		proj := testProject()
@@ -341,11 +347,187 @@ func TestSnapshotRESTFallbackUsesApprovalsAndNotes(t *testing.T) {
 			t.Fatalf("load: %v", err)
 		}
 		snap := loaded.Snapshot
-		if !snap.Reviewers[0].LastActivityAt.IsZero() {
-			t.Error("a system note is GitLab talking, not the reviewer")
-		}
+		// The REST fallback re-scans the discussions itself and skips system notes
+		// outright, so it cannot read GitLab's own event log as "the reviewer
+		// engaged" — regardless of what LastActivityAt ends up holding.
 		if !domain.NeedsHumanReview(snap, snap.Reviewers[0]) {
 			t.Error("a system note must not clear a reviewer")
+		}
+	})
+
+	t.Run("an ordinary note outranks a newer system note", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		proj := testProject()
+		seedGitLab(h.fake, proj, testMR(testMRIID, withReviewers(reviewer)))
+		// The push is last, so the system note is *usable* by the fallback's clamp:
+		// the ordinary note wins on precedence alone, not because the other was
+		// discarded for being too new.
+		setVersions(h.fake, proj, testMRIID, []gitlab.MergeRequestVersion{
+			{ID: 1, HeadCommitSHA: testHeadSHA, CreatedAt: "2026-08-13T12:00:00.000Z"},
+		})
+		setDiscussions(h.fake, proj, testMRIID, []gitlab.Discussion{{
+			ID: "d1",
+			Notes: []gitlab.Note{
+				{ID: 5, Author: reviewer, Body: "please fix", CreatedAt: "2026-08-13T10:00:00.000Z"},
+				{ID: 6, Author: reviewer, System: true, Body: "requested changes", CreatedAt: "2026-08-13T11:00:00.000Z"},
+			},
+		}})
+
+		loaded, err := h.svc.newSnapshotLoader(depthDigest).load(t.Context(), testTeam, proj, testMRIID)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		// The system-note fallback exists only for reviewers who wrote nothing at
+		// all: a real comment is the better evidence and must win even when a
+		// system note is newer.
+		want := time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC)
+		if got := loaded.Snapshot.Reviewers[0].LastActivityAt; !got.Equal(want) {
+			t.Errorf("LastActivityAt = %v, want the ordinary note's %v", got, want)
+		}
+	})
+}
+
+// TestSnapshotDatesAnUncommentedRequestedChangesVerdict walks the progression a
+// reviewer who clicks "Request changes" and writes nothing goes through.
+//
+// It used to dead-end. LastActivityAt counted non-system notes only, so such a
+// reviewer had none at all, and NeedsHumanReview answers false for an undated
+// verdict — which is correct while the ball is with the author but never stops
+// being true. The author's own push could not hand the MR back, so the reviewer
+// was never nudged again and the author read "changes requested by X" forever:
+// the stalled-MR-nobody-chases outcome the pairing was meant to prevent. The
+// partition itself held (the author kept the MR), which is why no existing test
+// caught it — both sides of the partition were tested, the *progression* was not.
+//
+// Every stage runs on the GraphQL path (reviewState REQUESTED_CHANGES), which is
+// the one where LastActivityAt decides anything: the REST fallback re-scans the
+// discussions and skips system notes outright, so it cannot show these bugs.
+func TestSnapshotDatesAnUncommentedRequestedChangesVerdict(t *testing.T) {
+	t.Parallel()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer"}
+	// GitLab records the click as a system note authored by the reviewer; the
+	// verdict itself (mergeRequestInteraction.reviewState) carries no timestamp.
+	verdictNote := gitlab.Note{
+		ID: 7, Author: reviewer, System: true, Body: "requested changes",
+		CreatedAt: "2026-08-13T09:30:00.000Z",
+	}
+	verdict := time.Date(2026, 8, 13, 9, 30, 0, 0, time.UTC)
+	// The push the reviewer looked at, and the author's answer to the verdict.
+	firstPush := gitlab.MergeRequestVersion{ID: 1, HeadCommitSHA: testHeadSHA, CreatedAt: "2026-08-13T09:00:00.000Z"}
+	fixPush := gitlab.MergeRequestVersion{ID: 2, HeadCommitSHA: "bbbb222", CreatedAt: "2026-08-13T10:00:00.000Z"}
+
+	// load rebuilds the snapshot from scratch: the loader cache is per-run, and
+	// each stage below is a separate digest run over the same merge request. Every
+	// note is installed as its own individual_note discussion, which is how GitLab
+	// returns system notes.
+	load := func(t *testing.T, versions []gitlab.MergeRequestVersion, notes ...gitlab.Note) domain.MergeRequestSnapshot {
+		t.Helper()
+		h := newHarness(t)
+		proj := testProject()
+		seedGitLab(h.fake, proj, testMR(testMRIID, withReviewers(reviewer)))
+		setVersions(h.fake, proj, testMRIID, versions)
+		var ds []gitlab.Discussion
+		for i, n := range notes {
+			ds = append(ds, gitlab.Discussion{
+				ID: "d" + strconv.Itoa(i), IndividualNote: true, Notes: []gitlab.Note{n},
+			})
+		}
+		setDiscussions(h.fake, proj, testMRIID, ds)
+		h.gql.States = map[int64][]gitlab.ReviewerState{
+			testMRIID: {{Username: "reviewer", State: gitlab.ReviewStateRequestedChanges}},
+		}
+
+		loader := h.svc.newSnapshotLoader(depthDigest)
+		loader.primeReviewStates(t.Context(), proj.PathWithNamespace, []int64{testMRIID})
+		loaded, err := loader.load(t.Context(), testTeam, proj, testMRIID)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if len(loaded.Snapshot.Reviewers) != 1 {
+			t.Fatalf("got %d reviewers, want 1", len(loaded.Snapshot.Reviewers))
+		}
+		return loaded.Snapshot
+	}
+
+	// claim asserts the partition and returns which side owns the MR: for a
+	// REQUESTED_CHANGES reviewer exactly one section must list it. Both would
+	// double-report it in the digest; neither would lose it silently.
+	claim := func(t *testing.T, snap domain.MergeRequestSnapshot) (reviewerOwes bool) {
+		t.Helper()
+		r := snap.Reviewers[0]
+		reviewerOwes = domain.NeedsHumanReview(snap, r)
+		authorOwes := len(domain.ClassifyAuthorActions(snap).ChangesRequestedBy) > 0
+		if reviewerOwes == authorOwes {
+			t.Fatalf("partition broken: reviewer owes = %v, author owes = %v; want exactly one",
+				reviewerOwes, authorOwes)
+		}
+		return reviewerOwes
+	}
+
+	t.Run("an unanswered verdict stays undated and sits with the author", func(t *testing.T) {
+		t.Parallel()
+		snap := load(t, []gitlab.MergeRequestVersion{firstPush}, verdictNote)
+		// The system note is newer than the last push, so it is not used: a system
+		// note may only ever prove a verdict *predates* a push. Dating the verdict
+		// from it would be indistinguishable from "the reviewer acted after the
+		// push", which is what lets a stray event evict a reviewer who is owed a
+		// re-look.
+		if got := snap.Reviewers[0].LastActivityAt; !got.IsZero() {
+			t.Errorf("LastActivityAt = %v, want the zero time: nothing predating the push says the reviewer engaged", got)
+		}
+		if claim(t, snap) {
+			t.Error("the author has not answered the verdict yet, so it is theirs to act on")
+		}
+	})
+
+	t.Run("the author's push dates the verdict and hands the MR back", func(t *testing.T) {
+		t.Parallel()
+		snap := load(t, []gitlab.MergeRequestVersion{firstPush, fixPush}, verdictNote)
+		if got := snap.Reviewers[0].LastActivityAt; !got.Equal(verdict) {
+			t.Errorf("LastActivityAt = %v, want the verdict's system note at %v", got, verdict)
+		}
+		if !claim(t, snap) {
+			t.Error("the author pushed after the verdict, so the reviewer owes the next look")
+		}
+	})
+
+	// The regression the first version of this fix introduced: any event GitLab
+	// credits to the reviewer dated the "verdict", so one stray act after the
+	// author's push parked the MR back in the author's list as "changes requested
+	// by R" — where it stayed until the next push, which the author has no reason
+	// to make. Work silently lost, and worse than the old behaviour, which at least
+	// kept the reviewer in "Reviews needed".
+	//
+	// The bodies below are real GitLab system notes. None of them is parsed: the
+	// rule is positional (newer than the last push ⇒ unusable), so it holds for
+	// wording this list does not contain.
+	t.Run("a later system note cannot take the MR back from the reviewer", func(t *testing.T) {
+		t.Parallel()
+		for _, body := range []string{
+			"added ~123 label",
+			"assigned to @someone-else",
+			"requested review from @colleague",
+			"added 3 commits",
+			"marked this merge request as ready",
+			"mentioned in merge request !999",
+			"changed milestone to %sprint-42",
+		} {
+			t.Run(body, func(t *testing.T) {
+				t.Parallel()
+				stray := gitlab.Note{
+					ID: 8, Author: reviewer, System: true, Body: body,
+					CreatedAt: "2026-08-13T11:00:00.000Z", // after the author's 10:00 fix
+				}
+				snap := load(t, []gitlab.MergeRequestVersion{firstPush, fixPush}, verdictNote, stray)
+				if got := snap.Reviewers[0].LastActivityAt; !got.Equal(verdict) {
+					t.Errorf("LastActivityAt = %v, want the verdict at %v: a later system note is not a re-review",
+						got, verdict)
+				}
+				if !claim(t, snap) {
+					t.Errorf("%q after the push must not clear the reviewer — the re-look would be lost", body)
+				}
+			})
 		}
 	})
 }

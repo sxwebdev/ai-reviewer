@@ -1,30 +1,62 @@
 # Configuration
 
-Sources, in increasing priority: **YAML file(s) → environment (`AI_REVIEWER_*`)
-→ Vault**. See [`config.example.yaml`](../config.example.yaml) for the full,
-commented set; the default path is `config.yaml` in the working directory, and a
-deployment configured purely through env and Vault needs no file at all.
+Sources, in increasing priority: **defaults → YAML file(s) → environment
+(`AI_REVIEWER_*`) → Vault**. See [`config.example.yaml`](../config.example.yaml)
+for the full, commented set; the default path is `config.yaml` in the working
+directory, and a deployment configured purely through env and Vault needs no file
+at all.
 
 Two things about this schema are worth knowing before you fight it:
 
-- **Defaults do not come from struct tags.** `config.DefaultConfig()` is the
-  single source of truth for defaults. Tag defaults fill every *zero* value
-  after the file is read, which would flip an explicit `false` in your YAML back
-  to `true`.
-- **Every externally-settable field carries an explicit `env:` tag**, so the
-  variable name is predictable. Without one, the name is derived by
-  word-splitting the Go field path, and `gitlab.token` would be
-  `AI_REVIEWER_GIT_LAB_TOKEN` (`GitLab` → `Git` + `Lab`).
+- **Defaults live in `default:` struct tags**, and a value you write in the YAML
+  always wins — including a value that happens to be the zero one. Setting
+  `graphql_enabled: false` against a `true` default keeps your `false`, because
+  the loader tracks which keys the file actually contained rather than looking for
+  empty fields.
+- **Most environment variable names are derived from the field path, not spelled
+  out.** `review.severity_threshold` is `AI_REVIEWER_REVIEW_SEVERITY_THRESHOLD`.
+  The exceptions are acronyms, where the derivation splits words the way Go
+  capitalises them: everything under `gitlab.` is tagged explicitly, because
+  `GitLab` would otherwise become `GIT_LAB`. Use the table below rather than
+  guessing.
+- **`teams[].ai_review.enabled` is the switch that spends money**, and it is per
+  team. `service.ai_review_publish_enabled` is not a second half of it: it decides
+  only whether findings are posted, and a review that posts nothing costs exactly
+  what a published one costs. The example config ships reviewing off for every
+  team, and `start` logs which teams it is on for
+  ([Operations](operations.md#dry-run-modes)).
 
 ## Environment variables
 
-The name is `AI_REVIEWER_` + the field's `env:` tag. **Do not derive names by
-hand from the YAML path** — most match, but the ones that do not are exactly the
-ones you would get wrong. The table below is generated from the actual struct
-tags in `internal/config/config.go`, and `TestEnvNamesRoundTrip` pins a sample of
-them against the loader.
+**Do not derive names by hand from the YAML path** — most match, but the ones that
+do not are exactly the ones you would get wrong. The table below follows the actual
+struct tags in `internal/config/config.go`, and for `log.*` and `ops.*` the tags of
+the embedded mx configs (`logger.Config`, `launcher/ops.Config`) — which is also
+where those defaults come from.
 
-Secrets are marked ★ — those are also the fields the Vault plugin fetches.
+Secrets are marked ★ — those are also the fields the Vault plugin fetches. ⚠ marks
+the three switches an env-only deployment has to set for the ops server to exist at
+all; see the second note below.
+
+Two defaults are worth reading before you trust the table:
+
+- **`review.workdir` defaults to the relative `./data`**, so a local run works
+  with no config. Inside the Docker image that relative path resolves against
+  `WORKDIR`, which is `/work` — so a container given no `review.workdir` uses
+  **`/work/data`**, inside the mounted volume. The image deliberately sets no
+  `AI_REVIEWER_REVIEW_WORKDIR`: the environment outranks the file, so the
+  variable would make the documented key inert in a container.
+  [`config.example.yaml`](../config.example.yaml) sets `workdir: /work`, which is
+  why the Compose install path lands on `/work` itself — change that key and the
+  container follows it.
+- **Every `ops.*.enabled` defaults to `false`.** Those defaults come from mx, not
+  from this schema, and mx ships the ops server off — including the health checker
+  and metrics. `config.example.yaml` turns all three on and Compose mounts it; a
+  deployment configured purely through the environment must set
+  `AI_REVIEWER_OPS_ENABLED`, `AI_REVIEWER_OPS_HEALTHY_ENABLED` and
+  `AI_REVIEWER_OPS_METRICS_ENABLED` itself, or it comes up with no listener on
+  10000 at all: no `/livez`, no `/readyz`, no `/metrics`
+  ([Operations](operations.md#observability)).
 
 | Variable                                          | YAML                                 | Default             |
 | ------------------------------------------------- | ------------------------------------ | ------------------- |
@@ -32,10 +64,13 @@ Secrets are marked ★ — those are also the fields the Vault plugin fetches.
 | **Logging / ops**                                 |                                      |                     |
 | `AI_REVIEWER_LOG_LEVEL`                           | `log.level`                          | `info`              |
 | `AI_REVIEWER_LOG_FORMAT`                          | `log.format`                         | `json`              |
-| `AI_REVIEWER_OPS_ENABLED`                         | `ops.enabled`                        | `true`              |
+| `AI_REVIEWER_OPS_ENABLED`                         | `ops.enabled`                        | `false` ⚠           |
+| `AI_REVIEWER_OPS_HEALTHY_ENABLED`                 | `ops.healthy.enabled`                | `false` ⚠           |
 | `AI_REVIEWER_OPS_HEALTHY_PORT`                    | `ops.healthy.port`                   | `10000`             |
 | `AI_REVIEWER_OPS_HEALTHY_LIVENESS_PATH`           | `ops.healthy.liveness_path`          | `/livez`            |
 | `AI_REVIEWER_OPS_HEALTHY_READINESS_PATH`          | `ops.healthy.readiness_path`         | `/readyz`           |
+| `AI_REVIEWER_OPS_HEALTHY_PATH`                    | `ops.healthy.path`                   | `/healthy`          |
+| `AI_REVIEWER_OPS_METRICS_ENABLED`                 | `ops.metrics.enabled`                | `false` ⚠           |
 | `AI_REVIEWER_OPS_METRICS_PORT`                    | `ops.metrics.port`                   | `10000`             |
 | `AI_REVIEWER_OPS_METRICS_PATH`                    | `ops.metrics.path`                   | `/metrics`          |
 | `AI_REVIEWER_OPS_PROFILER_ENABLED`                | `ops.profiler.enabled`               | `false`             |
@@ -91,7 +126,7 @@ Secrets are marked ★ — those are also the fields the Vault plugin fetches.
 | `AI_REVIEWER_REVIEW_MAX_COMMENTS`                 | `review.max_comments`                | `12`                |
 | `AI_REVIEWER_REVIEW_SEVERITY_THRESHOLD`           | `review.severity_threshold`          | `medium`            |
 | `AI_REVIEWER_REVIEW_PREFERRED_COMMENT_LANGUAGE`   | `review.preferred_comment_language`  | `auto`              |
-| `AI_REVIEWER_REVIEW_WORKDIR`                      | `review.workdir`                     | `/work`             |
+| `AI_REVIEWER_REVIEW_WORKDIR`                      | `review.workdir`                     | `./data`            |
 | `AI_REVIEWER_REVIEW_IGNORE_GLOBS`                 | `review.ignore_globs`                | see example         |
 | `AI_REVIEWER_REVIEW_PIPELINE_MODE`                | `review.pipeline.mode`               | `standard`          |
 | `AI_REVIEWER_REVIEW_PIPELINE_PASSES`              | `review.pipeline.passes`             | —                   |
@@ -129,6 +164,15 @@ Note the two that break the pattern: the Claude credentials are
 recognises it. The unprefixed `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`
 are **not** read from the service's own environment; they are constructed for
 the `claude` subprocess only.
+
+`slack.user_map` takes a value in any of three forms, and the form decides how it
+is resolved: a **user id** (`U…`/`W…`, upper case) answers offline and is the one
+to reach for when `users.list` is unavailable; an **@handle or bare handle** and an
+**email** are looked up in the directory like any other probe. Case is what tells
+an id from a handle — Slack lower-cases handles — so `wendy` is a handle and
+`W01WENDY` is an id. An override that resolves to nothing, or to more than one
+person, is a configuration error rather than a quiet fall-back to name matching:
+`doctor` resolves every entry and prints what each became.
 
 `llm.claude.passthrough_env` is the seam for a deployment whose `claude` needs a
 variable the built-in inheritance allowlist does not carry (see [Security

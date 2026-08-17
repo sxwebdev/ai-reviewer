@@ -120,9 +120,26 @@ COPY --from=build /out/ai-reviewer /usr/local/bin/ai-reviewer
 
 USER app
 
-# /work is review.workdir: ephemeral mirrors and worktrees, swept by the cleanup
-# job. Mount an emptyDir (or a tmpfs) over it — the image layer must not be the
-# place a 2 GB mirror lands.
+# /work is where review.workdir belongs: ephemeral mirrors and worktrees, swept
+# by the cleanup job. Mount a volume (an emptyDir, or a tmpfs) over it — the
+# image layer must not be the place a 2 GB mirror lands.
+#
+# WORKDIR is the whole mechanism, and deliberately NOT an
+# `ENV AI_REVIEWER_REVIEW_WORKDIR=/work`. The environment outranks the config
+# file, so that variable silently made `review.workdir` inert inside the
+# container: an operator who mounted a volume at /var/lib/ai-reviewer and wrote
+# the path into the config.yaml docker-compose.yml bind-mounts still got /work,
+# with nothing in the log to say why. A documented key that cannot be set from
+# the documented file is worse than one extra path level.
+#
+# What the schema default does instead: it is the relative ./data (so a local
+# `ai-reviewer start` works with no config at all), and relative resolves
+# against WORKDIR — so a container with no `review.workdir` key puts mirrors in
+# /work/data. That is still inside the mounted volume, one level below /work
+# rather than on the image layer, and app.ensureWorkdirWritable creates it.
+# config.example.yaml sets `workdir: /work` explicitly, so the documented
+# compose path lands exactly on /work and the config file remains the thing that
+# decides.
 WORKDIR /work
 
 # ENTRYPOINT only, deliberately no CMD. This image is the whole CLI — `start`,

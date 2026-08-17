@@ -34,6 +34,12 @@ func (w *ReviewWorker) Work(ctx context.Context, job *river.Job[ReviewArgs]) err
 	return tracked(job, func() error {
 		args := job.Args
 
+		// A review does not take part in the drain: it cannot finish inside the
+		// window and would spend the whole of it paying for output nobody reads.
+		// See Service.withShutdown.
+		ctx, cancel := w.svc.withShutdown(ctx)
+		defer cancel()
+
 		// Under the same advisory lock `--local` takes. River's uniqueness
 		// excludes a second *queued* review of this SHA; it knows nothing about a
 		// CLI process running one in-process, and the two together are what §15

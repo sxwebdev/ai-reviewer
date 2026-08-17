@@ -98,6 +98,21 @@ var (
 		Help: "Cumulative LLM cost in USD, as reported by the provider.",
 	}, []string{"team"})
 
+	// ReviewFindingsSuppressedTotal counts findings the pipeline dropped, by the
+	// stage that dropped them (threshold, duplicate, skeptic, verifier,
+	// not_in_diff, empty, max_comments).
+	//
+	// It is what makes "the reviews find nothing" answerable. A rising
+	// not_in_diff, in particular, means the model keeps wanting to comment on code
+	// the merge request does not touch — a prompt or context problem, not a quiet
+	// codebase. max_comments is the one stage an operator can undo: it means the
+	// review had more to say than review.max_comments allows. The label set is
+	// closed (review.Suppress* constants), so cardinality is bounded.
+	ReviewFindingsSuppressedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ai_review_findings_suppressed_total",
+		Help: "Findings dropped by the review pipeline, by suppression stage.",
+	}, []string{"team", "stage"})
+
 	// GitLabRequestsTotal is labelled by endpoint *template* (e.g.
 	// "/projects/:key/merge_requests/:iid"), never by a concrete path: real ids
 	// would make cardinality unbounded.
@@ -116,12 +131,21 @@ var (
 		Help: "Open merge requests inspected during scans.",
 	}, []string{"team"})
 
-	// The four gauges below are the digest's state, not events: they are
-	// overwritten every scan pass (see SetTeamState) so a team that drops to
+	// The gauges below are the digest's state, not events: they are overwritten
+	// every time a digest is built (see SetTeamState) so a team that drops to
 	// zero reports zero instead of keeping its last non-zero value forever.
 	MergeRequestsWaitingHumanReview = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "merge_requests_waiting_human_review_total",
 		Help: "Open merge requests where at least one reviewer still owes an action.",
+	}, []string{"team"})
+
+	// MergeRequestsWithChangesRequested is the author-side counterpart of
+	// MergeRequestsWaitingHumanReview: a standing "Request changes" verdict nobody
+	// has answered with a push. It was unmeasurable before the digest looked at
+	// reviewer state on the author side at all.
+	MergeRequestsWithChangesRequested = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "merge_requests_with_changes_requested_total",
+		Help: "Open merge requests whose author owes a response to a requested-changes review.",
 	}, []string{"team"})
 
 	MergeRequestsWithUnresolvedThreads = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -212,6 +236,19 @@ func ReviewFailed(team, reason string) { ReviewsFailedTotal.WithLabelValues(team
 // ReviewSkipped records a merge request the scanner decided not to review.
 func ReviewSkipped(team, reason string) { ReviewsSkippedTotal.WithLabelValues(team, reason).Inc() }
 
+// ReviewFindingsSuppressed records one review's suppression tally, keyed by
+// stage. Called with the engine's untruncated counts; an empty map records
+// nothing, which keeps a clean review from inventing zero-valued series for every
+// stage.
+func ReviewFindingsSuppressed(team string, counts map[string]int) {
+	for stage, n := range counts {
+		if n <= 0 {
+			continue
+		}
+		ReviewFindingsSuppressedTotal.WithLabelValues(team, stage).Add(float64(n))
+	}
+}
+
 // MergeRequestsScanned adds n inspected merge requests for a team.
 func MergeRequestsScanned(team string, n int) {
 	MergeRequestsScannedTotal.WithLabelValues(team).Add(float64(n))
@@ -241,16 +278,28 @@ func statusLabel(status int) string {
 // TeamState is the per-team MR classification a scan pass produced.
 type TeamState struct {
 	WaitingHumanReview int
-	UnresolvedThreads  int
-	Conflicts          int
-	FailedPipeline     int
+	// ChangesRequested is merge requests whose author owes a response to a
+	// standing "Request changes" verdict. Distinct from WaitingHumanReview: the two
+	// are mutually exclusive per reviewer, and the split is what tells a team
+	// whether its queue is stuck on reviewers or on authors.
+	ChangesRequested  int
+	UnresolvedThreads int
+	Conflicts         int
+	FailedPipeline    int
 }
 
-// SetTeamState publishes a team's MR classification. Call it once per scan pass
-// per team, including when every count is zero: these are gauges, so a team
+// SetTeamState publishes a team's MR classification. Call it once per digest
+// build per team, including when every count is zero: these are gauges, so a team
 // that is skipped keeps reporting stale numbers until it is set again.
+//
+// Per digest, not per scan, and the distinction matters when reading a dashboard:
+// the classification needs a whole team at once, which is what BuildDigest sees
+// and a per-repository scan pass does not, so these five gauges step twice a day
+// (09:00 and 16:30 Europe/Moscow) rather than every five minutes. A flat line
+// between the slots is the metric working as intended.
 func SetTeamState(team string, s TeamState) {
 	MergeRequestsWaitingHumanReview.WithLabelValues(team).Set(float64(s.WaitingHumanReview))
+	MergeRequestsWithChangesRequested.WithLabelValues(team).Set(float64(s.ChangesRequested))
 	MergeRequestsWithUnresolvedThreads.WithLabelValues(team).Set(float64(s.UnresolvedThreads))
 	MergeRequestsWithConflicts.WithLabelValues(team).Set(float64(s.Conflicts))
 	MergeRequestsWithFailedPipeline.WithLabelValues(team).Set(float64(s.FailedPipeline))

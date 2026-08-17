@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,12 +79,18 @@ type Result struct {
 	Recommendation string
 	Findings       []ValidatedFinding
 	Suppressed     []SuppressedFinding // dropped-but-surfaced findings (informational, never published)
-	MissingTests   []llm.MissingTest
-	Questions      []llm.Question
-	Raw            string
-	CostUSD        float64
-	PassReports    []PassReport
-	Completeness   *CompletenessReport
+	// SuppressedCounts is how many findings each Suppress* stage dropped, counted
+	// BEFORE Suppressed is ranked and capped at maxSuppressed. Reading the counts
+	// off the capped slice would understate a noisy run, which is exactly the run
+	// worth understanding. It answers "the review found nothing — why?" without a
+	// database query.
+	SuppressedCounts map[string]int
+	MissingTests     []llm.MissingTest
+	Questions        []llm.Question
+	Raw              string
+	CostUSD          float64
+	PassReports      []PassReport
+	Completeness     *CompletenessReport
 }
 
 // Engine runs the LLM review pipeline.
@@ -211,11 +218,19 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		suppressed = append(suppressed, verifierDropped...)
 	}
 
-	// Stage 6: finalize.
+	// Stage 6: finalize. The cap records what it cuts (SuppressMaxComments) —
+	// findings that survived every gate and only ranked too low are still findings
+	// the review paid for and discarded, and this is the drop an operator can undo
+	// by raising review.max_comments.
 	rankFindings(findings)
-	if len(findings) > maxComments {
-		findings = findings[:maxComments]
-	}
+	findings, capped := capFindings(findings, maxComments,
+		fmt.Sprintf("ranked outside the %d comments review.max_comments allows", maxComments))
+	suppressed = append(suppressed, capped...)
+
+	// Counted before the cap: the truncated slice is for display, the counts are
+	// for explaining the outcome, and a run noisy enough to be truncated is the one
+	// most in need of explaining.
+	suppressedCounts := countSuppressed(suppressed)
 	// Suppressed items are informational only — rank by severity and bound the
 	// list so a noisy run can't bloat the stored review.
 	suppressed = rankSuppressed(suppressed)
@@ -233,14 +248,55 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		reports = append(reports, rep)
 	}
 
+	// The suppression breakdown is the difference between "found nothing" and
+	// "found something and threw it away", which used to be invisible: the reasons
+	// existed only inside pipeline_json, so explaining a $5 review that published
+	// nothing meant querying the database.
 	e.log.Infow("review complete",
 		"passes", len(specs), "raw_findings", len(merged.Findings), "validated", len(findings),
+		"suppressed", formatSuppressedCounts(suppressedCounts),
 		"risk", merged.RiskLevel, "cost_usd", merged.CostUSD)
 
 	res := assembleResult(merged, findings, reports)
 	res.Suppressed = suppressed
+	res.SuppressedCounts = suppressedCounts
 	res.Completeness = completeness
 	return res, nil
+}
+
+// countSuppressed tallies suppressions by stage.
+func countSuppressed(fs []SuppressedFinding) map[string]int {
+	if len(fs) == 0 {
+		return nil
+	}
+	counts := make(map[string]int, len(fs))
+	for _, f := range fs {
+		counts[f.Stage]++
+	}
+	return counts
+}
+
+// formatSuppressedCounts renders the tally as "not_in_diff=2 threshold=1" —
+// stage order fixed so two log lines from different runs can be compared by eye.
+// Empty when nothing was suppressed, so the quiet case stays quiet.
+func formatSuppressedCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	stages := make([]string, 0, len(counts))
+	for stage := range counts {
+		stages = append(stages, stage)
+	}
+	sort.Strings(stages)
+
+	var b strings.Builder
+	for _, stage := range stages {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s=%d", stage, counts[stage])
+	}
+	return b.String()
 }
 
 // applyReflect merges a self-reflection result back into the review response

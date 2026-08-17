@@ -97,6 +97,12 @@ const (
 // before scan_repo re-enqueues its publication (§6.3 safety net).
 const defaultStalePublishAfter = 15 * time.Minute
 
+// defaultReviewGrace is the fallback for Config.ReviewGrace: comfortably longer
+// than any review the queue permits, so a `review --local` run outside the queue
+// is not mistaken for a crashed one either. The real value comes from
+// jobs.ReviewTimeout via the composition root.
+const defaultReviewGrace = 45 * time.Minute
+
 // SlackAPI is the Slack surface this package needs. It is declared here rather
 // than imported as *slack.Client so a test can drive delivery through an
 // httptest server or a stub without the digest builder depending on either.
@@ -164,6 +170,16 @@ type Config struct {
 
 	// StalePublishAfter overrides the 15m threshold of the §6.3 safety net.
 	StalePublishAfter time.Duration
+
+	// ReviewGrace is how long an attempt row written by startAttempt is believed
+	// to belong to a review that is still running rather than to one that died
+	// without a word. It must exceed the review job's own timeout, so the
+	// composition root derives it from jobs.ReviewTimeout — this layer cannot
+	// import internal/jobs, and duplicating the number as a local constant is how
+	// the two silently drift apart.
+	//
+	// Zero falls back to defaultReviewGrace.
+	ReviewGrace time.Duration
 
 	// Now is injectable so backoff and digest timing are testable without
 	// sleeping. Nil means time.Now.
@@ -234,6 +250,9 @@ func newService(deps Deps, cfg Config) *Service {
 	if cfg.StalePublishAfter <= 0 {
 		cfg.StalePublishAfter = defaultStalePublishAfter
 	}
+	if cfg.ReviewGrace <= 0 {
+		cfg.ReviewGrace = defaultReviewGrace
+	}
 	log := deps.Log
 	if log == nil {
 		log = logger.Default()
@@ -280,6 +299,13 @@ func (s *Service) team(name string) (domain.Team, bool) {
 func (s *Service) aiReviewEnabled(team string) bool {
 	t, ok := s.team(team)
 	if !ok {
+		// Said out loud, because from the queue's side this is how a review runs
+		// for a team whose switch is off: a job enqueued before the team was
+		// renamed or removed still carries the old name, finds no team, and is
+		// treated as an explicit request. Rare, and impossible to work out from a
+		// log that stays silent about it.
+		s.log.Warnw("review requested for a team that is not configured; treating ai_review as enabled",
+			"team", team)
 		return true
 	}
 	return t.AIReview

@@ -52,7 +52,9 @@ Runtime: `ai-reviewer {start,scan,review,digest,doctor,migrations}`.
 - `doctor [--local]` checks config, git, `claude` auth under the configured
   mode, timezone, Postgres, pending migrations, River tables, GitLab auth and
   every repository, `head_pipeline` visibility, Slack membership per channel,
-  workdir writability. Non-zero exit on any failure. Run it after config changes.
+  the Slack **directory** (`users.list` — the scope failure that silently breaks
+  every mention) and every `slack.user_map` entry resolved against it, workdir
+  writability. Non-zero exit on any failure. Run it after config changes.
 - `<ref>` accepts a full MR URL, `group/sub/repo!123` or `project-id:iid`
   (`internal/gitlab/ref.go`).
 
@@ -153,7 +155,28 @@ example — it is why `internal/service` never imports River).
 - **Never** approve or merge an MR; never resolve or delete other people's
   discussions; never change reviewers, labels, title or description.
 - **Findings only on changed lines.** A finding whose file is not in the MR diff
-  is dropped.
+  is dropped — but *recorded*, as `SuppressNotInDiff`, and counted into
+  `Result.SuppressedCounts` before that list is capped. Dropping it invisibly is
+  what made "the review cost $5 and published nothing" unanswerable without a
+  database query. Never publish one; never discard one silently either.
+  **Every** drop goes through a stage, including the two cheap ones it is tempting
+  to write as a bare slice cut: `SuppressEmpty` and `SuppressMaxComments`
+  (`validator.capFindings` is the single chokepoint for both cap sites — the
+  validator's own and the engine's final cut). A cap that silently truncated left
+  `raw_findings: 40, validated: 2, suppressed: ""`, which is the exact question the
+  field exists to answer.
+- **The digest's two sections are a partition, not an overlap.** For a reviewer in
+  `REQUESTED_CHANGES`, exactly one side claims the merge request:
+  `NeedsHumanReview` takes it back once the author pushes after the verdict, and
+  `ClassifyAuthorActions.ChangesRequestedBy` holds it until then. Change one rule
+  without the other and the MR is either reported twice or vanishes from the digest
+  entirely — the second is what used to happen. **Both rules need the verdict to
+  have a date**, and that is why `service.lastActivityAt` falls back to the
+  reviewer's newest *system* note when they left no ordinary one: "Request changes"
+  with no comment is a system note, and with a zero timestamp the push comparison
+  can never fire — the author read "changes requested by X" for the life of the MR
+  and X was never asked to look again. Zero now means "no note of any kind was
+  readable", the residual case, and it still parks the MR with the author.
 - **Dedup by fingerprint** — `review.Fingerprint(projectID, mrIID, file,
   category, title)`, sha256, head-SHA-independent. This is the dedupe contract in
   Postgres *and* in the GitLab markers: do not change its inputs or format.
@@ -222,6 +245,15 @@ commands.
   an OOM inside the LLM pass is countable even though River never re-runs it, and
   a review killed by **our own shutdown** discards its row (four deploys must not
   blacklist a healthy SHA) while a job *timeout* does count.
+- **Two switches, two different questions.** `teams[].ai_review.enabled` decides
+  whether the LLM runs; `service.ai_review_publish_enabled` decides only whether
+  the result is posted. A dry run costs exactly as much as a published one, so the
+  publish switch is not a cost control and must never be described as one —
+  `config.example.yaml` therefore ships every team with reviewing **off**, and
+  `App.logEffectiveMode` prints both at startup because "why is it reviewing?" was
+  unanswerable from the log. `service.aiReviewEnabled` treats an *unknown* team as
+  enabled (the CLI can review any MR) and now says so in a WARN: that is the one
+  path by which a stale queued job reviews for a team whose switch is off.
 - **Transactions.** `service.RunReview` takes an `OnPersist` callback that runs
   *inside* the transaction writing `mr_reviews` + `mr_findings`; `internal/jobs`
   passes a closure calling `river.InsertTx`. That single commit is what makes
@@ -235,18 +267,38 @@ commands.
   counted by `slack_resend_uncertain_total`. That counter must keep meaning "a
   human may see this twice": an answer that *refuses* delivery hands the claim
   back, and only a transport failure or 5xx leaves the row at `sending`.
-- **Config.** Sources: YAML → env (`AI_REVIEWER_*`) → Vault. Two rules that break
-  things silently if dropped. (1) **Defaults come from `DefaultConfig()`, not
-  struct tags** — the defaults plugin fills zero values after the file load and
-  would flip an explicit `false` back to `true`; pinned by
-  `TestLoadPreservesExplicitFalse`, and the consequence is that embedded
-  third-party defaults (`logger.Config`, `ops.Config`) must be populated
-  explicitly. (2) **Every externally-settable field needs an explicit `env:`
-  tag** — otherwise xconfig word-splits the field path and `gitlab.token` becomes
-  `AI_REVIEWER_GIT_LAB_TOKEN`; pinned by `TestEnvNamesRoundTrip`. The Vault key is
-  the field's full env name, prefix included. Leaf fields inside `teams[]`
-  deliberately carry no `env:` tag: inside a slice element the name is built from
-  the expanded path (`AI_REVIEWER_TEAMS_0_NAME`).
+- **Config.** Sources, in increasing priority: `default:` tags → YAML → env
+  (`AI_REVIEWER_*`) → Vault. One tag per job, and the division matters:
+  - **`yaml:` on every field, no exceptions** — pinned by
+    `TestEveryFieldHasAYAMLTag`. It names the file key *and* is what xconfig
+    re-resolves to decide a field was explicitly present in the file; a present
+    field is never overwritten by its default, which is what keeps a configured
+    `false` from being refilled with `true`. Without the tag that lookup silently
+    falls back to the lower-cased Go name and stops matching.
+  - **`default:` carries the value.** `DefaultConfig()` is gone; `config.Default()`
+    just runs the tag pass and nothing in this package is hand-written. Embedded
+    third-party configs (`logger.Config`, `ops.Config`) bring their own tags and
+    must not be restated. That includes the ops switches, which mx defaults to
+    **off**: what `/livez`, `/readyz` and `/metrics` expose is the deployment's
+    call. `config.example.yaml` turns them on (and the compose file mounts it);
+    an env-only deployment sets `AI_REVIEWER_OPS_*` itself.
+  - **`env:` only where the derived name is wrong.** xconfig word-splits the Go
+    field path, which is right nearly everywhere (`Review.SeverityThreshold` →
+    `AI_REVIEWER_REVIEW_SEVERITY_THRESHOLD`) and wrong for acronyms: `GitLab`
+    splits into `GIT_LAB`, so every `GitLabConfig` field keeps a tag, as do
+    `Review.WorkDir` (`REVIEW_WORK_DIR`) and the two auth secrets deliberately
+    named after Anthropic's own variables. A tag that restates the derived name is
+    noise — adding one is not "being explicit". Tagging the *parent* is not a
+    shortcut: xconfig then snake-cases the leaf per character and `BaseURL`
+    becomes `BASE_U_R_L`. The Vault key is the field's full env name, prefix
+    included, so **changing a name moves the secret** — diff
+    `xconfig.GenerateMarkdown` before and after any tag edit. Leaf fields inside
+    `teams[]` carry no `env:` tag: inside a slice element the name is built from
+    the expanded path (`AI_REVIEWER_TEAMS_0_NAME`).
+  - **xconfig is not tested here.** Defaulting order, env-name derivation and
+    unknown-key rejection are the library's contracts, not this repository's;
+    `internal/config` tests only our own decisions (safety switches, `Validate()`
+    vocabulary, schema shape).
 - **Database.** Not-found is `pgx.ErrNoRows`; there is no sentinel-error package.
   The zero `dbtypes.JSON` marshals to SQL NULL while every `*_json` column is
   `NOT NULL`, so pass `dbtypes.EmptyObject()`. `mr_findings` has no generated
@@ -275,16 +327,43 @@ commands.
   Do not move any of them into a default.
 - **Metrics.** Declared with `promauto` on the **default** registry in
   `internal/metrics`; other packages call the exported helpers and label
-  constants. Two call-site rules: `gitlab_requests_total{endpoint}` must receive
-  the **templated** path (wire it through `gitlab.Config.Observer`), and
-  `SetTeamState` must be called every pass **including when all counts are zero**,
-  or a stale gauge persists forever.
+  constants. Three call-site rules: `gitlab_requests_total{endpoint}` must receive
+  the **templated** path (wire it through `gitlab.Config.Observer`);
+  `SetTeamState` must be called on **every digest build, including when all counts
+  are zero**, or a stale gauge persists forever (per digest, not per scan — the
+  classification needs a whole team at once, so the gauges step twice a day and a
+  flat line between the slots is correct); and `internal/review` does **not** import
+  this package — like `internal/gitlab`, it reports numbers on its result and
+  `internal/service` publishes them (`ReviewFindingsSuppressed`).
 - **Lifecycle.** River starts on `context.WithoutCancel(ctx)` so mx's shutdown
   cannot hard-cancel in-flight jobs before `Stop` drains them; the jobs service is
   registered with `ShutdownTimeout = drain_timeout + 5s`; `launcher.WithService`
   is duck-typed; registration order is start order and shutdown is LIFO, so
   Postgres is registered first and stops last. The upstream helper really is
   spelled `launcher.ShutdownSiganl()`.
+  - **One signal owner: `app.ShutdownContext`, and `launcher.WithSignal(false)`
+    is the other half of it.** `os/signal` delivers to *every* registered channel
+    and the first registration removes the default disposition, so two handlers
+    are not redundancy — they are a race whose loser leaves nothing armed while
+    Ctrl-C has already stopped killing anything. mx arms its own force-exit
+    watcher only inside the branch where its channel won. Reproduced on the old
+    arrangement: three runs, one sat through the whole drain ignoring every
+    further signal. First signal cancels the context, second exits 1.
+  - **Reviews do not take part in the drain** (`jobs.Service.withShutdown`). A
+    review needs 4–10 minutes and the window is 60s, so draining one cannot let
+    it finish — it only holds the shutdown open while still paying the model.
+    They are cancelled when `Stop` begins; `service.recordFailure` already treats
+    our own shutdown as not-the-MR's-fault and discards the attempt row.
+  - **Do not degrade on our own shutdown.** `prepareWorktree` falls back to a
+    diff-only review for every infrastructure failure *except* interruption
+    (`interruptedByShutdown`), because degrading there starts a full LLM pass on a
+    process that is already leaving. Both halves of that predicate are deliberately
+    narrow, and widening either one is a real bug: `context.Canceled`
+    **specifically**, never `ctx.Err() != nil` — a review that ran out of
+    `jobs.ReviewTimeout` is the MR's own fault and must reach the §6.5 ladder — and
+    `git.Signalled` only for SIGINT/SIGTERM/SIGQUIT, because a true answer discards
+    the attempt row, so an OOM-killed `git fetch` counted as "shutdown" would
+    re-review the same doomed SHA at full price every scan, forever.
 - **Logging** is `github.com/tkcrm/mx/logger` (zap). New code takes
   `logger.Logger`, never `*slog.Logger`.
 - **Testing.** The engine, services, validator, line mapper, domain classifiers,
@@ -294,6 +373,12 @@ commands.
   stay fake-testable, and always run with `-race`. **No review has ever run
   against a real GitLab instance**; every path is exercised through fakes, so
   treat first contact with a live instance as untested ground.
+  One limit of the private-database trick: `storetest` names the database after the
+  **package**, so different packages never collide but two concurrent runs of the
+  *same* package truncate each other's rows. That looks exactly like a real
+  intermittent bug ("no rows in result set" on a review the test just wrote), so do
+  not run the same package twice at once — it cost two false leads during a
+  multi-agent session.
 - **Comments explain *why*, not *what*.** This tree is unusually well commented
   at decision points, and most of those comments record a failure mode that was
   hit once. Match that density; do not strip them.
@@ -324,6 +409,14 @@ compose files).
 - The service gets `AI_REVIEWER_CONFIG` as an environment variable rather than a
   `--config` flag, so `docker compose exec ai-reviewer ai-reviewer doctor` finds
   the config too instead of looking for `./config.yaml` in `/work`.
+- **`AI_REVIEWER_CONFIG` is the only `AI_REVIEWER_*` the image sets, and that is a
+  rule, not an accident.** The environment outranks the file, so every variable
+  baked into the image makes the matching config key unsettable by whoever mounts a
+  config. `review.workdir` was the case that proved it: an `ENV
+  AI_REVIEWER_REVIEW_WORKDIR=/work` made a mounted `workdir:` silently inert. The
+  container's path comes from `WORKDIR /work` plus the relative `./data` default
+  (→ `/work/data`, inside the mounted volume), and `config.example.yaml` is what
+  puts it at `/work` itself.
 - Claude Code needs 4 GB+ RAM per concurrent process; `review.max_parallel` of
   them run in one replica.
 

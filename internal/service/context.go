@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/sxwebdev/ai-reviewer/internal/git"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/security"
@@ -33,22 +34,64 @@ const (
 //
 // Every failure degrades to a diff-only review rather than failing the run: an
 // unreachable mirror is an infrastructure problem, not a reason to skip the MR.
-// The returned cleanup is always non-nil.
-func (s *Service) prepareWorktree(ctx context.Context, proj *gitlab.Project, headSHA string) (dir string, agent bool, cleanup func()) {
+// The one exception is our own shutdown, which is returned as an error — see
+// interruptedByShutdown. The returned cleanup is always non-nil.
+//
+// The abort error carries the git failure as text and context.Canceled as the
+// wrapped sentinel, deliberately in that order of machine-readability: exactly
+// one thing in the chain is matchable, the sentinel recordFailure discriminates
+// on, so no future errors.Is on this error can accidentally hit whatever git
+// happened to wrap. The cause is only in the message — but it must be there. An
+// abort that logged just "interrupted: context canceled" is why a misclassified
+// signal (the OOM killer read as a shutdown) survived a live run unnoticed: the
+// one line written about the aborted review named no signal and no operation.
+// Nothing leaks by including it — Cache.run has already masked its output through
+// security.Mask, and recordFailure masks the copy it stores again.
+func (s *Service) prepareWorktree(ctx context.Context, proj *gitlab.Project, headSHA string) (dir string, agent bool, cleanup func(), err error) {
 	noop := func() {}
 	if s.cache == nil || !s.cfg.AgentMode || proj.HTTPURLToRepo == "" || headSHA == "" {
-		return "", false, noop
+		return "", false, noop, nil
 	}
 	if _, err := s.cache.EnsureMirror(ctx, proj.HTTPURLToRepo, s.cfg.Host, proj.PathWithNamespace, s.cfg.Token); err != nil {
+		if interruptedByShutdown(ctx, err) {
+			return "", false, noop, fmt.Errorf("mirror fetch interrupted (%v): %w", err, context.Canceled)
+		}
 		s.log.Warnw("agent mode: mirror failed, falling back to diff-only review", "err", err)
-		return "", false, noop
+		return "", false, noop, nil
 	}
 	wt, done, err := s.cache.AddWorktree(ctx, s.cfg.Host, proj.PathWithNamespace, headSHA)
 	if err != nil {
+		if interruptedByShutdown(ctx, err) {
+			return "", false, noop, fmt.Errorf("worktree checkout interrupted (%v): %w", err, context.Canceled)
+		}
 		s.log.Warnw("agent mode: worktree failed, falling back to diff-only review", "err", err)
-		return "", false, noop
+		return "", false, noop, nil
 	}
-	return wt, true, done
+	return wt, true, done, nil
+}
+
+// interruptedByShutdown reports whether a git failure was this process stopping
+// rather than an infrastructure problem — the one case where degrading to a
+// diff-only review is wrong, because the degraded review would immediately spend
+// LLM budget on a run that is about to be thrown away.
+//
+// Two signals, because both happen at once in a terminal and either can be seen
+// first: our context is cancelled (SIGTERM in production, the jobs service's own
+// shutdown), or the git child was killed by the SIGINT the terminal delivered to
+// the whole process group before that cancellation arrived. The first live run
+// showed the second, twice, within a millisecond of Ctrl-C.
+//
+// context.Canceled specifically, never "ctx.Err() != nil": a true answer here
+// becomes a wrapped context.Canceled above, which is precisely what makes
+// recordFailure DISCARD the attempt row instead of counting it. A review that ran
+// out of its jobs.ReviewTimeout budget while the mirror was being fetched arrives
+// as context.DeadlineExceeded, and that is the merge request's own fault — the
+// pathological case the §6.5 ladder exists for. Treating it as shutdown made the
+// ladder blind to it: nothing recorded, so the same head SHA was re-enqueued at
+// full price on every scan, forever. A deadline therefore degrades like any other
+// infrastructure failure and lets the review fail where it can be counted.
+func interruptedByShutdown(ctx context.Context, err error) bool {
+	return errors.Is(ctx.Err(), context.Canceled) || git.Signalled(err)
 }
 
 // buildFileContexts assembles full or hunk-windowed content of the changed

@@ -23,10 +23,12 @@ var allNames = []string{
 	"ai_reviews_skipped_total",
 	"ai_review_duration_seconds",
 	"ai_review_cost_usd_total",
+	"ai_review_findings_suppressed_total",
 	"gitlab_requests_total",
 	"gitlab_request_errors_total",
 	"merge_requests_scanned_total",
 	"merge_requests_waiting_human_review_total",
+	"merge_requests_with_changes_requested_total",
 	"merge_requests_with_unresolved_threads_total",
 	"merge_requests_with_conflicts_total",
 	"merge_requests_with_failed_pipeline_total",
@@ -63,6 +65,11 @@ func vecCases() []vecCase {
 			func(l prometheus.Labels) error { _, err := ReviewDurationSeconds.GetMetricWith(l); return err }},
 		{"ai_review_cost_usd_total", prometheus.Labels{"team": "payments"},
 			func(l prometheus.Labels) error { _, err := ReviewCostUSDTotal.GetMetricWith(l); return err }},
+		{"ai_review_findings_suppressed_total", prometheus.Labels{"team": "payments", "stage": "not_in_diff"},
+			func(l prometheus.Labels) error {
+				_, err := ReviewFindingsSuppressedTotal.GetMetricWith(l)
+				return err
+			}},
 		{"gitlab_requests_total", prometheus.Labels{"endpoint": "/projects/:key", "method": "GET"},
 			func(l prometheus.Labels) error { _, err := GitLabRequestsTotal.GetMetricWith(l); return err }},
 		{"gitlab_request_errors_total", prometheus.Labels{"endpoint": "/projects/:key", "status": "500"},
@@ -72,6 +79,11 @@ func vecCases() []vecCase {
 		{"merge_requests_waiting_human_review_total", prometheus.Labels{"team": "payments"},
 			func(l prometheus.Labels) error {
 				_, err := MergeRequestsWaitingHumanReview.GetMetricWith(l)
+				return err
+			}},
+		{"merge_requests_with_changes_requested_total", prometheus.Labels{"team": "payments"},
+			func(l prometheus.Labels) error {
+				_, err := MergeRequestsWithChangesRequested.GetMetricWith(l)
 				return err
 			}},
 		{"merge_requests_with_unresolved_threads_total", prometheus.Labels{"team": "payments"},
@@ -308,5 +320,30 @@ func TestGitLabRequestErrorStatusLabel(t *testing.T) {
 	GitLabRequestError("/projects/:key", 0)
 	if got := testutil.ToFloat64(GitLabRequestErrorsTotal.WithLabelValues("/projects/:key", statusTransport)); got != before+1 {
 		t.Errorf("transport error counter = %v, want %v", got, before+1)
+	}
+}
+
+// TestReviewFindingsSuppressedSkipsEmptyStages: a review that suppressed nothing
+// must not materialise a series. Zero-valued series per stage per team would make
+// "is this team's reviewer dropping everything?" unreadable on a dashboard, which
+// is the only question the metric exists to answer.
+func TestReviewFindingsSuppressedSkipsEmptyStages(t *testing.T) {
+	const team = "suppress-test"
+
+	// A delta rather than an absolute count: other tests in this package share the
+	// collector and have already materialised series on it.
+	before := testutil.CollectAndCount(ReviewFindingsSuppressedTotal, "ai_review_findings_suppressed_total")
+	ReviewFindingsSuppressed(team, nil)
+	ReviewFindingsSuppressed(team, map[string]int{"threshold": 0})
+	if got := testutil.CollectAndCount(ReviewFindingsSuppressedTotal, "ai_review_findings_suppressed_total"); got != before {
+		t.Errorf("series count moved from %d to %d on empty tallies; want no new series", before, got)
+	}
+
+	ReviewFindingsSuppressed(team, map[string]int{"not_in_diff": 2, "threshold": 1, "empty": 0})
+	if got := testutil.ToFloat64(ReviewFindingsSuppressedTotal.WithLabelValues(team, "not_in_diff")); got != 2 {
+		t.Errorf("not_in_diff = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(ReviewFindingsSuppressedTotal.WithLabelValues(team, "threshold")); got != 1 {
+		t.Errorf("threshold = %v, want 1", got)
 	}
 }

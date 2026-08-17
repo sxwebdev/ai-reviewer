@@ -135,7 +135,7 @@ func (w *ScanRepoWorker) Work(ctx context.Context, job *river.Job[ScanRepoArgs])
 		// Reviews. Publish stays nil in the args so the decision is taken from
 		// config when the job actually runs, not when it was queued — and so a
 		// later `--publish` insert for the same SHA is recognisably different.
-		var queued int
+		var queued, alreadyQueued int
 		for _, c := range res.Candidates {
 			ins, err := w.svc.EnqueueReview(ctx, ReviewArgs{
 				Team:        c.Team,
@@ -148,7 +148,13 @@ func (w *ScanRepoWorker) Work(ctx context.Context, job *river.Job[ScanRepoArgs])
 				errs = append(errs, err)
 				continue
 			}
-			if !ins.Deduplicated {
+			// Counted separately, because "queued 0" alone is ambiguous in exactly
+			// the situation an operator most needs to understand: 25 candidates and
+			// nothing enqueued reads as "nothing to do" when it actually means "all
+			// 25 are still sitting in the queue behind two workers".
+			if ins.Deduplicated {
+				alreadyQueued++
+			} else {
 				queued++
 			}
 		}
@@ -173,6 +179,7 @@ func (w *ScanRepoWorker) Work(ctx context.Context, job *river.Job[ScanRepoArgs])
 			// Inspected, not seen: §9.1's cheap filter skips MRs whose head has
 			// not moved, so this is far below the repository's open-MR count.
 			"merge_requests_inspected", len(res.Snapshots), "reviews_queued", queued,
+			"reviews_already_queued", alreadyQueued,
 			"publications_requeued", republished, "result", outcome,
 			"duration", time.Since(start).String())
 

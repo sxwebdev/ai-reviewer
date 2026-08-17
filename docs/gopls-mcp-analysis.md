@@ -221,7 +221,7 @@ gopls помогает только Go. Не-Go MR (Python/TS/прочее) ни
 
 ## 11. Дополнение: symgraph и инструменты его класса
 
-> Оценка получена **чтением исходников** `/Users/vkuramshin/p/dev/symgraph` (~14 тыс. строк Rust, 186 тестов), а не README. Где README расходится с кодом — верю коду и отмечаю это.
+> Оценка получена **чтением исходников** symgraph локально (~14 тыс. строк Rust, 186 тестов), а не README. Где README расходится с кодом — верю коду и отмечаю это.
 
 ### 11.1. Что это (по факту, не по README)
 
@@ -286,4 +286,4 @@ symgraph — компилируемый Rust MCP-сервер, который с
 - Пакет: [golang.org/x/tools/gopls/internal/mcp](https://pkg.go.dev/golang.org/x/tools/gopls/internal/mcp)
 - Набор инструментов gopls и инструкции — получены локально: `gopls v0.22.0`, `gopls mcp -instructions`, MCP `tools/list` (8 инструментов).
 - Флаги `claude` CLI — подтверждены локально: `claude --help` (`--mcp-config`, `--strict-mcp-config`, `--allowedTools`).
-- symgraph — оценка по исходникам `/Users/vkuramshin/p/dev/symgraph` (резолюция `src/db/mod.rs:1332-1349`; `diff-impact` `src/mcp/handlers/diff_impact.rs` + `src/db/mod.rs:1257-1295`; извлечение `src/extraction/`; схема `src/db/schema.rs`). Апстрим: [github.com/grahambrooks/symgraph](https://github.com/grahambrooks/symgraph).
+- symgraph — оценка по локально вычитанным исходникам (резолюция `src/db/mod.rs:1332-1349`; `diff-impact` `src/mcp/handlers/diff_impact.rs` + `src/db/mod.rs:1257-1295`; извлечение `src/extraction/`; схема `src/db/schema.rs`). Апстрим: [github.com/grahambrooks/symgraph](https://github.com/grahambrooks/symgraph).

@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
+	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/slack"
 	"github.com/sxwebdev/ai-reviewer/sql"
@@ -462,28 +464,204 @@ func (a *App) checkSlack(ctx context.Context, col *checkCollector) {
 	} else {
 		col.add("slack channels", StatusOK, "the bot is a member of all %d channel(s)", len(a.Config.Teams))
 	}
+
+	checkSlackDirectory(ctx, col, client, a.Config.Slack.UserMap)
+}
+
+// checkSlackDirectory reads the workspace directory and resolves every user_map
+// entry against it.
+//
+// It exists because `doctor` used to stop at auth.test and channel membership,
+// and passed green while every mention in the digest was broken: the token was
+// missing the users:read scope, so users.list failed at 09:00 and each person was
+// named without a ping. A diagnostic that cannot see the most common Slack
+// misconfiguration is not doing its job.
+//
+// Split out from checkSlack and taking slack.UserLister (the interface
+// slack.Directory already defines) so it can be driven by a fake — checkSlack
+// itself builds a client against the real API.
+func checkSlackDirectory(ctx context.Context, col *checkCollector, lister slack.UserLister, userMap map[string]string) {
+	// The same Directory the digest uses, so the indexes checked here are the
+	// indexes matching will actually consult — including the deactivated-and-bot
+	// filtering, which is why a resolved entry proves the account is live.
+	snap, err := slack.NewDirectory(lister, slack.DirectoryConfig{}).Snapshot(ctx)
+	if err != nil {
+		var apiErr *slack.APIError
+		if errors.As(err, &apiErr) && apiErr.Needed != "" {
+			col.add("slack directory", StatusFail,
+				"users.list needs the %s scope (token has: %s) — without it every digest names people without mentioning them",
+				apiErr.Needed, apiErr.Provided)
+			return
+		}
+		col.add("slack directory", StatusFail, "users.list: %s", err)
+		return
+	}
+
+	withEmail := 0
+	for _, u := range snap.Users {
+		if strings.TrimSpace(u.Profile.Email) != "" {
+			withEmail++
+		}
+	}
+	switch {
+	case len(snap.Users) == 0:
+		col.add("slack directory", StatusFail, "users.list returned no active members")
+	case withEmail == 0:
+		// Slack answers 200 with the field simply absent when users:read.email is
+		// missing, so this is the only way to tell the two scopes apart. Email is
+		// the matcher's one exact identifier; without it matching falls back to
+		// name comparison and quietly gets worse.
+		col.add("slack directory", StatusWarn,
+			"%d active members, but not one exposes an email: add the users:read.email scope, "+
+				"or matching falls back to comparing names", len(snap.Users))
+	default:
+		col.add("slack directory", StatusOK, "%d active members, %d with an email", len(snap.Users), withEmail)
+	}
+
+	checkUserMap(col, snap, userMap)
+}
+
+// errUserMapEntryIgnored marks a value the *runtime* throws away rather than
+// chokes on, which is why it may not fail the check: match.New drops a blank
+// override, the matcher falls through to the ordinary probe ladder and the person
+// is matched normally. Failing the run for it made `doctor` exit non-zero — and
+// blocked every deploy gate reading that exit code — over a no-op. It is still
+// reported, as a warning: somebody meant to type an id there.
+//
+// Same rule as the workdir/agent-mode verdict: doctor's exit code may only
+// diverge from what `start` will actually do when the deployment is broken.
+var errUserMapEntryIgnored = errors.New("blank value: the entry is ignored, and the user is matched the ordinary way")
+
+// checkUserMap resolves slack.user_map exactly the way the matcher does, and
+// prints what each entry became.
+//
+// The map is the escape hatch for people the directory cannot match, so a broken
+// entry is doubly invisible: the digest names the person without a ping, which is
+// precisely what the entry was added to prevent, and looks identical to having no
+// entry at all.
+func checkUserMap(col *checkCollector, snap *slack.Snapshot, userMap map[string]string) {
+	if len(userMap) == 0 {
+		return
+	}
+	names := slices.Sorted(maps.Keys(userMap))
+
+	var resolved, ignored, problems []string
+	for _, gitlabUser := range names {
+		value := strings.TrimSpace(userMap[gitlabUser])
+		u, err := resolveUserMapValue(snap, value)
+		switch {
+		case errors.Is(err, errUserMapEntryIgnored):
+			// The value is blank, so printing it would render as "jsmith → :".
+			ignored = append(ignored, fmt.Sprintf("%s: %s", gitlabUser, err))
+		case err != nil:
+			problems = append(problems, fmt.Sprintf("%s → %s: %s", gitlabUser, value, err))
+		default:
+			resolved = append(resolved, fmt.Sprintf("%s → %s (%s)", gitlabUser, u.ID, u.DisplayName()))
+		}
+	}
+
+	summary := "no entries resolved"
+	if len(resolved) > 0 {
+		summary = fmt.Sprintf("%d entr%s resolved: %s",
+			len(resolved), map[bool]string{true: "y", false: "ies"}[len(resolved) == 1], strings.Join(resolved, ", "))
+	}
+
+	switch {
+	case len(problems) > 0:
+		// The ignored entries are named alongside, or a warning-worthy entry stays
+		// hidden until the failing one is fixed and the check is run again.
+		col.add("slack user_map", StatusFail, "%s", strings.Join(slices.Concat(problems, ignored), "; "))
+	case len(ignored) > 0:
+		col.add("slack user_map", StatusWarn, "%s; %s", summary, strings.Join(ignored, "; "))
+	default:
+		col.add("slack user_map", StatusOK, "%s", summary)
+	}
+}
+
+// resolveUserMapValue resolves one user_map value against the directory, with
+// match.ParseOverride — the matcher's own grammar, not a copy of it — deciding
+// what the value is.
+//
+// The classification used to be reimplemented here: the @-stripping, the "an @
+// elsewhere means email" rule, the ambiguity policy, all of it, sharing only the
+// id predicate with the matcher. That is a drift waiting to happen in the one
+// place that cannot afford it, because verifying this grammar is the entire
+// purpose of the check: a doctor that classifies a value differently from the
+// matcher either blesses a map that mentions nobody or fails one that works.
+// Only the *lookup* is doctor's own, and only because it reads a
+// slack.Snapshot where the matcher reads a match.Directory.
+//
+// Two forms make the two sides differ legitimately, both in the safe direction.
+// An id: the matcher takes it at face value so an override survives users.list
+// being unavailable, which leaves doctor as the only side that ever checks one
+// exists. And a blank value: the runtime discards it, so doctor may only warn —
+// see errUserMapEntryIgnored.
+func resolveUserMapValue(snap *slack.Snapshot, value string) (slack.User, error) {
+	o := match.ParseOverride(value)
+	switch o.Form {
+	case match.OverrideID:
+		u, ok := snap.ByID(o.Key)
+		if !ok {
+			return slack.User{}, errors.New("no active Slack account has this user id")
+		}
+		return u, nil
+	case match.OverrideEmail:
+		u, ok := snap.ByEmail(o.Key)
+		if !ok {
+			return slack.User{}, errors.New("no active Slack account has this email (users:read.email may be missing)")
+		}
+		return u, nil
+	case match.OverrideHandle:
+		switch found := snap.ByHandle(o.Key); len(found) {
+		case 1:
+			return found[0], nil
+		case 0:
+			return slack.User{}, errors.New("no active Slack account has this handle")
+		default:
+			// Never resolved by picking one, same rule as the matcher.
+			return slack.User{}, fmt.Errorf("%d accounts share this handle; use the Slack user id", len(found))
+		}
+	case match.OverrideEmpty:
+		return slack.User{}, errUserMapEntryIgnored
+	default:
+		return slack.User{}, fmt.Errorf("unclassifiable value (%s)", o.Form)
+	}
 }
 
 // checkWorkdir verifies review.workdir is writable. It is where mirrors and
 // worktrees live, so a read-only mount fails every review at clone time.
+//
+// The probe itself lives in workdir.go, shared with the `start` gate: doctor
+// reporting one verdict while start enforces another is the failure this
+// diagnostic exists to prevent. So is the *severity*, which is why agent mode is
+// read here at all: checkAgentWorkdir refuses to start only when
+// llm.claude.agent_mode is on, because with it off nothing is cloned and no
+// worktree is created, and this check used to fail regardless. A deliberately
+// diff-only deployment on a read-only mount therefore ran perfectly while
+// `doctor` exited non-zero — and every deploy gate built on that exit code
+// blocked it.
 func (a *App) checkWorkdir(col *checkCollector) {
 	dir := a.Config.Review.WorkDir
-	if dir == "" {
-		col.add("workdir", StatusFail, "review.workdir is empty")
+	if err := ensureWorkdirWritable(dir); err != nil {
+		if !a.Config.LLM.Claude.AgentMode {
+			// Exactly what start concludes: nothing here is used, so nothing is
+			// broken. Still said out loud, because the reason it is survivable is
+			// one config flag away from no longer being true — and an operator who
+			// reads only "not writable" goes off to fix a mount that is fine.
+			col.add("workdir", StatusWarn,
+				"%s — but llm.claude.agent_mode is off, so nothing is cloned or checked out here and "+
+					"reviews read the diff only; a writable path is required before turning agent mode on", err)
+			return
+		}
+		col.add("workdir", StatusFail, "%s", err)
 		return
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		col.add("workdir", StatusFail, "%s: %s", dir, err)
+	if !a.Config.LLM.Claude.AgentMode {
+		// Not a failure — with agent mode off nothing writes here — but worth
+		// saying, because it also means reviews see only the diff.
+		col.add("workdir", StatusWarn, "%s is writable, but llm.claude.agent_mode is off: reviews read the diff only",
+			filepath.Clean(dir))
 		return
 	}
-	probe, err := os.CreateTemp(dir, ".doctor-*")
-	if err != nil {
-		col.add("workdir", StatusFail, "%s is not writable: %s", dir, err)
-		return
-	}
-	name := probe.Name()
-	_ = probe.Close()
-	_ = os.Remove(name)
-
 	col.add("workdir", StatusOK, "%s is writable", filepath.Clean(dir))
 }

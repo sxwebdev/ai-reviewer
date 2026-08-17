@@ -11,8 +11,20 @@ import (
 	"github.com/tkcrm/mx/logger"
 )
 
-func refConfig() *config.Config {
-	cfg := config.DefaultConfig()
+// defaultConfig is config.Default() for tests: the only error it can return is a
+// malformed `default:` tag in the schema, which stops the test rather than
+// becoming a branch.
+func defaultConfig(t *testing.T) *config.Config {
+	t.Helper()
+	c, err := config.Default()
+	if err != nil {
+		t.Fatalf("config.Default: %v", err)
+	}
+	return c
+}
+
+func refConfig(t *testing.T) *config.Config {
+	cfg := defaultConfig(t)
 	cfg.GitLab.BaseURL = "https://gitlab.example.com"
 	cfg.Teams = []config.TeamConfig{{
 		Name: "payments", SlackChannel: "C1",
@@ -22,9 +34,9 @@ func refConfig() *config.Config {
 	return cfg
 }
 
-func refApp() *app.App {
+func refApp(t *testing.T) *app.App {
 	return &app.App{
-		Config: refConfig(),
+		Config: refConfig(t),
 		Log: logger.NewExtended(logger.WithConfig(logger.Config{
 			Level: logger.LogLevelFatal, Format: logger.LoggerFormatJSON,
 		})),
@@ -60,7 +72,7 @@ func TestResolveRefFillsTheUniquenessKey(t *testing.T) {
 			fake.Projects["42"] = &gitlab.Project{ID: 42, PathWithNamespace: "backend/payments"}
 			fake.MRs["42/12"] = &gitlab.MergeRequest{IID: 12, SHA: sha}
 
-			got, err := resolveRef(t.Context(), refApp(), fake, ref)
+			got, err := resolveRef(t.Context(), refApp(t), fake, ref)
 			if err != nil {
 				t.Fatalf("resolveRef: %v", err)
 			}
@@ -104,7 +116,7 @@ func TestResolveRefUsesTheSharedHeadSHA(t *testing.T) {
 		DiffRefs: gitlab.DiffRefs{HeadSHA: diffRefsHead},
 	}
 
-	got, err := resolveRef(t.Context(), refApp(), f, "backend/payments!12")
+	got, err := resolveRef(t.Context(), refApp(t), f, "backend/payments!12")
 	if err != nil {
 		t.Fatalf("resolveRef: %v", err)
 	}
@@ -123,7 +135,7 @@ func TestResolveRefUsesTheSharedHeadSHA(t *testing.T) {
 func TestResolveRefWithoutAHeadSHA(t *testing.T) {
 	t.Parallel()
 	f := refFake("backend/payments", 42, "")
-	_, err := resolveRef(t.Context(), refApp(), f, "backend/payments!12")
+	_, err := resolveRef(t.Context(), refApp(t), f, "backend/payments!12")
 	if err == nil {
 		t.Fatal("a merge request with no head SHA must be rejected")
 	}
@@ -137,7 +149,7 @@ func TestResolveRefWithoutAHeadSHA(t *testing.T) {
 func TestResolveRefOutsideAnyTeam(t *testing.T) {
 	t.Parallel()
 	f := refFake("other/repo", 9, "abc")
-	got, err := resolveRef(t.Context(), refApp(), f, "other/repo!12")
+	got, err := resolveRef(t.Context(), refApp(t), f, "other/repo!12")
 	if err != nil {
 		t.Fatalf("resolveRef: %v", err)
 	}
@@ -151,21 +163,21 @@ func TestResolveRefOutsideAnyTeam(t *testing.T) {
 
 func TestResolveRefRejectsAMalformedReference(t *testing.T) {
 	t.Parallel()
-	if _, err := resolveRef(t.Context(), refApp(), gitlab.NewFake(), "not a reference"); err == nil {
+	if _, err := resolveRef(t.Context(), refApp(t), gitlab.NewFake(), "not a reference"); err == nil {
 		t.Fatal("a malformed reference must be rejected before any API call")
 	}
 }
 
 func TestResolveRefReportsAnUnknownProject(t *testing.T) {
 	t.Parallel()
-	if _, err := resolveRef(t.Context(), refApp(), gitlab.NewFake(), "backend/payments!12"); err == nil {
+	if _, err := resolveRef(t.Context(), refApp(t), gitlab.NewFake(), "backend/payments!12"); err == nil {
 		t.Fatal("an unresolvable project must be an error")
 	}
 }
 
 func TestDigestTargets(t *testing.T) {
 	t.Parallel()
-	a := refApp()
+	a := refApp(t)
 
 	all, err := digestTargets(a, "")
 	if err != nil {
@@ -188,7 +200,7 @@ func TestDigestTargets(t *testing.T) {
 		t.Error("an unknown team must be reported, not silently produce no digests")
 	}
 
-	empty := &app.App{Config: config.DefaultConfig(), Log: a.Log}
+	empty := &app.App{Config: defaultConfig(t), Log: a.Log}
 	if _, err := digestTargets(empty, ""); err == nil {
 		t.Error("a config with no teams must be reported")
 	}
@@ -210,7 +222,7 @@ func TestSymbolsAreDistinct(t *testing.T) {
 // dropped from the tree is a feature nobody can reach.
 func TestCommandTreeCoversThePlan(t *testing.T) {
 	t.Parallel()
-	root := NewApp(refApp().Log)
+	root := NewApp(refApp(t).Log)
 
 	want := map[string]bool{
 		"start": false, "scan": false, "review": false,

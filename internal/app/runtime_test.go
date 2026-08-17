@@ -18,8 +18,8 @@ func quietLogger() logger.ExtendedLogger {
 	}))
 }
 
-func testConfig() *config.Config {
-	cfg := config.DefaultConfig()
+func testConfig(t *testing.T) *config.Config {
+	cfg := defaultConfig(t)
 	cfg.Teams = []config.TeamConfig{
 		{
 			Name: "Payments", SlackChannel: "C1",
@@ -36,7 +36,7 @@ func testConfig() *config.Config {
 
 func TestTeamsMapping(t *testing.T) {
 	t.Parallel()
-	got := Teams(testConfig())
+	got := Teams(testConfig(t))
 	if len(got) != 2 {
 		t.Fatalf("teams = %d, want 2", len(got))
 	}
@@ -51,14 +51,14 @@ func TestTeamsMapping(t *testing.T) {
 	if !slices.Equal(got[0].Repositories, []string{"backend/payments", "backend/billing"}) {
 		t.Errorf("repositories = %v", got[0].Repositories)
 	}
-	if len(Teams(config.DefaultConfig())) != 0 {
+	if len(Teams(defaultConfig(t))) != 0 {
 		t.Error("a config with no teams must map to no teams")
 	}
 }
 
 func TestTeamLookups(t *testing.T) {
 	t.Parallel()
-	cfg := testConfig()
+	cfg := testConfig(t)
 
 	// Case-insensitive: config validation enforces uniqueness under the same
 	// comparison, and a CLI flag is typed by a human.
@@ -82,7 +82,7 @@ func TestTeamLookups(t *testing.T) {
 // settings for one pool drift apart and the one that loses is invisible.
 func TestJobsConfigSizesTheReviewQueueFromReviewMaxParallel(t *testing.T) {
 	t.Parallel()
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.Review.MaxParallel = 7
 	cfg.Jobs.Queues = config.QueuesConfig{Default: 3, Publish: 2, Slack: 4}
 	cfg.Service.AIReviewPublishEnabled = true
@@ -127,7 +127,7 @@ func TestPipelineFromConfigModes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
 			t.Parallel()
-			rc := config.DefaultConfig().Review
+			rc := defaultConfig(t).Review
 			rc.Pipeline.Mode = tc.mode
 			rc.Pipeline.Completeness = tc.completeness
 
@@ -145,7 +145,7 @@ func TestPipelineFromConfigModes(t *testing.T) {
 	}
 
 	// custom takes the configured list verbatim.
-	rc := config.DefaultConfig().Review
+	rc := defaultConfig(t).Review
 	rc.Pipeline.Mode = "custom"
 	rc.Pipeline.Passes = []string{review.PassSecurity}
 	if got := pipelineFromConfig(rc); !slices.Equal(got.Passes, []string{review.PassSecurity}) {
@@ -154,7 +154,7 @@ func TestPipelineFromConfigModes(t *testing.T) {
 
 	// An explicit "on" survives cheap mode, which is the whole point of the
 	// tri-state: the preset decides only when the operator did not.
-	rc = config.DefaultConfig().Review
+	rc = defaultConfig(t).Review
 	rc.Pipeline.Mode = "cheap"
 	rc.Pipeline.Completeness = "on"
 	if got := pipelineFromConfig(rc); got.Completeness != review.CompletenessOn {
@@ -166,7 +166,7 @@ func TestPipelineFromConfigModes(t *testing.T) {
 // bytes. Getting this wrong by 1024× either sends nothing or sends everything.
 func TestContextBudgetConvertsKilobytes(t *testing.T) {
 	t.Parallel()
-	rc := config.DefaultConfig().Review
+	rc := defaultConfig(t).Review
 	rc.Context.MaxTotalKB = 256
 	rc.Context.MaxDiscussionKB = 4
 	rc.Context.InterdiffMaxKB = 32
@@ -182,7 +182,7 @@ func TestContextBudgetConvertsKilobytes(t *testing.T) {
 
 func TestProfileFromConfig(t *testing.T) {
 	t.Parallel()
-	rc := config.DefaultConfig().Review
+	rc := defaultConfig(t).Review
 	rc.PreferredCommentLanguage = "ru"
 	rc.MaxComments = 3
 	rc.SeverityThreshold = "blocking"
@@ -204,7 +204,7 @@ func TestProfileFromConfig(t *testing.T) {
 
 func TestRiskAndCoverageSettings(t *testing.T) {
 	t.Parallel()
-	rc := config.DefaultConfig().Review
+	rc := defaultConfig(t).Review
 	risk := riskSettingsFromConfig(rc)
 	if !risk.Enabled || risk.HistoryCommits != rc.Risk.HistoryCommits ||
 		!slices.Equal(risk.SensitiveGlobs, rc.Risk.SensitiveGlobs) {
@@ -227,7 +227,7 @@ func TestCheckWorkdir(t *testing.T) {
 
 	t.Run("writable", func(t *testing.T) {
 		t.Parallel()
-		cfg := config.DefaultConfig()
+		cfg := defaultConfig(t)
 		cfg.Review.WorkDir = filepath.Join(t.TempDir(), "work")
 		a := &App{Config: cfg, Log: quietLogger()}
 
@@ -249,7 +249,7 @@ func TestCheckWorkdir(t *testing.T) {
 
 	t.Run("empty", func(t *testing.T) {
 		t.Parallel()
-		cfg := config.DefaultConfig()
+		cfg := defaultConfig(t)
 		cfg.Review.WorkDir = ""
 		a := &App{Config: cfg, Log: quietLogger()}
 
@@ -270,7 +270,7 @@ func TestCheckWorkdir(t *testing.T) {
 		if err := os.Mkdir(readonly, 0o500); err != nil {
 			t.Fatal(err)
 		}
-		cfg := config.DefaultConfig()
+		cfg := defaultConfig(t)
 		cfg.Review.WorkDir = readonly
 		a := &App{Config: cfg, Log: quietLogger()}
 
@@ -300,7 +300,7 @@ func TestProjectKey(t *testing.T) {
 func TestPoolSizeCoversTheWorkerPools(t *testing.T) {
 	t.Parallel()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.Review.MaxParallel = 12
 	cfg.Jobs.Queues.Default = 2
 	cfg.Jobs.Queues.Publish = 1
@@ -315,14 +315,14 @@ func TestPoolSizeCoversTheWorkerPools(t *testing.T) {
 
 	// The default configuration must not shrink the pool below what
 	// postgres.New would have given it on its own.
-	small := &App{Config: config.DefaultConfig(), Log: quietLogger()}
+	small := &App{Config: defaultConfig(t), Log: quietLogger()}
 	if got := small.poolSize(); got != basePoolSize {
 		t.Errorf("poolSize with the defaults = %d, want the %d floor", got, basePoolSize)
 	}
 
 	// And a mis-set worker count must not ask a stock PostgreSQL for more
 	// connections than it has.
-	huge := testConfig()
+	huge := testConfig(t)
 	huge.Review.MaxParallel = 10_000
 	if got := (&App{Config: huge, Log: quietLogger()}).poolSize(); got != maxPoolSize {
 		t.Errorf("poolSize = %d, want the %d cap", got, maxPoolSize)

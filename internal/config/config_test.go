@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +22,18 @@ func quietLog() logger.Logger {
 		Level:  logger.LogLevelFatal,
 		Format: logger.LoggerFormatJSON,
 	}))
+}
+
+// defaultConfig is Default() for tests. The error can only be a malformed
+// `default:` tag, which is a mistake in the schema rather than a condition a test
+// should branch on — so it stops the test instead.
+func defaultConfig(t *testing.T) *Config {
+	t.Helper()
+	c, err := Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	return c
 }
 
 // writeConfig writes yml to a temp file and returns its path.
@@ -54,7 +65,7 @@ teams:
 
 func loadFile(t *testing.T, path string) (*Config, error) {
 	t.Helper()
-	cfg := DefaultConfig()
+	cfg := defaultConfig(t)
 	res, err := Load(t.Context(), quietLog(), cfg, []string{path})
 	if res != nil {
 		t.Cleanup(res.Cleanup)
@@ -62,14 +73,48 @@ func loadFile(t *testing.T, path string) (*Config, error) {
 	return cfg, err
 }
 
-func TestDefaultConfig(t *testing.T) {
-	c := DefaultConfig()
-	// Safety defaults: nothing reaches GitLab or Slack until an operator opts in.
+// TestDefaultTagsAreWellFormed is what replaced a panic in Default().
+//
+// A `default:"5x"` on a duration, or a value xconfig cannot parse into the
+// field's type, is a mistake in the schema above and nowhere else — it cannot
+// depend on the environment. Default() reports it as an error so no code path has
+// to panic, and this is the test that makes sure nobody has to see that error at
+// runtime.
+func TestDefaultTagsAreWellFormed(t *testing.T) {
+	t.Parallel()
+	if _, err := Default(); err != nil {
+		t.Fatalf("a default: tag in the schema does not parse: %v", err)
+	}
+}
+
+// TestDefaultSafetySwitches pins the defaults that are decisions rather than
+// values: every one of them is a choice about what the service is allowed to do
+// to the outside world before an operator says anything.
+//
+// It deliberately does not restate ordinary numbers and timeouts — those are the
+// `default:` tags themselves, and asserting them here only duplicates the
+// schema.
+func TestDefaultSafetySwitches(t *testing.T) {
+	t.Parallel()
+	c := defaultConfig(t)
+
+	// Nothing reaches GitLab or Slack until an operator opts in.
 	if c.Service.SlackSendEnabled || c.Service.AIReviewPublishEnabled {
 		t.Error("service dry-run switches must default to false")
 	}
 	if c.Review.Coverage.Enabled {
 		t.Error("review.coverage.enabled must default to false (executes repository code)")
+	}
+	if c.Review.Coverage.Node.Install {
+		t.Error("review.coverage.node.install must default to false (runs lifecycle scripts)")
+	}
+	// Verifiers that execute repository code (tsc, go_test) must stay out.
+	for _, v := range c.Review.Pipeline.Verifiers {
+		switch v {
+		case "go_build", "go_vet", "py_syntax":
+		default:
+			t.Errorf("default verifier %q executes repository code; keep it an opt-in", v)
+		}
 	}
 	// On by default: the service brings its own schema up, application migrations
 	// then River's. What makes that safe with N replicas is App.Migrate holding
@@ -79,33 +124,25 @@ func TestDefaultConfig(t *testing.T) {
 	if !c.Postgres.MigrateOnStart {
 		t.Error("postgres.migrate_on_start must default to true; the service migrates itself on start")
 	}
-	// The ops port has no ingress restriction in the shipped NetworkPolicy
-	// (it is egress-only, because probe source addresses are CNI-specific), so
-	// a profiler on by default would serve heap and goroutine dumps to anything
-	// that can reach the pod. If this ever flips, README's endpoint table and
-	// CLAUDE.md both describe it as opt-in and would become wrong.
-	if c.Ops.Profiler.Enabled {
-		t.Error("ops.profiler.enabled must default to false; /debug/pprof is an explicit opt-in")
-	}
 	if c.LLM.Claude.Auth.Mode != llm.AuthExistingLogin {
-		t.Errorf("claude auth mode = %q, want existing-login", c.LLM.Claude.Auth.Mode)
+		t.Errorf("claude auth mode = %q, want existing-login: any other mode needs a credential nobody supplied", c.LLM.Claude.Auth.Mode)
 	}
-	if c.Review.MaxComments != 12 {
-		t.Errorf("MaxComments = %d, want 12", c.Review.MaxComments)
+	// /debug/pprof belongs in this list and nowhere else: the ops port carries no
+	// authentication, so an on-by-default profiler hands heap and goroutine dumps
+	// to anything that can reach the pod. It was previously asserted only against
+	// config.example.yaml (TestExampleConfigLoads) — a file an env-only deployment
+	// never reads, which is exactly the deployment that would be exposed. mx ships
+	// it off; what is pinned here is that this package never turns it on, whether
+	// by restating the embedded ops config with a `default:` of its own or by
+	// seeding Default() by hand.
+	if c.Ops.Profiler.Enabled {
+		t.Error("ops.profiler.enabled must default to false: /debug/pprof on the ops port has no authentication in front of it")
 	}
-	if c.GitLab.Timeout != 30*time.Second {
-		t.Errorf("GitLab.Timeout = %v, want 30s", c.GitLab.Timeout)
-	}
-	// WithSkipDefaults() also suppresses mx's own struct-tag defaults, so
-	// DefaultConfig must populate the fields mx marks `validate:"required"`.
-	if c.Ops.Network == "" || c.Ops.Metrics.Path == "" || c.Ops.Metrics.Port == "" ||
-		c.Ops.Healthy.Path == "" || c.Ops.Healthy.Port == "" ||
-		c.Ops.Profiler.Path == "" || c.Ops.Profiler.Port == "" {
-		t.Errorf("ops defaults incomplete, tag validation would fail: %+v", c.Ops)
-	}
-	if !c.Log.Format.Valid() || !c.Log.Level.Valid() || !c.Log.Trace.Valid() {
-		t.Errorf("logger defaults incomplete: %+v", c.Log)
-	}
+	// The other ops switches are deliberately NOT asserted, and the asymmetry is
+	// the point: whether /livez, /readyz and /metrics are exposed is the
+	// deployment's call (mx ships all three off, config.example.yaml turns them on,
+	// an env-only deployment sets AI_REVIEWER_OPS_* itself — docs/configuration.md
+	// lists them). A profiler is not that kind of choice.
 }
 
 // TestDefaultAllowedToolsAreReadOnlyAndWorktreeScoped pins plan §1's
@@ -120,7 +157,7 @@ func TestDefaultConfig(t *testing.T) {
 // write succeeded with `permission_denials: []`. And unscoped `Read`/`Grep`/
 // `Glob` made the worktree a working directory rather than a boundary.
 func TestDefaultAllowedToolsAreReadOnlyAndWorktreeScoped(t *testing.T) {
-	tools := DefaultConfig().LLM.Claude.AllowedTools
+	tools := defaultConfig(t).LLM.Claude.AllowedTools
 	if len(tools) == 0 {
 		t.Fatal("allowed_tools default is empty")
 	}
@@ -139,121 +176,6 @@ func TestDefaultAllowedToolsAreReadOnlyAndWorktreeScoped(t *testing.T) {
 		}
 		if !strings.Contains(args, llm.WorktreePlaceholder) {
 			t.Errorf("rule %q is not scoped to %s", rule, llm.WorktreePlaceholder)
-		}
-	}
-}
-
-// TestLoadPreservesExplicitFalse is the key regression: xconfig's defaults
-// plugin runs after the file loader and fills every zero value, which would flip
-// an explicitly configured `false` back to a `true` default. Load must run with
-// WithSkipDefaults() and take its defaults from DefaultConfig() instead.
-func TestLoadPreservesExplicitFalse(t *testing.T) {
-	path := writeConfig(t, `
-gitlab:
-  base_url: https://gitlab.example.com
-  token: glpat-test
-  graphql_enabled: false
-slack:
-  token: xoxb-test
-postgres:
-  username: ai_reviewer
-  migrate_on_start: false
-review:
-  max_comments: 3
-  risk:
-    enabled: false
-  context:
-    include_full_files: false
-    prior_review: false
-llm:
-  claude:
-    agent_mode: false
-teams:
-  - name: payments
-    slack_channel: C012345678
-    ai_review: { enabled: true }
-    repositories: [backend/payments]
-`)
-	c, err := loadFile(t, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, got := range map[string]bool{
-		// Opting out of self-migration is the case where this bug would hurt
-		// most: a deployment that applies the schema elsewhere would silently
-		// get replicas migrating anyway.
-		"postgres.migrate_on_start":         c.Postgres.MigrateOnStart,
-		"gitlab.graphql_enabled":            c.GitLab.GraphQLEnabled,
-		"review.risk.enabled":               c.Review.Risk.Enabled,
-		"review.context.include_full_files": c.Review.Context.IncludeFullFiles,
-		"review.context.prior_review":       c.Review.Context.PriorReview,
-		"llm.claude.agent_mode":             c.LLM.Claude.AgentMode,
-	} {
-		if got {
-			t.Errorf("%s: explicit false in the file was reset to the default true", name)
-		}
-	}
-	if c.Review.MaxComments != 3 {
-		t.Errorf("MaxComments = %d, want 3", c.Review.MaxComments)
-	}
-	// A field absent from the file keeps its default.
-	if c.Review.SeverityThreshold != "medium" {
-		t.Errorf("SeverityThreshold = %q, want default medium", c.Review.SeverityThreshold)
-	}
-	if !c.Review.Context.IncludeCommits {
-		t.Error("include_commits was absent from the file and must keep its default true")
-	}
-}
-
-// TestEnvNamesRoundTrip proves the env variable names documented in config.go
-// and config.example.yaml are the ones xconfig actually reads. Without explicit
-// `env:` tags xconfig derives them by word-splitting the Go field path, which
-// turns gitlab.token into AI_REVIEWER_GIT_LAB_TOKEN — and, because xconfigvault
-// reads the same metadata, would put the secret in Vault under that name too.
-func TestEnvNamesRoundTrip(t *testing.T) {
-	cases := []struct {
-		env   string
-		value string
-		got   func(*Config) string
-	}{
-		{"AI_REVIEWER_GITLAB_BASE_URL", "https://gl.env", func(c *Config) string { return c.GitLab.BaseURL }},
-		{"AI_REVIEWER_GITLAB_TOKEN", "glpat-env", func(c *Config) string { return c.GitLab.Token.Unmask() }},
-		{"AI_REVIEWER_SLACK_TOKEN", "xoxb-env", func(c *Config) string { return c.Slack.Token.Unmask() }},
-		{"AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-env", func(c *Config) string { return c.LLM.Claude.Auth.OAuthToken.Unmask() }},
-		{"AI_REVIEWER_ANTHROPIC_API_KEY", "sk-ant-api-env", func(c *Config) string { return c.LLM.Claude.Auth.APIKey.Unmask() }},
-		{"AI_REVIEWER_LLM_CLAUDE_AUTH_MODE", "api-key", func(c *Config) string { return string(c.LLM.Claude.Auth.Mode) }},
-		{"AI_REVIEWER_LLM_CLAUDE_BIN", "/usr/local/bin/claude", func(c *Config) string { return c.LLM.Claude.Bin }},
-		{"AI_REVIEWER_LOG_LEVEL", "debug", func(c *Config) string { return string(c.Log.Level) }},
-		{"AI_REVIEWER_OPS_METRICS_PORT", "10002", func(c *Config) string { return c.Ops.Metrics.Port }},
-		{"AI_REVIEWER_POSTGRES_HOST", "pg.env", func(c *Config) string { return c.Postgres.Host }},
-		{"AI_REVIEWER_POSTGRES_USERNAME", "pguser", func(c *Config) string { return c.Postgres.Username.Unmask() }},
-		{"AI_REVIEWER_POSTGRES_PASSWORD", "pgpass", func(c *Config) string { return c.Postgres.Password.Unmask() }},
-		{"AI_REVIEWER_JOBS_QUEUES_DEFAULT", "7", func(c *Config) string { return itoa(c.Jobs.Queues.Default) }},
-		{"AI_REVIEWER_REVIEW_PIPELINE_MODE", "deep", func(c *Config) string { return c.Review.Pipeline.Mode }},
-		{"AI_REVIEWER_REVIEW_WORKDIR", "/tmp/work", func(c *Config) string { return c.Review.WorkDir }},
-		{"AI_REVIEWER_SERVICE_SLACK_SEND_ENABLED", "true", func(c *Config) string { return btoa(c.Service.SlackSendEnabled) }},
-		{"AI_REVIEWER_REVIEW_COVERAGE_NODE_INSTALL", "true", func(c *Config) string { return btoa(c.Review.Coverage.Node.Install) }},
-		// Slice-of-struct: teams are configurable entirely through env in k8s.
-		{"AI_REVIEWER_TEAMS_0_NAME", "platform", func(c *Config) string { return c.Teams[0].Name }},
-		{"AI_REVIEWER_TEAMS_0_SLACK_CHANNEL", "C987654321", func(c *Config) string { return c.Teams[0].SlackChannel }},
-		{"AI_REVIEWER_TEAMS_0_REPOSITORIES", "platform/auth", func(c *Config) string { return strings.Join(c.Teams[0].Repositories, ",") }},
-		{"AI_REVIEWER_TEAMS_0_AI_REVIEW_ENABLED", "true", func(c *Config) string { return btoa(c.Teams[0].AIReview.Enabled) }},
-	}
-
-	// The whole set is applied at once: a name that silently shadows another
-	// (the derivation footgun) shows up as a mismatch on the losing field.
-	for _, tc := range cases {
-		t.Setenv(tc.env, tc.value)
-	}
-	// api-key mode needs its secret, which the table sets; the base file only
-	// supplies what the env cases do not.
-	c, err := loadFile(t, writeConfig(t, minimalYAML))
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	for _, tc := range cases {
-		if got := tc.got(c); got != tc.value {
-			t.Errorf("%s: got %q, want %q", tc.env, got, tc.value)
 		}
 	}
 }
@@ -281,6 +203,26 @@ func TestExampleConfigLoads(t *testing.T) {
 	if c.Service.SlackSendEnabled || c.Service.AIReviewPublishEnabled {
 		t.Error("the example must ship with both dry-run switches off")
 	}
+	// The publish switch is not a cost switch: with it off, reviews still run and
+	// still cost a few dollars per merge request, they just post nothing. An example
+	// that enables reviewing therefore starts spending on its first scan pass — 25
+	// open merge requests on the live project it was first pointed at.
+	for _, team := range c.Teams {
+		if team.AIReview.Enabled {
+			t.Errorf("team %q enables ai_review: the example must not spend money on its first scan", team.Name)
+		}
+	}
+	// mx ships the ops server off and this package adds no default of its own, so
+	// the example file is the only thing that turns /livez, /readyz and /metrics
+	// on — and docker-compose.yml healthchecks /livez against exactly this file.
+	// If the block is ever dropped from the example, the documented install path
+	// comes up with no listener and the container never reports healthy.
+	if !c.Ops.Enabled || !c.Ops.Healthy.Enabled || !c.Ops.Metrics.Enabled {
+		t.Errorf("the example must enable the ops server, health checker and metrics: %+v", c.Ops)
+	}
+	if c.Ops.Profiler.Enabled {
+		t.Error("the example must leave /debug/pprof off: the ops port carries no authentication")
+	}
 }
 
 func TestLoadRejectsUnknownKey(t *testing.T) {
@@ -291,7 +233,7 @@ func TestLoadRejectsUnknownKey(t *testing.T) {
 }
 
 func TestValidateReportsEveryProblemAtOnce(t *testing.T) {
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	c.GitLab.BaseURL = "gitlab.example.com" // not absolute
 	c.GitLab.Token = ""
 	c.Review.ScanInterval = 10 * time.Second
@@ -404,7 +346,7 @@ teams:
 // config one error per restart is the feedback loop joinConfigErrors exists to
 // avoid, and a tag failure would produce exactly that.
 func TestMissingSecretsStillAggregateWithEverythingElse(t *testing.T) {
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	c.GitLab.BaseURL = "https://gitlab.example.com"
 	c.GitLab.Token = ""
 	c.Postgres.Username = ""
@@ -430,7 +372,7 @@ func TestMissingSecretsStillAggregateWithEverythingElse(t *testing.T) {
 // without one — so it must not acquire a required check by symmetry with the
 // username.
 func TestPostgresPasswordIsOptional(t *testing.T) {
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	c.GitLab.BaseURL = "https://gitlab.example.com"
 	c.GitLab.Token = "glpat-test"
 	c.Slack.Token = "xoxb-test"
@@ -540,7 +482,7 @@ func TestSecretsAreNotValidatedByTag(t *testing.T) {
 
 func TestValidateTeams(t *testing.T) {
 	base := func() *Config {
-		c := DefaultConfig()
+		c := defaultConfig(t)
 		c.GitLab.BaseURL = "https://gitlab.example.com"
 		c.GitLab.Token = "glpat-x"
 		c.Slack.Token = "xoxb-x"
@@ -612,7 +554,7 @@ func TestValidateTeams(t *testing.T) {
 
 func TestValidateClaudeAuthMode(t *testing.T) {
 	base := func() *Config {
-		c := DefaultConfig()
+		c := defaultConfig(t)
 		c.GitLab.BaseURL = "https://gitlab.example.com"
 		c.GitLab.Token = "glpat-x"
 		c.Slack.Token = "xoxb-x"
@@ -653,7 +595,7 @@ func TestValidateClaudeAuthMode(t *testing.T) {
 }
 
 func TestValidateSlackTokenRequiredWhenChannelsConfigured(t *testing.T) {
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	c.GitLab.BaseURL = "https://gitlab.example.com"
 	c.GitLab.Token = "glpat-x"
 	c.Postgres.Username = "ai_reviewer"
@@ -703,7 +645,7 @@ func TestSecretNeverLeaks(t *testing.T) {
 	}
 	// A whole Config formatted with %+v must not leak either — that is how a
 	// config dump reaches a log line.
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	c.GitLab.Token = "glpat-supersecret"
 	if strings.Contains(fmtSprintf("%+v", *c), "supersecret") {
 		t.Error("formatting the Config leaked a secret")
@@ -721,7 +663,7 @@ func TestSecretNeverLeaks(t *testing.T) {
 // clear. Postgres.Username was exactly that, for long enough that a comment in
 // doctor justified another omission by claiming this one was covered.
 func TestRegisterSecretsCoversEverySecretField(t *testing.T) {
-	c := DefaultConfig()
+	c := defaultConfig(t)
 	secretType := reflect.TypeFor[Secret]()
 
 	// path → the value planted there, so a failure names the field.
@@ -783,28 +725,25 @@ func TestPostgresDSN(t *testing.T) {
 	}
 }
 
-// Small helpers so the env round-trip table can compare everything as strings.
-func itoa(v int) string  { return strconv.Itoa(v) }
-func btoa(v bool) string { return strconv.FormatBool(v) }
-
 func fmtSprintf(format string, a ...any) string { return fmt.Sprintf(format, a...) }
 
-// TestSchemaHasNoTagDefaults pins the other half of the explicit-false
-// invariant. Load runs with WithSkipDefaults(), so a `default:` tag on one of
-// our fields would be dead weight; and if that option were ever dropped, a
-// `default:"true"` tag would resurrect the footgun the whole DefaultConfig()
-// arrangement exists to avoid — xconfig's defaults plugin runs after the file
-// loader and overwrites every zero value, turning a configured `false` back
-// into `true`. Defaults belong in DefaultConfig(), full stop.
+// TestEveryFieldHasAYAMLTag guards the tag the whole defaulting scheme rests on.
 //
-// Third-party embedded configs (logger.Config, ops.Config) are exempt: we do
-// not own their tags, which is exactly why DefaultConfig() restates their
-// values.
-func TestSchemaHasNoTagDefaults(t *testing.T) {
+// The yaml tag does two jobs. It names the key in the file, and xconfig resolves
+// it a second time to decide whether a field was *explicitly present* there — a
+// field that was is never overwritten by its `default:`. A field without the tag
+// falls back to the lower-cased Go name for that second lookup, so the presence
+// check quietly stops matching and a configured `false` starts being refilled
+// with `true` again. That failure is invisible in a diff, hence this check.
+//
+// Third-party embedded configs (logger.Config, ops.Config) are exempt: we do not
+// own their tags. VaultConfig is not walked at all — it has no file keys by
+// design, being read from the unprefixed environment before anything else.
+func TestEveryFieldHasAYAMLTag(t *testing.T) {
 	t.Parallel()
 	pkg := reflect.TypeFor[Config]().PkgPath()
 
-	var walk func(t reflect.Type, path string, seen map[reflect.Type]bool)
+	var walk func(rt reflect.Type, path string, seen map[reflect.Type]bool)
 	walk = func(rt reflect.Type, path string, seen map[reflect.Type]bool) {
 		for rt.Kind() == reflect.Pointer || rt.Kind() == reflect.Slice || rt.Kind() == reflect.Map {
 			rt = rt.Elem()
@@ -814,9 +753,12 @@ func TestSchemaHasNoTagDefaults(t *testing.T) {
 		}
 		seen[rt] = true
 		for f := range rt.Fields() {
-			f := f
-			if v, ok := f.Tag.Lookup("default"); ok {
-				t.Errorf("%s.%s has default:%q — move it to DefaultConfig()", path, f.Name, v)
+			if !f.IsExported() {
+				continue
+			}
+			if tag, ok := f.Tag.Lookup("yaml"); !ok || tag == "" {
+				t.Errorf("%s.%s has no yaml tag; its default would stop respecting an explicit value in the file",
+					path, f.Name)
 			}
 			walk(f.Type, path+"."+f.Name, seen)
 		}

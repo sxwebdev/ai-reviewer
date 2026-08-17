@@ -98,6 +98,11 @@ func NeedsAIReview(s MergeRequestSnapshot, teamEnabled bool, lastReviewedSHA str
 // for the single most common state in an active MR. So they owe an action only
 // once the author has pushed since their last engagement.
 //
+// UNAPPROVED and REVIEW_STARTED both owe one: withdrawing an approval asks for a
+// fresh verdict, and starting a review is not finishing it. Neither may be left
+// to the REST fallback, which would read an earlier note as "done" and drop the
+// reviewer out of the digest entirely.
+//
 // There is intentionally no equivalent "REVIEWED but a newer push landed" rule:
 // REVIEWED is a terminal verdict the reviewer chose, and re-opening it on every
 // push would nag reviewers of long-running MRs forever. GitLab owns resetting
@@ -112,15 +117,29 @@ func NeedsHumanReview(s MergeRequestSnapshot, r Reviewer) bool {
 	switch r.State {
 	case ReviewStateReviewed, ReviewStateApproved:
 		return false
-	case ReviewStateUnreviewed:
+	case ReviewStateUnreviewed, ReviewStateUnapproved, ReviewStateReviewStarted:
 		return true
 	case ReviewStateRequestedChanges:
-		// No engagement timestamp: we cannot tell whether the verdict predates
-		// the push, and a missed nudge (a stalled MR nobody chases) costs more
-		// than a spurious one (a line in a digest). The state itself already
-		// says this reviewer is engaged with the MR, so asking again is cheap.
+		// Without an engagement timestamp the verdict cannot be dated, so this
+		// reviewer is treated as done and the author is nudged instead — which is
+		// where the ball actually is. That relies on ClassifyAuthorActions listing
+		// the MR under the author for exactly this state; before it did, the safe
+		// answer here was the opposite (nudge the reviewer, because a stalled MR
+		// nobody chases costs more than a spurious line), since an undatable
+		// verdict with no unresolved thread made the MR vanish from the digest
+		// altogether. The two rules are a pair — changing one without the other
+		// either double-reports the MR or loses it.
+		//
+		// A verdict delivered by clicking "Request changes" without writing a word
+		// used to land here on *every* pass, so the push-aware comparison below was
+		// unreachable for it and the author kept the MR for the life of the merge
+		// request. The service now dates such a verdict from the reviewer's own
+		// system note as soon as the author's push proves it is the older of the two
+		// (see Reviewer.LastActivityAt). So this branch still fires while the ball is
+		// genuinely with the author, and stops firing the moment they answer — which
+		// is the whole difference between a residual case and a dead end.
 		if r.LastActivityAt.IsZero() {
-			return true
+			return false
 		}
 		return s.LastPushAt.After(r.LastActivityAt)
 	}
@@ -285,27 +304,32 @@ func normalizeStatus(s string) string { return strings.ToLower(strings.TrimSpace
 
 // AuthorActions is what the digest needs from an MR to render its
 // "Author actions" entry. Field order mirrors the fixed line order of the
-// digest (threads → conflicts → pipeline, plan §13.3) so the rendering stays
-// identical from day to day.
+// digest (changes requested → threads → conflicts → pipeline, plan §13.3) so the
+// rendering stays identical from day to day.
 type AuthorActions struct {
-	UnresolvedThreads int
-	HasConflicts      bool
-	PipelineFailed    bool
-	Pipeline          Pipeline // set only when PipelineFailed; carries WebURL for the link
+	// ChangesRequestedBy are the reviewers whose REQUESTED_CHANGES verdict still
+	// stands. First, because it outranks a thread count: "a reviewer asked for
+	// changes" is the strongest thing the digest can tell an author.
+	ChangesRequestedBy []User
+	UnresolvedThreads  int
+	HasConflicts       bool
+	PipelineFailed     bool
+	Pipeline           Pipeline // set only when PipelineFailed; carries WebURL for the link
 }
 
-// Any reports whether the MR belongs in the digest's "Author actions" section:
-// at least one of unresolved threads, merge conflicts, failed pipeline.
+// Any reports whether the MR belongs in the digest's "Author actions" section.
 func (a AuthorActions) Any() bool {
-	return a.UnresolvedThreads > 0 || a.HasConflicts || a.PipelineFailed
+	return len(a.ChangesRequestedBy) > 0 || a.UnresolvedThreads > 0 || a.HasConflicts || a.PipelineFailed
 }
 
-// ClassifyAuthorActions runs the three author-facing classifiers over one
-// snapshot. Unknown answers (mergeability not computed, pipeline stale or
-// missing) are reported as "no action" — the digest only ever states things it
-// is sure of.
+// ClassifyAuthorActions runs the author-facing classifiers over one snapshot.
+// Unknown answers (mergeability not computed, pipeline stale or missing) are
+// reported as "no action" — the digest only ever states things it is sure of.
 func ClassifyAuthorActions(s MergeRequestSnapshot) AuthorActions {
-	a := AuthorActions{UnresolvedThreads: UnresolvedThreads(s)}
+	a := AuthorActions{
+		ChangesRequestedBy: changesRequestedBy(s),
+		UnresolvedThreads:  UnresolvedThreads(s),
+	}
 	if conflict, known := HasMergeConflicts(s); known && conflict {
 		a.HasConflicts = true
 	}
@@ -314,6 +338,39 @@ func ClassifyAuthorActions(s MergeRequestSnapshot) AuthorActions {
 		a.Pipeline = pl
 	}
 	return a
+}
+
+// changesRequestedBy lists the reviewers who asked for changes and have not been
+// answered by a push yet.
+//
+// This is the gap the digest had: the author-facing section was built from
+// unresolved threads, conflicts and pipelines only, and never looked at
+// s.Reviewers at all. So a "Request changes" verdict reached the author only by
+// accident — if the reviewer happened to leave a *resolvable* thread. Without
+// one (a plain comment, resolved threads, or a verdict with no comment at all)
+// the MR appeared in neither section: NeedsHumanReview said the reviewer was
+// done, and nothing said the author owed anything. Observed on a live project as
+// the single REQUESTED_CHANGES MR being rendered as "3 unresolved threads",
+// with the actual verdict stated nowhere.
+//
+// A verdict answered by a later push is excluded: the ball has gone back to the
+// reviewer, NeedsHumanReview lists them, and reporting both would double-count
+// the same merge request.
+func changesRequestedBy(s MergeRequestSnapshot) []User {
+	if !s.MR.IsOpen() || s.MR.Draft {
+		return nil
+	}
+	var out []User
+	for _, r := range s.Reviewers {
+		if r.State != ReviewStateRequestedChanges {
+			continue
+		}
+		if !r.LastActivityAt.IsZero() && s.LastPushAt.After(r.LastActivityAt) {
+			continue // superseded by a push; the reviewer owes the next look
+		}
+		out = append(out, r.User)
+	}
+	return out
 }
 
 // NeedsAuthorAction is the shorthand predicate for "this MR belongs in

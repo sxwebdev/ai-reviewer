@@ -241,6 +241,9 @@ func teamState(snapshots []domain.MergeRequestSnapshot) metrics.TeamState {
 			}
 		}
 		actions := domain.ClassifyAuthorActions(snap)
+		if len(actions.ChangesRequestedBy) > 0 {
+			st.ChangesRequested++
+		}
 		if actions.UnresolvedThreads > 0 {
 			st.UnresolvedThreads++
 		}
@@ -260,17 +263,37 @@ func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []
 	now := s.now()
 	mentions := map[string]slack.Mention{}
 
-	type reviewerBucket struct {
-		mention slack.Mention
-		items   []slack.ReviewItem
+	// One bucket per person, holding both halves of what they owe — and the bucket
+	// is the rendered shape itself, so nothing has to be copied field by field
+	// later. Two separate groupings (by reviewer, then by author) put the same
+	// person in two places and the same merge request under every one of its
+	// reviewers.
+	people := map[string]*slack.PersonDigest{}
+	at := func(u domain.User) *slack.PersonDigest {
+		k := userKey(u)
+		p := people[k]
+		if p == nil {
+			p = &slack.PersonDigest{Person: s.mention(ctx, mentions, u)}
+			people[k] = p
+		}
+		return p
 	}
-	type authorBucket struct {
-		mention slack.Mention
-		items   []slack.AuthorItem
-	}
-	reviewers := map[string]*reviewerBucket{}
-	authors := map[string]*authorBucket{}
 	counted := map[string]bool{}
+
+	// The per-row project label is dropped only when the whole digest is one
+	// project, so the only facts to carry are which project and whether a second
+	// one turned up; a set of paths existed only to be measured. The count
+	// saturates at two — "more than one" is the entire rule.
+	var soleProject string
+	projectCount := 0
+	noteProject := func(fullPath string) {
+		switch {
+		case projectCount == 0:
+			soleProject, projectCount = fullPath, 1
+		case fullPath != soleProject:
+			projectCount = 2
+		}
+	}
 
 	// Snapshots arrive grouped by repository and ordered by GitLab; sorting
 	// here makes the digest read the same way from one run to the next
@@ -286,64 +309,82 @@ func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []
 
 	for _, snap := range ordered {
 		key := snapshotKey(snap.Project.ID, snap.MR.IID)
-		author := s.mention(ctx, mentions, snap.MR.Author)
 
 		for _, r := range snap.Reviewers {
 			if !domain.NeedsHumanReview(snap, r) {
 				continue
 			}
-			rk := userKey(r.User)
-			b := reviewers[rk]
-			if b == nil {
-				b = &reviewerBucket{mention: s.mention(ctx, mentions, r.User)}
-				reviewers[rk] = b
-			}
-			b.items = append(b.items, slack.ReviewItem{
+			p := at(r.User)
+			p.ToReview = append(p.ToReview, slack.ReviewItem{
 				Project: projectLabel(snap.Project.FullPath),
 				IID:     snap.MR.IID,
 				Title:   snap.MR.Title,
 				WebURL:  snap.MR.WebURL,
-				Author:  author,
 				Waiting: waitingFor(snap, now),
 			})
 			counted[key] = true
+			noteProject(snap.Project.FullPath)
 		}
 
 		actions := domain.ClassifyAuthorActions(snap)
 		if !actions.Any() {
 			continue
 		}
-		ak := userKey(snap.MR.Author)
-		b := authors[ak]
-		if b == nil {
-			b = &authorBucket{mention: author}
-			authors[ak] = b
+		// The reviewers who asked for changes are named, so the author knows who to
+		// go back to. Resolved through the same per-run cache as everyone else, so a
+		// reviewer who is also an author costs no extra lookup.
+		var requested []slack.Mention
+		for _, u := range actions.ChangesRequestedBy {
+			requested = append(requested, s.mention(ctx, mentions, u))
 		}
-		b.items = append(b.items, slack.AuthorItem{
-			Project:           projectLabel(snap.Project.FullPath),
-			IID:               snap.MR.IID,
-			Title:             snap.MR.Title,
-			WebURL:            snap.MR.WebURL,
-			UnresolvedThreads: actions.UnresolvedThreads,
-			MergeConflicts:    actions.HasConflicts,
-			PipelineFailed:    actions.PipelineFailed,
-			PipelineWebURL:    actions.Pipeline.WebURL,
+		p := at(snap.MR.Author)
+		p.Own = append(p.Own, slack.AuthorItem{
+			Project:            projectLabel(snap.Project.FullPath),
+			IID:                snap.MR.IID,
+			Title:              snap.MR.Title,
+			WebURL:             snap.MR.WebURL,
+			ChangesRequestedBy: requested,
+			UnresolvedThreads:  actions.UnresolvedThreads,
+			MergeConflicts:     actions.HasConflicts,
+			PipelineFailed:     actions.PipelineFailed,
+			PipelineWebURL:     actions.Pipeline.WebURL,
 		})
 		counted[key] = true
+		noteProject(snap.Project.FullPath)
 	}
 
 	data := slack.DigestData{Team: team.Name, FailedRepos: failedRepos}
-	for _, k := range sortedKeys(reviewers) {
-		data.ReviewsNeeded = append(data.ReviewsNeeded, slack.ReviewerGroup{
-			Reviewer: reviewers[k].mention, MRs: reviewers[k].items,
-		})
+	// Only a single-project digest can drop the per-row project label.
+	if projectCount == 1 {
+		data.Project = projectLabel(soleProject)
 	}
-	for _, k := range sortedKeys(authors) {
-		data.AuthorActions = append(data.AuthorActions, slack.AuthorGroup{
-			Author: authors[k].mention, MRs: authors[k].items,
-		})
+
+	for _, k := range orderedPeople(people) {
+		p := people[k]
+		// Oldest first: the detail rows a reader gets are the ones that have been
+		// ignored longest, and the tail is the rest.
+		sort.SliceStable(p.ToReview, func(i, j int) bool { return p.ToReview[i].Waiting > p.ToReview[j].Waiting })
+		data.People = append(data.People, *p)
 	}
 	return data, len(counted)
+}
+
+// orderedPeople sorts the digest's people by how much they owe, most first, and
+// falls back to the key so a tie is stable from one run to the next. The busiest
+// queue is the one a reader is looking for; alphabetical order buried it.
+func orderedPeople(people map[string]*slack.PersonDigest) []string {
+	keys := make([]string, 0, len(people))
+	for k := range people {
+		keys = append(keys, k)
+	}
+	sort.SliceStable(keys, func(i, j int) bool {
+		ti, tj := people[keys[i]].Total(), people[keys[j]].Total()
+		if ti != tj {
+			return ti > tj
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }
 
 // waitingFor is how long the MR has been waiting on its reviewers: since the
@@ -380,6 +421,14 @@ func (s *Service) mention(ctx context.Context, cache map[string]slack.Mention, u
 			metrics.SlackUserMatch(metrics.MatchNotFound)
 		} else {
 			metrics.SlackUserMatch(r.Status.String())
+			// A user_map entry that did not resolve is a configuration mistake, not
+			// an ordinary unmatched user, and it is invisible in the digest itself —
+			// the person is simply named without a ping, exactly like everyone the
+			// directory does not know. This is the only place it can be reported.
+			if r.Note != "" {
+				s.log.Warnw("slack user_map entry did not resolve; naming the user without a mention",
+					"gitlab_user", u.Username, "detail", r.Note)
+			}
 			m = slack.MentionFrom(r)
 		}
 	}
@@ -526,13 +575,4 @@ func projectLabel(fullPath string) string {
 		return fullPath[i+1:]
 	}
 	return fullPath
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -523,10 +524,19 @@ func TestRunReviewCountsACrashedAttempt(t *testing.T) {
 	// taken at the instant one would land — inside the LLM call, which is where
 	// the memory goes. Whatever the database holds here is what a crash leaves
 	// behind.
-	var inFlight repo_review.FailureStats
+	var midReview, aged repo_review.FailureStats
 	h.llm.ReviewFn = func(llm.Request) (*llm.ReviewResponse, error) {
-		inFlight, _ = h.st.Review().FailureStats(context.Background(), repo_review.FailureStatsParams{
+		midReview, _ = h.svc.failureStats(context.Background(), testProjectID, testMRIID, testHeadSHA)
+		// The same row read as it would be *after* the grace expires, which is what
+		// a crash actually leaves behind: nobody comes back to rewrite it.
+		//
+		// The threshold is derived from the wall clock, not from testNow: created_at
+		// is filled by the database's now(), which the harness's fake clock does not
+		// move. Anything later than the row's real timestamp puts it past the grace.
+		aged, _ = h.st.Review().FailureStats(context.Background(), repo_review.FailureStatsParams{
 			ProjectID: testProjectID, MrIid: testMRIID, HeadSha: testHeadSHA,
+			InFlightMarker: inFlightMarker,
+			InFlightSince:  time.Now().Add(time.Minute),
 		})
 		return reviewResponse("leaks a connection"), nil
 	}
@@ -535,23 +545,31 @@ func TestRunReviewCountsACrashedAttempt(t *testing.T) {
 		t.Fatalf("RunReview: %v", err)
 	}
 
-	if inFlight.Failures != 1 {
-		t.Fatalf("failures visible mid-review = %d, want 1: an invisible crash is re-run at full price every scan",
-			inFlight.Failures)
+	// While the process is alive the row is a live attempt, not a strike — that is
+	// what stops the scanner warning about a review it is watching succeed.
+	if !midReview.InFlight {
+		t.Error("the attempt row must be recognised as in flight while the review runs")
 	}
-	if !strings.Contains(inFlight.LastError, "did not report an outcome") {
-		t.Errorf("last error = %q, want it to say the process never came back", inFlight.LastError)
+	if midReview.Failures != 0 {
+		t.Errorf("failures mid-review = %d, want 0: a running review is not a failure", midReview.Failures)
 	}
-	// …and the same row is gone once the process did come back, so a review that
+	// Once it can no longer be alive, the very same row is the countable crash.
+	if aged.Failures != 1 {
+		t.Fatalf("failures for an abandoned attempt = %d, want 1: an invisible crash is re-run at full price every scan",
+			aged.Failures)
+	}
+	if !strings.Contains(aged.LastError, "did not report an outcome") {
+		t.Errorf("last error = %q, want it to say the process never came back", aged.LastError)
+	}
+	// …and the row is gone once the process did come back, so a review that
 	// completes never scores a strike against itself.
-	after, err := h.st.Review().FailureStats(t.Context(), repo_review.FailureStatsParams{
-		ProjectID: testProjectID, MrIid: testMRIID, HeadSha: testHeadSHA,
-	})
+	after, err := h.svc.failureStats(t.Context(), testProjectID, testMRIID, testHeadSHA)
 	if err != nil {
-		t.Fatalf("FailureStats: %v", err)
+		t.Fatalf("failureStats: %v", err)
 	}
-	if after.Failures != 0 {
-		t.Errorf("failures after a completed review = %d, want 0", after.Failures)
+	if after.Failures != 0 || after.InFlight {
+		t.Errorf("after a completed review: failures = %d, in flight = %v; want 0 and false",
+			after.Failures, after.InFlight)
 	}
 }
 
@@ -586,14 +604,36 @@ func TestRunReviewDoesNotCountOurOwnShutdown(t *testing.T) {
 		// stop ends the review's context the way this failure mode does, from
 		// inside the LLM call — which is where a rolling deploy and a job timeout
 		// both land, and after the attempt row has been written.
-		stop         func(ctx context.Context, cancel context.CancelFunc)
+		stop func(ctx context.Context, cancel context.CancelFunc)
+		// llmErr overrides what the LLM call reports; the default is ctx.Err(),
+		// which is what both a cancellation and a timeout produce.
+		llmErr       error
 		deadline     time.Duration
 		wantFailures int64
 	}{
-		{"shutdown cancels the work", func(_ context.Context, cancel context.CancelFunc) { cancel() }, time.Hour, 0},
+		{
+			name:     "shutdown cancels the work",
+			stop:     func(_ context.Context, cancel context.CancelFunc) { cancel() },
+			deadline: time.Hour, wantFailures: 0,
+		},
 		// A deadline is the job's own 30-minute budget running out: an MR whose
 		// pipeline cannot finish is precisely what the ladder exists to throttle.
-		{"the job timeout counts", func(ctx context.Context, _ context.CancelFunc) { <-ctx.Done() }, 20 * time.Millisecond, 1},
+		{
+			name:     "the job timeout counts",
+			stop:     func(ctx context.Context, _ context.CancelFunc) { <-ctx.Done() },
+			deadline: 20 * time.Millisecond, wantFailures: 1,
+		},
+		// The context is still live here, and that is the point: a terminal sends
+		// Ctrl-C to the whole process group, so our claude and git children can be
+		// dead — with their error already on its way up — a moment before the
+		// cancellation reaches us. Counted, it would put a strike on a healthy SHA
+		// for the operator's stop.
+		{
+			name:     "a child killed with us does not count",
+			stop:     func(context.Context, context.CancelFunc) {},
+			llmErr:   fmt.Errorf("claude failed (signal: interrupt): %w", context.Canceled),
+			deadline: time.Hour, wantFailures: 0,
+		},
 	}
 
 	for _, c := range cases {
@@ -605,6 +645,9 @@ func TestRunReviewDoesNotCountOurOwnShutdown(t *testing.T) {
 			defer cancel()
 			h.llm.ReviewFn = func(llm.Request) (*llm.ReviewResponse, error) {
 				c.stop(ctx, cancel)
+				if c.llmErr != nil {
+					return nil, c.llmErr
+				}
 				return nil, ctx.Err()
 			}
 

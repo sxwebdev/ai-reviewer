@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -506,4 +507,58 @@ func TestDigestWorkerUsesTheScheduleAccessor(t *testing.T) {
 	if !dg.runDate.Equal(want) {
 		t.Errorf("run date = %s, want the UTC fallback %s", dg.runDate, want)
 	}
+}
+
+// TestWithShutdownCancelsReviewsAtStop pins the arithmetic that made this
+// necessary: a review takes 4-10 minutes and the default drain window is one, so
+// a review left in the drain cannot finish — it only holds the shutdown open for
+// the full window and keeps paying the model for output that is discarded when
+// the window closes. Measured on the first live run: Ctrl-C, then a full minute
+// of LLM passes, then "signal: killed".
+func TestWithShutdownCancelsReviewsAtStop(t *testing.T) {
+	t.Parallel()
+	svc := &Service{log: quietLogger(), stopping: make(chan struct{})}
+
+	ctx, cancel := svc.withShutdown(t.Context())
+	defer cancel()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("the review context must be live before the shutdown starts")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	svc.beginStop()
+	svc.beginStop() // idempotent: Stop may be reached twice, and a double close is fatal
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the review context was not cancelled when the shutdown began")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Errorf("ctx.Err() = %v, want context.Canceled — service.recordFailure discriminates on it", ctx.Err())
+	}
+}
+
+// A review that finishes normally must not leave its watcher behind: the cancel
+// func is the only thing that ends it, and there is one per in-flight review.
+func TestWithShutdownWatcherEndsWithItsJob(t *testing.T) {
+	t.Parallel()
+	svc := &Service{log: quietLogger(), stopping: make(chan struct{})}
+
+	before := runtime.NumGoroutine()
+	for range 50 {
+		_, cancel := svc.withShutdown(t.Context())
+		cancel()
+	}
+	// The watchers are woken by cancel(); give the scheduler a moment to run them.
+	for range 100 {
+		if runtime.NumGoroutine() <= before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("goroutines = %d, want back to %d: the shutdown watchers are leaking",
+		runtime.NumGoroutine(), before)
 }

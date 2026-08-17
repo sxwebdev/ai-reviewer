@@ -57,9 +57,15 @@ uniqueness, retries and metrics as a scheduled one.
 mode**, the `Europe/Moscow` timezone, PostgreSQL connectivity, pending
 migrations, River's tables, GitLab authentication (`GET /user`), GraphQL
 availability, every configured repository, `head_pipeline` visibility, Slack
-`auth.test`, bot membership of each channel, and whether `review.workdir` is
-writable. Secret values are never printed. `--local` skips the network probes. A
-failed check exits non-zero.
+`auth.test`, bot membership of each channel, the Slack **directory**
+(`users.list` — it names the missing scope, and warns when no member exposes an
+email), every `slack.user_map` entry resolved against that directory, and whether
+`review.workdir` is writable. Secret values are never printed. `--local` skips
+the network probes. A failed check exits non-zero.
+
+The directory check exists because its absence was invisible: a token without
+`users:read` passes `auth.test` and every channel check, then fails at 09:00 and
+the digest names everybody without mentioning them.
 
 The TLS line is a `WARN`, not a failure: `gitlab.insecure_skip_verify` is
 honoured if you set it, and this is the only place that says so out loud —
@@ -73,6 +79,25 @@ than appending to it).
 
 Both are on by default, so a fresh deployment observes and records without
 writing anything to GitLab or Slack.
+
+**Neither of them is the switch that spends money.** Reviewing is per team —
+`teams[].ai_review.enabled` — and it is the only thing that decides whether the
+LLM runs at all. A dry run costs exactly what a published one costs, a few dollars
+per merge request per head SHA, and shows nothing in GitLab in return, so the
+combination "reviewing on, publishing off" is a deliberate, temporary state. The
+service says so at startup:
+
+```text
+info  effective mode  {"ai_review_teams": ["payments"], "digest_only_teams": [],
+                       "publish_findings": false, "send_to_slack": true,
+                       "agent_mode": true, "workdir": "./data", "model": "sonnet"}
+warn  reviews will run but nothing will be published to GitLab  {"teams": ["payments"], ...}
+```
+
+That is the first place to look when the service is reviewing and you did not
+expect it to. `config.example.yaml` ships every team with `ai_review.enabled:
+false` for the same reason — pointed at a busy project, the very first scan pass
+would otherwise review every open merge request at once.
 
 **`service.ai_review_publish_enabled: false`** — merge requests are scanned,
 reviewed, validated and persisted; the review row is stored with
@@ -94,6 +119,49 @@ classified, users matched and the Block Kit payload built and stored, with
 `digest_messages.status='dry_run'`, the payload logged as a preview and no
 `slack_send` jobs enqueued. `digest_runs.status` is `dry_run`. Everything except
 the network call actually happens, so what you inspect is the real output.
+
+---
+
+## What the digest looks like
+
+One block per person, answering "what does this person owe": the reviews they
+have not delivered, then their own merge requests that need work.
+
+```text
+📋 MR Digest — blockchain-api
+
+@dkhristoliubov · review 11 · yours 3
+🔴 !1392 10d — CHAIN-206: raise FIREBLOCKS_PROXY_TIMEOUT above the…
+🟡 !1358 5d — CHAIN-170 index EVM ERC20 deposits via Transfer event…
+🟡 !1327 4d — CHAIN-104 partial index for unsynced blocks
+   +8 more: !1363 !1365 !1369 !1356 !1390 !1385 !1403 !1404
+🛠 !1378 · 💬 6 threads — CHAIN-122 Consolidation deposit detection improvement
+🛠 !1366 · 💬 3 threads · ⚠️ conflicts — CHAIN-184 Scheduler http wrapper
+🛠 !1375 · 💬 2 threads — CHAIN-203 Delegator integration
+```
+
+Reading it:
+
+- **People are ordered by how much they owe**, most first. The biggest queue is
+  the one worth looking at, and alphabetical order buried it.
+- **Reviews:** the three oldest get a full row; the rest are the `+N more:` line.
+  Every merge request is linked — nothing is dropped, only shortened.
+- **Age markers** are 🔴 from a week, 🟡 from two days, ▫️ below that. They
+  classify; they do not filter.
+- **Own merge requests** are the `🛠` rows, with the flags in a fixed order:
+  changes requested → threads → conflicts → pipeline.
+- **The project name** sits in the title when the digest covers one repository,
+  and moves into each row when it covers several — it is what tells two `!1404`s
+  apart.
+- **Titles** are cut to 55 characters at a word boundary. The ticket key comes
+  first in practice, so it survives the cut.
+- **Nothing is filtered.** A merge request nobody has touched in 110 days, a
+  draft, and one pushed 38 minutes ago are all listed. A reviewer who is on four
+  merge requests sees four rows, and a merge request with four reviewers appears
+  under each of them — as one line, not as a two-line entry.
+
+A person who owes nothing is not listed, and a digest with nothing in it is not
+posted at all.
 
 ---
 
@@ -136,16 +204,55 @@ is the MR's problem.
 
 ---
 
+## Stopping the service
+
+The first signal (`SIGINT`, `SIGTERM`, `SIGQUIT`) starts a graceful shutdown; **the
+second one exits immediately**, abandoning whatever is in flight, with status 1.
+The log says so at the moment the first arrives:
+
+```text
+info  shutdown signal received: draining, send it again to exit immediately  {"signal": "interrupt"}
+```
+
+What the graceful path waits for is publication and Slack delivery — network calls
+measured in seconds. **Reviews are not drained.** A review takes 4–10 minutes and
+`jobs.drain_timeout` is 60s, so waiting could never let one finish; it would only
+hold the shutdown open for the full window while continuing to pay for output that
+is discarded when the window closes. In-flight reviews are therefore cancelled the
+moment the shutdown starts, their attempt rows are discarded rather than counted
+against the merge request, and the next scan pass enqueues the same head SHA again.
+
+So a normal stop takes about as long as the slowest in-flight publish, and the
+worst case is bounded by `jobs.drain_timeout` — not by the length of a review.
+
+---
+
 ## Observability
 
-The mx ops server exposes, on `ops.*.port` (10000 by default):
+The ops server is **opt-in**: mx ships it off, and
+[`config.example.yaml`](../config.example.yaml) is what turns it on. A deployment
+configured purely through the environment sets `AI_REVIEWER_OPS_ENABLED`,
+`AI_REVIEWER_OPS_HEALTHY_ENABLED` and `AI_REVIEWER_OPS_METRICS_ENABLED` itself —
+without them the service runs with no listener at all, and a `/livez` healthcheck
+(the shipped compose file has one) never passes.
+
+Once on, it exposes, on `ops.*.port` (10000 by default):
 
 | Path           | Purpose                                              |
 | -------------- | ---------------------------------------------------- |
-| `/livez`       | liveness                                             |
-| `/readyz`      | readiness — fails while Postgres is unreachable      |
+| `/livez`       | liveness — service state only, 503 on a failed one   |
+| `/readyz`      | readiness — service state **and** the health checks  |
+| `/healthy`     | the health-check results alone, as JSON              |
 | `/metrics`     | Prometheus                                           |
 | `/debug/pprof` | profiler — **off by default**, see below             |
+
+**Point probes at `/readyz`, not `/healthy`.** They are not the same check: mx's
+`/healthy` returns only the health-checker poll map, so it ignores service state
+entirely, while `/readyz` overlays the two and is the one that goes red while
+Postgres is unreachable or a service is still starting. `/healthy` is useful for
+reading *which* checker is unhappy — it answers with a name per checker — and
+misleading as a gate. The shipped compose healthcheck uses `/livez`, which is the
+right question for "should this container be restarted".
 
 The profiler is the one endpoint that is not served out of the box: this port
 carries no authentication of its own, so heap and goroutine dumps would be
@@ -170,7 +277,7 @@ Metrics worth alerting on:
 | `ai_reviewer_scans_total{result}`, `ai_reviewer_scan_duration_seconds` | scan health              |
 | `gitlab_requests_total{endpoint,method,status}`, `gitlab_request_errors_total` | API health (templated paths, low cardinality) |
 | `merge_requests_scanned_total{team}`               | counter: open MRs inspected                    |
-| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten every pass — this is the digest's state as a dashboard |
+| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten on every digest build — twice a day, not every scan, because the classification needs a whole team at once. A flat line between 09:00 and 16:30 is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
 | `slack_digest_runs_total{team,result}`, `slack_messages_sent_total`, `slack_send_errors_total`, `slack_resend_uncertain_total` | digest delivery |
 | `slack_user_match_total{result}`                  | matching quality — watch `ambiguous`/`not_found` |
 | `river_jobs_total{kind,state}`, `river_job_duration_seconds`, `river_job_retries_total` | queue health |
@@ -186,9 +293,12 @@ per-SHA backoff ladder, so four deploys can no longer blacklist a healthy SHA:
 sum by (team, reason) (increase(ai_reviews_failed_total{reason!="canceled"}[1h]))
 ```
 
-Watching `canceled` on its own is still useful — a rise means reviews are being
-killed mid-flight, i.e. `jobs.drain_timeout` is too short for how long reviews
-actually take.
+Watching `canceled` on its own is still useful, but it no longer says anything
+about `jobs.drain_timeout`: reviews are cancelled deliberately when a shutdown
+starts (see [Stopping the service](#stopping-the-service)). A rise means the
+process is restarting often — deploys, OOM kills, a crash loop — and each restart
+throws away whatever reviews were running, to be re-done from scratch by the next
+scan.
 
 ---
 
@@ -200,14 +310,19 @@ no secret values, so its output is safe to paste into a ticket.
 | Symptom                                            | Likely cause                                                                                             |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Nothing happens at all after `start` runs           | Both dry-run switches are off by default. Check `service.*_enabled`, and look for persisted `dry_run` rows |
+| It reviews MRs though nobody enabled that          | Reviewing is `teams[].ai_review.enabled`, not `service.ai_review_publish_enabled` — the second only decides whether findings are posted. The `effective mode` line at startup names every team it is on for |
+| Ctrl-C does nothing, the process will not stop     | Fixed: the process has one signal owner and the second signal force-exits. If a build still ignores it, `kill -9`; reviews are re-enqueued by the next scan either way |
 | `config` check fails listing several problems       | Fail-fast validation. It reports every problem at once — fix them together                                |
 | `river schema` check fails                          | `ai-reviewer migrations up` was never run against this database                                          |
 | `migrations` check reports pending                  | A replica started with `migrate_on_start: false`; run `ai-reviewer migrations up`, or turn it back on     |
 | Reviews never start, `readyz` red                   | Postgres unreachable. The service is designed to stop rather than proceed blind                          |
 | "pipeline failed" never appears in the digest       | The token cannot see pipelines — the service account needs at least Reporter (§ GitLab permissions)      |
 | Digest posts nothing, token looks fine              | The bot is not a member of the channel — `doctor` checks this per channel                                |
-| Everyone in the digest appears without a mention    | `users:read.email` scope missing, or GitLab is not exposing emails; add `slack.user_map` overrides       |
-| One person appears as plain text while others ping  | Ambiguous match. Add a `slack.user_map` entry for them                                                   |
+| Everyone in the digest appears without a mention    | The token cannot read the directory. `doctor` says which scope is missing (`users:read`, then `users:read.email`); GitLab also rarely exposes emails, so add `slack.user_map` overrides |
+| One person appears as plain text while others ping  | Ambiguous match, a deactivated Slack account, or a `user_map` entry that did not resolve — the log says which. Deactivated accounts are excluded on purpose |
+| A `user_map` entry seems to be ignored              | It did not resolve, which looks identical to having no entry. `doctor` resolves every entry and prints what it became |
+| A review completes with 0 findings                  | `review complete` now carries a `suppressed=` breakdown; a large `not_in_diff` means the model keeps commenting on files the MR does not touch |
+| `held back by the failure backoff` for a healthy MR  | Fixed: a running review is reported as `review already in progress`. A WARN now means real failures |
 | `claude auth` check fails                           | The mode and the credential disagree. `oauth-token` needs `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`; `existing-login` will not work in a container |
 | Reviewer states look coarse                         | GraphQL is disabled or unsupported; the REST heuristic is in use. `doctor` says which                    |
 | A review job runs but publishes nothing             | It ran as a dry run. Re-run with `ai-reviewer review <ref> --publish --wait`                              |

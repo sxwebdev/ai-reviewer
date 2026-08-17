@@ -96,6 +96,18 @@ const (
 	ReviewStateReviewed         ReviewState = "REVIEWED"
 	ReviewStateRequestedChanges ReviewState = "REQUESTED_CHANGES"
 	ReviewStateApproved         ReviewState = "APPROVED"
+	// ReviewStateUnapproved is a reviewer who withdrew an approval, and
+	// ReviewStateReviewStarted one who opened the MR without delivering a verdict.
+	//
+	// Both were missing here while gitlab.ReviewState already knew them, so both
+	// collapsed into ReviewStateUnknown and took the REST fallback written for old
+	// self-managed instances. Measured against one live gitlab.com project: 7 of 57
+	// reviewer states, 12%. The fallback errs in the dangerous direction — it reads
+	// "left a note after the last push" as done, so a reviewer who *withdrew* an
+	// approval but had commented earlier silently left "Reviews needed" and the MR
+	// stalled with nobody chasing it.
+	ReviewStateUnapproved    ReviewState = "UNAPPROVED"
+	ReviewStateReviewStarted ReviewState = "REVIEW_STARTED"
 )
 
 // Known reports whether the state carries usable information.
@@ -116,6 +128,10 @@ func ParseReviewState(v string) ReviewState {
 		return ReviewStateRequestedChanges
 	case ReviewStateApproved:
 		return ReviewStateApproved
+	case ReviewStateUnapproved:
+		return ReviewStateUnapproved
+	case ReviewStateReviewStarted:
+		return ReviewStateReviewStarted
 	default:
 		return ReviewStateUnknown
 	}
@@ -127,14 +143,29 @@ type Reviewer struct {
 	State ReviewState
 
 	// LastActivityAt is when this reviewer last engaged with the MR: their most
-	// recent non-system note, or their approval, whichever is later. The service
-	// layer computes it from the discussions it already loads for every
-	// snapshot, so it costs no extra API call.
+	// recent ordinary note, or — only when they wrote none — their most recent
+	// system note **predating LastPushAt**. The service layer computes it from the
+	// discussions it already loads for every snapshot, so it costs no extra API
+	// call.
 	//
 	// It exists because GitLab's reviewState (mergeRequestInteraction) carries
 	// no timestamp of its own, and NeedsHumanReview has to know whether a
 	// REQUESTED_CHANGES verdict predates the author's latest push. Zero means
-	// "could not be determined".
+	// "could not be determined", which now covers two situations: the discussions
+	// were not loaded, or the only evidence of this reviewer is a system note the
+	// author has not answered yet.
+	//
+	// The system-note fallback is what makes a verdict delivered through GitLab's
+	// UI alone datable at all: a "Request changes" click with no comment leaves
+	// nothing but a *system* note, so counting ordinary notes only pinned such a
+	// reviewer at zero forever and no push could ever hand the MR back to them.
+	// The clamp is what keeps that from losing the opposite way — a system note can
+	// only ever prove a verdict is OLDER than the last push, never that the
+	// reviewer acted after it, because GitLab credits label, assignee and commit
+	// events to whoever made them too. service.lastActivityAt carries the full
+	// argument. An ordinary note is unclamped and wins whenever there is one; an
+	// approval would be dated the same way, which changes nothing, since
+	// NeedsHumanReview answers APPROVED before it ever reads this field.
 	LastActivityAt time.Time
 }
 

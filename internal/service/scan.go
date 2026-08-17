@@ -262,11 +262,19 @@ func (s *Service) reviewCandidate(ctx context.Context, team domain.Team, proj *g
 		return nil, nil
 	}
 
-	stats, err := s.st.Review().FailureStats(ctx, repo_review.FailureStatsParams{
-		ProjectID: proj.ID, MrIid: snap.MR.IID, HeadSha: snap.HeadSHA,
-	})
+	stats, err := s.failureStats(ctx, proj.ID, snap.MR.IID, snap.HeadSHA)
 	if err != nil {
 		return nil, fmt.Errorf("failure stats for %d!%d: %w", proj.ID, snap.MR.IID, err)
+	}
+	if stats.InFlight {
+		// A review of this exact SHA is running right now. Not a candidate, and
+		// emphatically not a failure: this used to be reported as "held back by the
+		// failure backoff" at WARN every scan interval for the whole duration of a
+		// perfectly healthy review, because the attempt row is written before the
+		// expensive work starts.
+		s.log.Infow("review already in progress; not enqueuing again",
+			"project", proj.PathWithNamespace, "iid", snap.MR.IID, "head_sha", snap.HeadSHA)
+		return nil, nil
 	}
 	due, wait := reviewDue(stats, s.now())
 	if !due {
@@ -289,6 +297,19 @@ func (s *Service) reviewCandidate(ctx context.Context, team domain.Team, proj *g
 		MRIID:       snap.MR.IID,
 		HeadSHA:     snap.HeadSHA,
 	}, nil
+}
+
+// failureStats reads the §6.5 counters for one head SHA. It is the only place
+// the in-flight recognition rule is assembled, so the scanner and the review
+// worker cannot disagree about which attempt rows are strikes.
+func (s *Service) failureStats(ctx context.Context, projectID, mrIID int64, headSHA string) (repo_review.FailureStats, error) {
+	return s.st.Review().FailureStats(ctx, repo_review.FailureStatsParams{
+		ProjectID:      projectID,
+		MrIid:          mrIID,
+		HeadSha:        headSHA,
+		InFlightMarker: inFlightMarker,
+		InFlightSince:  s.now().Add(-s.cfg.ReviewGrace),
+	})
 }
 
 // reviewDue applies the §6.5 ladder. wait is how long is still left when the

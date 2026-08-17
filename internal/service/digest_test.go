@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -139,7 +140,8 @@ func TestBuildDigestPersistsRunAndParts(t *testing.T) {
 		t.Fatalf("decode payload: %v", err)
 	}
 	rendered := renderedText(m)
-	for _, want := range []string{"<@U42>", "<@U01>", "payments", "!481", "unresolved", "merge conflicts", "pipeline failed", "https://pipelines/5"} {
+	// One row per merge request now, with the author's flags inline.
+	for _, want := range []string{"<@U42>", "<@U01>", "!481", "💬 1 thread", "⚠️ conflicts", "https://pipelines/5"} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("digest is missing %q:\n%s", want, rendered)
 		}
@@ -408,7 +410,7 @@ func TestBuildDigestMeasuresWaitingFromTheLastPush(t *testing.T) {
 	if err := json.Unmarshal(msgs[0].Payload, &m); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
-	if text := renderedText(m); !strings.Contains(text, "waiting 18h") {
+	if text := renderedText(m); !strings.Contains(text, "|!481> 18h") {
 		t.Errorf("digest does not report the wait since the last push:\n%s", text)
 	}
 }
@@ -447,6 +449,26 @@ func TestWaitingFor(t *testing.T) {
 				t.Errorf("waitingFor = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestOrderedPeopleRanksBusiestFirst pins the order the digest's people are
+// assembled in: workload descending, key ascending as the tiebreak. The busiest
+// queue is the one a reader is looking for (alphabetical order buried it), and a
+// tie has to break the same way every run or two slots that saw identical work
+// would reshuffle the digest between them.
+func TestOrderedPeopleRanksBusiestFirst(t *testing.T) {
+	t.Parallel()
+	people := map[string]*slack.PersonDigest{
+		"quiet": {ToReview: []slack.ReviewItem{{}}},
+		// Both halves count towards the workload: three merge requests owed.
+		"busy": {ToReview: []slack.ReviewItem{{}, {}}, Own: []slack.AuthorItem{{}}},
+		"anna": {Own: []slack.AuthorItem{{}}},
+	}
+	got := orderedPeople(people)
+	want := []string{"busy", "anna", "quiet"}
+	if !slices.Equal(got, want) {
+		t.Errorf("orderedPeople = %v, want %v (workload desc, key asc on a tie)", got, want)
 	}
 }
 

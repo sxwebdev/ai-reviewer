@@ -246,34 +246,86 @@ func (l *snapshotLoader) buildReviewers(fullPath string, detail *gitlab.MergeReq
 		if rs, ok := byUsername[strings.ToLower(strings.TrimSpace(u.Username))]; ok {
 			r.State = domain.ParseReviewState(string(rs.State))
 		}
-		r.LastActivityAt = lastActivityAt(snap.Discussions, r.User)
+		// snap.LastPushAt is already filled by the caller; it bounds which system
+		// notes may date a verdict — see lastActivityAt.
+		r.LastActivityAt = lastActivityAt(snap.Discussions, r.User, snap.LastPushAt)
 		out = append(out, r)
 	}
 	return out
 }
 
 // lastActivityAt is when a user last engaged with the MR: their most recent
-// non-system note.
+// ordinary note, or — only when they wrote none at all — their most recent
+// system note that predates lastPushAt.
 //
-// Approval time would also count, but GitLab's /approvals payload carries no
-// per-approver timestamp and its "approved this merge request" note is a system
-// note. That costs nothing in practice: an approver's review state is APPROVED,
-// and the REST fallback checks approved_by before it looks at timestamps — so
-// the only case the missing timestamp could affect is a reviewer who both
-// requested changes and approved, which cannot happen.
-func lastActivityAt(discussions []domain.Discussion, u domain.User) time.Time {
-	var latest time.Time
+// The system-note fallback exists because a reviewer can deliver a verdict
+// without typing anything. GitLab records a click on "Request changes" as a
+// *system* note ("requested changes"), exactly as it records approvals and
+// un-approvals, and mergeRequestInteraction.reviewState carries no timestamp of
+// its own. Counting ordinary notes only left that reviewer at the zero time
+// forever, which NeedsHumanReview reads as "the verdict cannot be dated" and
+// hands to the author — permanently. The author's push could never give the MR
+// back, so the reviewer was never nudged again and the author read "changes
+// requested by X" for the rest of the MR's life.
+//
+// The lastPushAt clamp is the whole safety of that fallback, and it is not an
+// optimisation: **a system note may only ever establish that a verdict predates
+// the last push, never that the reviewer acted after it.** GitLab credits a user
+// with every event it records for them — "added ~label", "assigned to @x",
+// "requested review from @y", "added 3 commits", "marked this merge request as
+// ready", "mentioned in merge request !999" — so an unclamped fallback let one
+// unrelated click after the author's push read as a re-review. That parks the MR
+// in the *author's* list as "changes requested by R" and leaves it there until
+// the next push, which the author has no reason to make, having already pushed
+// the fix: the re-look is lost for the life of the MR, which is strictly worse
+// than the zero-time bug this fallback fixes. Clamped, the states come out right
+// without any assumption about note bodies:
+//
+//   - verdict newer than the last push, nothing since → unusable → zero → the
+//     author keeps the MR (the documented undatable residual);
+//   - author pushes after the verdict → the note now predates the push, is used,
+//     and the push is later still → the reviewer owes the next look;
+//   - a stray event after that push → newer than the push → ignored → the
+//     reviewer still owes it.
+//
+// Matching the body prefix instead ("requested changes" / "approved" /
+// "unapproved") would be semantically sharper, and is rejected twice over: this
+// repository has never verified GitLab's wording against a live instance, and a
+// *second* uncommented verdict would still date itself after the push and evict
+// the reviewer. The positional rule needs neither the vocabulary nor the luck.
+//
+// Ordinary notes are not clamped and still win outright, even when a system note
+// is newer: a comment is a human act, and it is the evidence the rule was written
+// for. A lastPushAt of zero (no diff versions were read) discards every system
+// note, which is observationally identical to the old behaviour — NeedsHumanReview
+// cannot conclude anything from an unknown push time either.
+func lastActivityAt(discussions []domain.Discussion, u domain.User, lastPushAt time.Time) time.Time {
+	var ordinary, system time.Time
 	for _, d := range discussions {
 		for _, n := range d.Notes {
-			if n.System || !sameUser(n.Author, u) {
+			if !sameUser(n.Author, u) {
 				continue
 			}
-			if n.CreatedAt.After(latest) {
-				latest = n.CreatedAt
+			if n.System {
+				// Strictly after the push: a note at the push instant is kept, the
+				// same tie-break the push-aware classifier uses.
+				if n.CreatedAt.After(lastPushAt) {
+					continue
+				}
+				if n.CreatedAt.After(system) {
+					system = n.CreatedAt
+				}
+				continue
+			}
+			if n.CreatedAt.After(ordinary) {
+				ordinary = n.CreatedAt
 			}
 		}
 	}
-	return latest
+	if ordinary.IsZero() {
+		return system
+	}
+	return ordinary
 }
 
 // sameUser matches two GitLab accounts: by id when both carry one, otherwise

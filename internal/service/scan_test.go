@@ -90,6 +90,95 @@ func (h *harness) seedFailures(t *testing.T, headSHA string, n int, at time.Time
 	}
 }
 
+// seedInFlight writes the row startAttempt leaves behind while a review is
+// running: status='failed' carrying the in-flight marker, created at `at`.
+func (h *harness) seedInFlight(t *testing.T, headSHA string, at time.Time) {
+	t.Helper()
+	rev, err := h.st.Review().Create(t.Context(), repo_review.CreateParams{
+		ProjectID:    testProjectID,
+		ProjectPath:  "backend/payments",
+		Team:         testTeam,
+		MrIid:        testMRIID,
+		HeadSha:      headSHA,
+		Status:       StatusFailed,
+		PipelineJson: dbtypes.EmptyObject(),
+		RiskJson:     dbtypes.EmptyObject(),
+		Error:        inFlightMarker,
+		Attempt:      1,
+	})
+	if err != nil {
+		t.Fatalf("seed in-flight attempt: %v", err)
+	}
+	if _, err := h.pool.Exec(t.Context(),
+		`UPDATE mr_reviews SET created_at = $1 WHERE id = $2`, at, rev.ID); err != nil {
+		t.Fatalf("backdate in-flight attempt: %v", err)
+	}
+}
+
+// TestFailureStatsSeparatesRunningFromCrashed is the fix for the log line that
+// cried wolf.
+//
+// startAttempt records the attempt before spending a cent, so for the four to ten
+// minutes a review takes, its row is a status='failed' row like any other. The
+// scanner runs every five minutes, so it kept reporting "held back by the failure
+// backoff" at WARN — with a retry_in counted from a review that was running at
+// that very moment — and then the review succeeded. Observed on MR !1394: the same
+// warning at 13:05, 13:10 and 13:15, success at 13:16.
+//
+// The marker plus an age bound separates the two readings of that row. Both halves
+// matter: a young row must not be a strike, and an old one must still be, because
+// counting the crash is the entire reason the row is written up front.
+func TestFailureStatsSeparatesRunningFromCrashed(t *testing.T) {
+	cases := []struct {
+		name         string
+		age          time.Duration
+		wantInFlight bool
+		wantFailures int64
+	}{
+		{"started a moment ago", time.Minute, true, 0},
+		{"a long review, still inside the job timeout", 25 * time.Minute, true, 0},
+		// Past the grace the process cannot still be alive: River cancelled the job
+		// at ReviewTimeout. So this is the OOM/eviction case, and it must count.
+		{"older than the grace: the process died", 90 * time.Minute, false, 1},
+		{"a day old", 24 * time.Hour, false, 1},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, withDB)
+			seedGitLab(h.fake, testProject(), testMR(testMRIID))
+			h.seedInFlight(t, testHeadSHA, testNow.Add(-c.age))
+
+			stats, err := h.svc.failureStats(t.Context(), testProjectID, testMRIID, testHeadSHA)
+			if err != nil {
+				t.Fatalf("failureStats: %v", err)
+			}
+			if stats.InFlight != c.wantInFlight {
+				t.Errorf("InFlight = %v, want %v", stats.InFlight, c.wantInFlight)
+			}
+			if stats.Failures != c.wantFailures {
+				t.Errorf("Failures = %d, want %d", stats.Failures, c.wantFailures)
+			}
+			// A row that is not a strike must not contribute a timestamp either, or
+			// the ladder would measure its wait from a review still in progress.
+			if c.wantFailures == 0 && !stats.LastFailureAt.IsZero() {
+				t.Errorf("LastFailureAt = %v, want the zero time for a live attempt", stats.LastFailureAt)
+			}
+
+			// And the scanner must not queue a second review of a SHA already being
+			// reviewed — whichever reading applies, this MR is not a candidate now:
+			// live means "wait for it", crashed means the ladder decides.
+			res, err := h.svc.ScanRepository(t.Context(), testTeamConfig(), "backend/payments")
+			if err != nil {
+				t.Fatalf("ScanRepository: %v", err)
+			}
+			if c.wantInFlight && len(res.Candidates) != 0 {
+				t.Errorf("candidates = %d while a review of the same SHA is running, want 0", len(res.Candidates))
+			}
+		})
+	}
+}
+
 // TestScanRepositoryAppliesTheFailureBackoff exercises the ladder end to end
 // through the scanner, including the reset a new push brings.
 func TestScanRepositoryAppliesTheFailureBackoff(t *testing.T) {

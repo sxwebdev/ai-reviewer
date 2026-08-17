@@ -169,8 +169,9 @@ CLI does not report one.
 
 ## Docker Compose
 
-[`docker-compose.yml`](../docker-compose.yml) is the whole stack:
-PostgreSQL 17, a one-shot container that applies the schema, and the service.
+[`docker-compose.yml`](../docker-compose.yml) is the whole stack: PostgreSQL 17
+and the service. There is no third container — the service applies the schema
+itself, as below.
 
 ```bash
 cp .env.example .env    # the three tokens
@@ -185,6 +186,14 @@ River's, under one advisory lock.
 Two volumes: `pgdata` for the database, and `work` for `review.workdir` — git
 mirrors and per-review worktrees, which is why it must not be an image layer
 (one mirror can be gigabytes). The `cleanup` job sweeps it.
+
+`config.yaml` is what decides where inside that volume they land, and the image
+does not overrule it: `config.example.yaml` sets `review.workdir: /work`, so the
+Compose deployment uses `/work` itself. Remove the key and the schema default
+`./data` resolves against the image's `WORKDIR` — `/work/data`, still inside the
+same volume. Point the key at another path and mount `work` there instead. (The
+image sets no `AI_REVIEWER_REVIEW_WORKDIR`, deliberately: the environment outranks
+the file, so such a variable would silently make the key inert in the container.)
 
 Everyday commands:
 
@@ -211,7 +220,8 @@ review, `review.max_parallel` of them per replica.
 
 The image is Alpine-based and carries the Claude Code CLI, `git` and `ripgrep`
 alongside the service binary. It runs as a non-root user (uid 10001) with a
-writable `/work` for ephemeral mirrors and worktrees, and contains **no
+writable `/work` — which is also its `WORKDIR`, so with no `review.workdir` in the
+config the mirrors and worktrees go to `/work/data` — and contains **no
 credentials**.
 
 Its entrypoint is the binary and there is no default command, so the image is

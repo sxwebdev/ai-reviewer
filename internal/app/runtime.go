@@ -369,6 +369,9 @@ func (a *App) serviceConfig(ctx context.Context, gl gitlab.API) service.Config {
 		AllowedTools:     cfg.LLM.Claude.AllowedTools,
 		Model:            cfg.LLM.Claude.Model,
 		IgnoreGlobs:      cfg.Review.IgnoreGlobs,
+		// Margin over the job timeout: a review cancelled exactly at the deadline
+		// must still be recognised as finished-by-timeout rather than as live.
+		ReviewGrace: jobs.ReviewTimeout + 5*time.Minute,
 	}
 }
 

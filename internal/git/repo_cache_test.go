@@ -3,12 +3,14 @@ package git
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/tkcrm/mx/logger"
@@ -356,6 +358,87 @@ func TestGitAuthEnv(t *testing.T) {
 	want := "b2F1dGgyOnNla3JldC10b2tlbg=="
 	if !strings.Contains(joined, want) {
 		t.Errorf("expected base64 credential %q in %q", want, joined)
+	}
+}
+
+// signalledChild starts a child, kills it with sig and returns the error os/exec
+// reports for it — the shape a git failure has when a signal reached the child
+// directly.
+func signalledChild(t *testing.T, sig syscall.Signal) error {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	// SIGQUIT's default disposition is a core dump; keep any core file out of the
+	// package directory.
+	cmd.Dir = t.TempDir()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	if err := cmd.Process.Signal(sig); err != nil {
+		t.Fatalf("signal sleep with %v: %v", sig, err)
+	}
+	err := cmd.Wait()
+	if err == nil {
+		t.Fatalf("a child killed by %v must report an error", sig)
+	}
+	return err
+}
+
+// TestSignalled pins *which* signals mean "this process is shutting down".
+//
+// The answer is not cosmetic: a true answer makes service.recordFailure discard
+// the review's attempt row, so the §6.5 backoff ladder never counts the failure.
+// Read "killed by any signal" as shutdown and the OOM killer's SIGKILL on a
+// `git fetch` of a large mirror re-enqueues the same doomed head SHA at full
+// price on every scan, labelled `canceled`, with nothing in the ladder to stop
+// it. The shutdown signals are the ones the launcher installs; everything else
+// is infrastructure trouble and must stay countable.
+func TestSignalled(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+	t.Parallel()
+
+	exited := exec.Command("sh", "-c", "exit 3").Run()
+	if exited == nil {
+		t.Fatal("a non-zero exit must report an error")
+	}
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "not a child failure at all", err: errors.New("mirror missing"), want: false},
+		// git rejecting the work: exit status, no signal.
+		{name: "ordinary non-zero exit", err: exited, want: false},
+		{name: "wrapped non-zero exit", err: fmt.Errorf("fetch mirror: %w", exited), want: false},
+
+		// Ctrl-C reaches the whole process group, so our git children die of SIGINT
+		// microseconds before our own cancellation arrives; SIGTERM is what an
+		// orchestrator sends, and SIGQUIT completes launcher.ShutdownSiganl()'s set.
+		{name: "SIGINT", err: signalledChild(t, syscall.SIGINT), want: true},
+		{name: "SIGTERM", err: signalledChild(t, syscall.SIGTERM), want: true},
+		{name: "SIGQUIT", err: signalledChild(t, syscall.SIGQUIT), want: true},
+		// Cache.run wraps with %w precisely so this still resolves.
+		{name: "wrapped SIGINT", err: fmt.Errorf("fetch mirror: %w", signalledChild(t, syscall.SIGINT)), want: true},
+
+		// Nobody's shutdown: the OOM killer, and a `kill -9` from an operator
+		// pruning a runaway fetch. Both must count against the merge request.
+		{name: "SIGKILL from the OOM killer", err: signalledChild(t, syscall.SIGKILL), want: false},
+		{name: "SIGBUS", err: signalledChild(t, syscall.SIGBUS), want: false},
+
+		// An ExitError that never ran: ProcessState is nil, and reading the wait
+		// status off it must not panic.
+		{name: "exit error without a process state", err: &exec.ExitError{}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := Signalled(tt.err); got != tt.want {
+				t.Errorf("Signalled(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

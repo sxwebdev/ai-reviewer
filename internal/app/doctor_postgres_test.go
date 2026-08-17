@@ -37,7 +37,7 @@ func dbApp(t *testing.T) (*App, *pgxpool.Pool) {
 	}
 	pass, _ := u.User.Password()
 
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.Postgres = config.PostgresConfig{
 		Host:     u.Hostname(),
 		Port:     u.Port(),
@@ -100,7 +100,7 @@ func TestRiverTablesPresent(t *testing.T) {
 // failure, not a panic or a hang.
 func TestCheckPostgresCannotConnect(t *testing.T) {
 	t.Parallel()
-	cfg := testConfig()
+	cfg := testConfig(t)
 	cfg.Postgres.Host = "127.0.0.1"
 	cfg.Postgres.Port = "1" // nothing listens here
 	cfg.Postgres.Username = config.Secret("nobody")

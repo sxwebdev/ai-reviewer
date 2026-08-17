@@ -95,7 +95,10 @@ func withMigrationPool(ctx context.Context, boot logger.ExtendedLogger, cmd *cli
 	dsn := cmd.String("dsn")
 
 	if dsn != "" {
-		a := app.Minimal(options(cmd))
+		a, err := app.Minimal(options(cmd))
+		if err != nil {
+			return err
+		}
 		pg, err := postgres.New(ctx, dsn)
 		if err != nil {
 			return fmt.Errorf("connect postgres: %w", err)

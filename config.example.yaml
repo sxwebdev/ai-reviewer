@@ -19,9 +19,9 @@ ops: # mx ops server: /livez, /readyz, /metrics
   enabled: true
   healthy: { enabled: true, port: "10000" }
   metrics: { enabled: true, port: "10000" }
-  # /debug/pprof is off by default and stays that way until the ops port has an
-  # ingress restriction: the shipped NetworkPolicy is egress-only, so a profiler
-  # here would hand heap and goroutine dumps to anything that can reach the pod.
+  # /debug/pprof is off by default and stays that way until something in front of
+  # the ops port restricts it: this port carries no authentication of its own, so
+  # a profiler here hands heap and goroutine dumps to anything that can reach it.
   profiler: { enabled: false, port: "10000" }
 
 service:
@@ -43,7 +43,10 @@ postgres:
   migrate_on_start: true
 
 jobs:
-  drain_timeout: 60s # graceful River drain on shutdown
+  # Graceful River drain on shutdown. It covers publication and Slack delivery;
+  # in-flight reviews are cancelled at once instead — one cannot finish inside any
+  # sane window, so waiting would only keep paying for output nobody reads.
+  drain_timeout: 60s
   queues: # worker pool size per queue
     default: 2
     # The `review` queue is deliberately absent: its size is review.max_parallel,
@@ -63,7 +66,19 @@ gitlab:
 slack:
   token: "" # AI_REVIEWER_SLACK_TOKEN
   directory_ttl: 15m # in-process TTL of the users.list cache
-  user_map: {} # optional override: gitlab_username -> SLACK_USER_ID
+  # Optional override for people the indexes below cannot match. The value may be
+  # a Slack user id, an @handle or an email:
+  #
+  #   user_map:
+  #     jsmith: U01ABCDEF      # id — resolved without calling users.list
+  #     adoe: "@adoe"          # handle
+  #     bkim: bkim@acme.io     # email
+  #
+  # An id is the only form that keeps working while users.list is unavailable,
+  # which is the case the override exists for; the other two are the forms you can
+  # actually look up by hand. `ai-reviewer doctor` resolves every entry and prints
+  # what it became, so a wrong one is caught before a digest goes out.
+  user_map: {}
 
 llm:
   provider: claude-cli
@@ -103,7 +118,13 @@ review:
   max_comments: 12
   severity_threshold: medium
   preferred_comment_language: auto
-  workdir: /work # ephemeral mirrors and worktrees
+  # Ephemeral mirrors and worktrees. The default is the relative ./data, which is
+  # what makes a local run work with no config at all. In a container it resolves
+  # against WORKDIR (/work), i.e. inside the mounted volume — and THIS key is what
+  # puts it at /work itself. The image deliberately sets no
+  # AI_REVIEWER_REVIEW_WORKDIR: the environment outranks the file, so the variable
+  # would make this line unsettable.
+  workdir: /work
   # Excluded from the prompt AND from the finding-eligible set, on both sides of
   # a rename. This is the default; setting the key replaces the list rather than
   # adding to it.
@@ -143,12 +164,17 @@ review:
     enabled: false # runs the reviewed repository's tests — explicit opt-in
 
 teams:
+  # ai_review.enabled is the switch that spends money: every open MR is reviewed
+  # once per head sha, at a few dollars each, and service.ai_review_publish_enabled
+  # above does NOT gate that — with it off the reviews still run and simply post
+  # nothing. So both start off here: bring up the digest, get `doctor` green, then
+  # turn reviewing on one team at a time.
   - name: payments
     slack_channel: C012345678
-    ai_review: { enabled: true }
+    ai_review: { enabled: false }
     repositories: [backend/payments, backend/billing, frontend/checkout]
 
   - name: platform
     slack_channel: C987654321
-    ai_review: { enabled: true }
+    ai_review: { enabled: false }
     repositories: [platform/auth, platform/gateway]

@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -105,17 +106,24 @@ func TestNeedsAIReview(t *testing.T) {
 
 func TestNeedsHumanReviewGraphQLStates(t *testing.T) {
 	// The reviewer has neither approved nor commented, so the REST fallback
-	// would answer "needs review" for all four states. Anything that comes back
+	// would answer "needs review" for every state below. Anything that comes back
 	// false therefore proves the GraphQL state is what decided.
 	cases := []struct {
 		state ReviewState
 		want  bool
 	}{
 		{ReviewStateUnreviewed, true},
-		// LastActivityAt is zero here, which is the "cannot tell" branch of the
-		// push-aware rule; TestNeedsHumanReviewRequestedChangesIsPushAware
-		// covers the timestamped cases.
-		{ReviewStateRequestedChanges, true},
+		// Withdrawing an approval asks for a fresh verdict; starting a review is
+		// not finishing one. Both used to fall through to the REST fallback, which
+		// answers "done" for a reviewer who commented after the last push — so a
+		// reviewer who un-approved could silently leave the digest.
+		{ReviewStateUnapproved, true},
+		{ReviewStateReviewStarted, true},
+		// LastActivityAt is zero here: the verdict cannot be dated, so the author is
+		// nudged instead (ClassifyAuthorActions lists the MR under them).
+		// TestNeedsHumanReviewRequestedChangesIsPushAware covers the timestamped
+		// cases.
+		{ReviewStateRequestedChanges, false},
 		{ReviewStateReviewed, false},
 		{ReviewStateApproved, false},
 	}
@@ -141,7 +149,11 @@ func TestNeedsHumanReviewRequestedChangesIsPushAware(t *testing.T) {
 		// Exact ties resolve as "no new push": the comparison is strict.
 		{"reviewer engaged exactly at the push instant", pushedAt, false},
 		{"author pushed after the reviewer requested changes", beforeMR, true},
-		{"engagement time unknown", time.Time{}, true},
+		// An undatable verdict goes to the author, not back to the reviewer. This
+		// is only safe because ClassifyAuthorActions now reports the same state —
+		// TestAuthorActionsIncludeRequestedChanges is the other half, and the MR
+		// would fall out of the digest entirely if either side stopped.
+		{"engagement time unknown", time.Time{}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -241,10 +253,15 @@ func TestParseReviewState(t *testing.T) {
 		{"REVIEWED", ReviewStateReviewed},
 		{"REQUESTED_CHANGES", ReviewStateRequestedChanges},
 		{"APPROVED", ReviewStateApproved},
+		// Both are live values on gitlab.com — 7 of 57 reviewer states on one
+		// project — and both used to land in the REST fallback because this
+		// function did not know them while gitlab.ReviewState did.
+		{"UNAPPROVED", ReviewStateUnapproved},
+		{"REVIEW_STARTED", ReviewStateReviewStarted},
 		{"", ReviewStateUnknown},
-		// A value we do not know must degrade to the REST fallback, never to
-		// "already reviewed".
-		{"REVIEW_STARTED", ReviewStateUnknown},
+		// A value we genuinely do not know must degrade to the REST fallback, never
+		// to "already reviewed".
+		{"SOMETHING_NEW", ReviewStateUnknown},
 		{"approved", ReviewStateUnknown},
 	}
 	for _, c := range cases {
@@ -512,15 +529,179 @@ func TestClassifyAuthorActions(t *testing.T) {
 			s.Pipeline = c.pipeline
 
 			got := ClassifyAuthorActions(s)
-			if got != c.want {
+			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("ClassifyAuthorActions = %+v, want %+v", got, c.want)
 			}
-			wantAny := c.want != AuthorActions{}
+			wantAny := !reflect.DeepEqual(c.want, AuthorActions{})
 			if got.Any() != wantAny {
 				t.Errorf("Any() = %v, want %v", got.Any(), wantAny)
 			}
 			if NeedsAuthorAction(s) != wantAny {
 				t.Errorf("NeedsAuthorAction = %v, want %v", NeedsAuthorAction(s), wantAny)
+			}
+		})
+	}
+}
+
+// TestAuthorActionsIncludeRequestedChanges is the half of the digest that was
+// missing entirely.
+//
+// ClassifyAuthorActions never looked at s.Reviewers, so "a reviewer asked for
+// changes" reached the author only when the reviewer also happened to leave a
+// resolvable thread. A verdict with no comment, or one whose threads were all
+// resolved, put the MR in neither section — NeedsHumanReview said the reviewer
+// was done and nothing said the author owed anything.
+func TestAuthorActionsIncludeRequestedChanges(t *testing.T) {
+	reviewer := func(state ReviewState, activity time.Time) Reviewer {
+		return Reviewer{User: reviewerUser, State: state, LastActivityAt: activity}
+	}
+
+	cases := []struct {
+		name      string
+		reviewers []Reviewer
+		wantUsers []User
+	}{
+		{
+			// The case that used to vanish: no threads, no conflicts, no pipeline,
+			// and an undatable verdict.
+			name:      "undatable verdict still reaches the author",
+			reviewers: []Reviewer{reviewer(ReviewStateRequestedChanges, time.Time{})},
+			wantUsers: []User{reviewerUser},
+		},
+		{
+			name:      "verdict newer than the last push",
+			reviewers: []Reviewer{reviewer(ReviewStateRequestedChanges, afterMR)},
+			wantUsers: []User{reviewerUser},
+		},
+		{
+			// Answered by a push: the ball is back with the reviewer, who is listed
+			// under "Reviews needed". Reporting both would double-count the MR.
+			name:      "verdict superseded by a push",
+			reviewers: []Reviewer{reviewer(ReviewStateRequestedChanges, beforeMR)},
+			wantUsers: nil,
+		},
+		{
+			name:      "other states are not author actions",
+			reviewers: []Reviewer{reviewer(ReviewStateUnreviewed, time.Time{}), reviewer(ReviewStateApproved, afterMR)},
+			wantUsers: nil,
+		},
+		{
+			name: "two reviewers, one of them superseded",
+			reviewers: []Reviewer{
+				reviewer(ReviewStateRequestedChanges, afterMR),
+				{User: otherUser, State: ReviewStateRequestedChanges, LastActivityAt: beforeMR},
+			},
+			wantUsers: []User{reviewerUser},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := openSnap()
+			s.Reviewers = c.reviewers
+
+			got := ClassifyAuthorActions(s)
+			if !reflect.DeepEqual(got.ChangesRequestedBy, c.wantUsers) {
+				t.Errorf("ChangesRequestedBy = %+v, want %+v", got.ChangesRequestedBy, c.wantUsers)
+			}
+			// Any() is what puts the MR in the digest at all, and there is nothing
+			// else to report on this snapshot.
+			if want := len(c.wantUsers) > 0; got.Any() != want {
+				t.Errorf("Any() = %v, want %v: the merge request would be %s the digest",
+					got.Any(), want, map[bool]string{true: "missing from", false: "wrongly listed in"}[want])
+			}
+		})
+	}
+}
+
+// claimant returns which side of the digest claims the merge request for
+// reviewer r, failing when the two rules do not partition it: both would
+// double-report the MR, neither would lose it silently.
+func claimant(t *testing.T, s MergeRequestSnapshot, r Reviewer) (reviewerOwes bool) {
+	t.Helper()
+	reviewerOwes = NeedsHumanReview(s, r)
+	authorOwes := len(ClassifyAuthorActions(s).ChangesRequestedBy) > 0
+	if reviewerOwes == authorOwes {
+		t.Fatalf("partition broken: reviewer owes = %v, author owes = %v; want exactly one",
+			reviewerOwes, authorOwes)
+	}
+	return reviewerOwes
+}
+
+// TestAuthorActionsAndReviewsNeededDoNotOverlap pins the pairing the two rules
+// rely on: for a REQUESTED_CHANGES reviewer, exactly one side must claim the
+// merge request. Both would double-report it; neither would lose it.
+func TestAuthorActionsAndReviewsNeededDoNotOverlap(t *testing.T) {
+	cases := []struct {
+		name             string
+		activity         time.Time
+		wantReviewerOwes bool
+	}{
+		{"author pushed after the verdict", beforeMR, true},
+		{"verdict at the push instant", pushedAt, false},
+		{"verdict newer than the last push", afterMR, false},
+		// The residual undated case. The service now dates an uncommented verdict
+		// from the reviewer's own system note, so zero means it could not read the
+		// discussions at all — not "the reviewer wrote nothing". The author keeps
+		// the MR, and TestUncommentedVerdictIsReachableAfterAPush is what stops
+		// that from being a permanent dead end.
+		{"engagement time unknown", time.Time{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := openSnap()
+			r := Reviewer{User: reviewerUser, State: ReviewStateRequestedChanges, LastActivityAt: c.activity}
+			s.Reviewers = []Reviewer{r}
+
+			if got := claimant(t, s, r); got != c.wantReviewerOwes {
+				t.Errorf("activity=%v: reviewer owes = %v, want %v", c.activity, got, c.wantReviewerOwes)
+			}
+		})
+	}
+}
+
+// TestUncommentedVerdictIsReachableAfterAPush walks the progression of a
+// REQUESTED_CHANGES verdict from "the author owes a fix" to "the reviewer owes a
+// re-look", which is where the pairing used to dead-end.
+//
+// Both static halves of the partition were tested; the progression between them
+// was not. LastActivityAt was fed by non-system notes only, so a reviewer who
+// clicked "Request changes" without writing a word stayed at zero forever, the
+// push-aware comparison was never reached, and the MR sat under the author for the
+// rest of its life — nobody chasing the reviewer.
+func TestUncommentedVerdictIsReachableAfterAPush(t *testing.T) {
+	verdictAt := afterMR // the verdict lands after the push the reviewer looked at
+
+	// The two ways a verdict is dated by the time it reaches this package. The
+	// uncommented one is only datable once the author's push proves the verdict is
+	// the older of the two — a system note newer than the push cannot be trusted to
+	// mean "the reviewer acted", so service.lastActivityAt reports zero until then.
+	cases := []struct {
+		name        string
+		unanswered  time.Time // LastActivityAt while the verdict stands
+		afterAnswer time.Time // LastActivityAt once the author has pushed
+	}{
+		{"reviewer left a comment", verdictAt, verdictAt},
+		{"reviewer wrote nothing", time.Time{}, verdictAt},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Step 1: the verdict is fresher than the last push. The author owes the fix.
+			s := openSnap()
+			r := Reviewer{User: reviewerUser, State: ReviewStateRequestedChanges, LastActivityAt: c.unanswered}
+			s.Reviewers = []Reviewer{r}
+			if claimant(t, s, r) {
+				t.Fatal("an unanswered verdict belongs to the author, not back to the reviewer")
+			}
+
+			// Step 2: the author pushes the fix. Ownership must flip — exactly once,
+			// and without the MR passing through a state where nobody claims it
+			// (claimant fails on that).
+			s.LastPushAt = verdictAt.Add(time.Hour)
+			r.LastActivityAt = c.afterAnswer
+			s.Reviewers = []Reviewer{r}
+			if !claimant(t, s, r) {
+				t.Error("after the author pushes, the reviewer owes the next look")
 			}
 		})
 	}

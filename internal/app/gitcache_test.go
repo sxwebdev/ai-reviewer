@@ -91,7 +91,7 @@ func TestGitCacheTakesTheCrossProcessMirrorLock(t *testing.T) {
 	src := initSourceRepo(t)
 	proj := uniqueProject(t)
 
-	a := &App{Config: testConfig(), Log: quietLogger()}
+	a := &App{Config: testConfig(t), Log: quietLogger()}
 	a.Config.Review.WorkDir = t.TempDir()
 	cache := a.gitCache(pool)
 
@@ -149,7 +149,7 @@ func TestGitCacheSerializesTwoReplicasOnOneMirror(t *testing.T) {
 	shared := t.TempDir() // one volume, two replicas
 
 	newReplica := func(pool *pgxpool.Pool) *App {
-		a := &App{Config: testConfig(), Log: quietLogger()}
+		a := &App{Config: testConfig(t), Log: quietLogger()}
 		a.Config.Review.WorkDir = shared
 		return a
 	}

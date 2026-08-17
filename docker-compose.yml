@@ -76,6 +76,17 @@ services:
       # review.workdir: git mirrors and per-review worktrees. A named volume
       # rather than the image layer — one mirror can be gigabytes — and it comes
       # up owned by the image's non-root user. The cleanup job sweeps it.
+      #
+      # config.example.yaml sets `review.workdir: /work`, and that file is what
+      # decides: the image sets no AI_REVIEWER_REVIEW_WORKDIR, because the
+      # environment outranks the file and the variable would make the key inert
+      # in here. Drop the key and the relative default ./data resolves against
+      # the image's WORKDIR /work, i.e. /work/data — still inside this volume.
+      #
+      # Pointing the key somewhere else works, but mount the volume on that path
+      # AND make the path writable by uid 10001: /work is the one directory the
+      # image creates and chowns, so a named volume mounted anywhere else comes up
+      # root-owned and the service refuses to start (loudly — `doctor` says so too).
       - work:/work
     ports:
       # ops only: /livez, /readyz, /metrics. The service has no other listener.

@@ -70,9 +70,10 @@ func TestExpandToolRules(t *testing.T) {
 	}
 }
 
-// The placeholder must survive as an exact literal: config.DefaultConfig writes
-// it into allowed_tools, and a rename would silently stop scoping the rules
-// (they would pass through unexpanded and claude would match nothing).
+// The placeholder must survive as an exact literal: it is spelled out in the
+// `default:` tag on config's allowed_tools (a struct tag cannot reference this
+// constant), and a rename here would silently stop scoping the rules — they
+// would pass through unexpanded and claude would match nothing.
 func TestWorktreePlaceholderSpelling(t *testing.T) {
 	if WorktreePlaceholder != "${worktree}" {
 		t.Errorf("WorktreePlaceholder = %q; config defaults and README document ${worktree}", WorktreePlaceholder)

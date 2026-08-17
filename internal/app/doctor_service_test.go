@@ -132,7 +132,7 @@ func (r refusingPipelines) ListMRPipelines(context.Context, string, int64) ([]gi
 // repositories are named, and the pipeline verdict is aggregated across them.
 func TestCheckRepositoriesSummarises(t *testing.T) {
 	t.Parallel()
-	cfg := testConfig()
+	cfg := testConfig(t)
 	a := &App{Config: cfg, Log: quietLogger()}
 
 	f := gitlab.NewFake()
@@ -180,7 +180,7 @@ func TestCheckRepositoriesSummarises(t *testing.T) {
 
 func TestCheckRepositoriesWithNoneConfigured(t *testing.T) {
 	t.Parallel()
-	a := &App{Config: config.DefaultConfig(), Log: quietLogger()}
+	a := &App{Config: defaultConfig(t), Log: quietLogger()}
 	col := &checkCollector{}
 	a.checkRepositories(t.Context(), col, gitlab.NewFake())
 
@@ -202,15 +202,15 @@ func TestCheckCollectorRedacts(t *testing.T) {
 
 func TestFirstRepository(t *testing.T) {
 	t.Parallel()
-	if got := firstRepository(&App{Config: testConfig()}); got != "backend/payments" {
+	if got := firstRepository(&App{Config: testConfig(t)}); got != "backend/payments" {
 		t.Errorf("firstRepository = %q", got)
 	}
-	if got := firstRepository(&App{Config: config.DefaultConfig()}); got != "" {
+	if got := firstRepository(&App{Config: defaultConfig(t)}); got != "" {
 		t.Errorf("with no teams = %q, want empty", got)
 	}
 	// A team configured with no repositories must not shadow a later one that
 	// has them.
-	cfg := config.DefaultConfig()
+	cfg := defaultConfig(t)
 	cfg.Teams = []config.TeamConfig{
 		{Name: "empty", SlackChannel: "C0"},
 		{Name: "real", SlackChannel: "C1", Repositories: []string{"a/b"}},
@@ -240,7 +240,7 @@ func TestCheckSlackWithoutAToken(t *testing.T) {
 	t.Parallel()
 
 	// Delivery off: not having a token is a legitimate configuration.
-	cfg := testConfig()
+	cfg := testConfig(t)
 	a := &App{Config: cfg, Log: quietLogger()}
 	col := &checkCollector{}
 	a.checkSlack(t.Context(), col)
@@ -249,7 +249,7 @@ func TestCheckSlackWithoutAToken(t *testing.T) {
 	}
 
 	// Delivery on with no token cannot possibly work, so it is a failure.
-	cfg2 := testConfig()
+	cfg2 := testConfig(t)
 	cfg2.Service.SlackSendEnabled = true
 	col2 := &checkCollector{}
 	(&App{Config: cfg2, Log: quietLogger()}).checkSlack(t.Context(), col2)
@@ -263,7 +263,7 @@ func TestCheckSlackWithoutAToken(t *testing.T) {
 // running, the summary must not tell the operator to change project membership.
 func TestCheckRepositoriesDoesNotWarnAboutRepositoriesWithoutCI(t *testing.T) {
 	t.Parallel()
-	cfg := testConfig()
+	cfg := testConfig(t)
 	a := &App{Config: cfg, Log: quietLogger()}
 
 	f := gitlab.NewFake()

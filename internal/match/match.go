@@ -9,6 +9,7 @@ package match
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -56,6 +57,11 @@ type Result struct {
 	// "John Smith (@john)" otherwise, so the digest can still name the
 	// person it cannot ping.
 	Display string
+	// Note explains an outcome the caller should log, and is set only when the
+	// explanation is not obvious from Status: today, a user_map entry that did not
+	// resolve. A misconfigured override must not look like an ordinary unmatched
+	// user, or nobody ever finds out the entry is wrong.
+	Note string
 }
 
 // SlackUser is the subset of a Slack directory entry the matcher compares
@@ -110,13 +116,118 @@ type UserMatcher interface {
 // Matcher is the default UserMatcher.
 type Matcher struct {
 	dir Directory
-	// overrides maps a normalised GitLab username to a Slack user ID
-	// (slack.user_map).
+	// overrides maps a normalised GitLab username to a Slack user id, @handle or
+	// email (slack.user_map). ParseOverride decides which of the three a value
+	// is; resolveOverride is what each form then costs.
 	overrides map[string]string
 }
 
+// slackIDPattern recognises a Slack user id: U or W, then eight or more
+// uppercase alphanumerics. Matching it is what keeps an id-valued override
+// answerable without touching the directory.
+//
+// Both halves of the shape are load-bearing, and each was got wrong once:
+//
+// Length is Slack's documented format — a user id is nine characters or more
+// (`U012AB3CD`), on every workspace, including the oldest. The floor was `{2,}`
+// for a while, lowered purely so short test fixtures (`U42`, `U999`) would keep
+// working and then justified in a comment as tolerating ids from old workspaces.
+// No such id exists; the fixtures were the only reason, and a fixture is not a
+// reason. That looseness classified *any* all-caps U/W-initial string of three
+// characters or more as an id, which is precisely what an operator produces by
+// typing a colleague's handle in capitals: `{jsmith: WENDY}` mentioned <@WENDY>.
+//
+// Case is the discriminator above that floor: Slack lower-cases the `name` it
+// serves as a handle, so an all-caps value of id length is an id. Nothing may
+// fold the case before matching — that too happened, and it made every
+// u/w-initial handle an "id", so `{jsmith: wendy}` resolved to <@WENDY> offline
+// with no lookup, no Note and no log line, while `slack_user_match_total` counted
+// a success and `doctor` reported "no active Slack account has this user id" for
+// a handle somebody actually holds.
+//
+// The residual false-positive class, stated plainly: an all-caps handle at least
+// nine characters long (`UNDERWATER`) is still read as an id. It is rare, it
+// produces a broken mention rather than a mention of the wrong person, and
+// `doctor` resolves ids against the directory too — so a value that is not a real
+// account is reported before any digest goes out. That last property is the one
+// that makes the residue tolerable; do not remove it.
+var slackIDPattern = regexp.MustCompile(`^[UW][A-Z0-9]{8,}$`)
+
+// OverrideForm is the form one slack.user_map value takes. It decides whether
+// resolving the value needs the Slack directory at all.
+type OverrideForm int
+
+const (
+	// OverrideEmpty is a value that is blank once trimmed. It is named rather
+	// than reported as a handle so callers can say "nothing was configured"
+	// instead of looking up "".
+	OverrideEmpty OverrideForm = iota
+	// OverrideID is a Slack user id (U…/W…), the one form that resolves offline.
+	OverrideID
+	// OverrideHandle is a Slack @handle, with or without the @.
+	OverrideHandle
+	// OverrideEmail is an email address.
+	OverrideEmail
+)
+
+func (f OverrideForm) String() string {
+	switch f {
+	case OverrideID:
+		return "id"
+	case OverrideHandle:
+		return "handle"
+	case OverrideEmail:
+		return "email"
+	case OverrideEmpty:
+		return "empty"
+	default:
+		return fmt.Sprintf("override_form(%d)", int(f))
+	}
+}
+
+// Override is one slack.user_map value, classified.
+type Override struct {
+	// Form decides how Key is meant to be used.
+	Form OverrideForm
+	// Key is what the lookup takes: the id verbatim for OverrideID — Slack ids
+	// are case-sensitive and the pattern already required upper case — and the
+	// normalised comparison form for a handle or an email.
+	Key string
+}
+
+// ParseOverride classifies one slack.user_map value: id, handle, email or empty.
+//
+// This is the single owner of the override grammar, and it is exported and pure
+// for one reason. Two callers must agree on it exactly — the matcher, which
+// resolves entries when a digest is built, and `doctor`, whose whole purpose is to
+// tell an operator beforehand whether those entries will resolve. `doctor` used to
+// reimplement the @-stripping, the "an @ elsewhere means email" rule and the
+// ambiguity policy, sharing only the id predicate; two copies of a grammar drift,
+// and a `doctor` that classifies a value differently from the matcher blesses a
+// map that mentions nobody. Neither side may re-derive any of this locally.
+//
+// It performs no I/O by design: what the Key resolves *to* is the caller's
+// business, because the two callers ask different questions of different
+// indexes — the matcher through Directory, doctor against a slack.Snapshot.
+func ParseOverride(value string) Override {
+	v := strings.TrimSpace(value)
+	switch {
+	case v == "":
+		return Override{Form: OverrideEmpty}
+	case slackIDPattern.MatchString(v):
+		return Override{Form: OverrideID, Key: v}
+	}
+	// A leading @ is how people write handles; an @ anywhere else makes it an
+	// email. Both are stripped to the bare key the indexes hold.
+	key := strings.TrimPrefix(v, "@")
+	if strings.Contains(key, "@") {
+		return Override{Form: OverrideEmail, Key: normalize(key)}
+	}
+	return Override{Form: OverrideHandle, Key: normalize(key)}
+}
+
 // New builds a matcher over dir. userMap is the optional
-// gitlab_username → SLACK_USER_ID override from the config; keys are
+// gitlab_username → Slack account override from the config; keys are
 // normalised, so it tolerates however the operator typed them.
 func New(dir Directory, userMap map[string]string) *Matcher {
 	m := &Matcher{dir: dir, overrides: make(map[string]string, len(userMap))}
@@ -135,7 +246,8 @@ var _ UserMatcher = (*Matcher)(nil)
 
 // Match resolves u, in the fixed order of plan §13.2:
 //
-//  1. explicit user_map override;
+//  1. explicit user_map override (an id answers offline; a handle or email is
+//     resolved, and a failure to resolve stops here rather than falling through);
 //  2. normalised email;
 //  3. GitLab username against Slack handle / display name / real name, then
 //     GitLab name against real name / display name;
@@ -148,11 +260,10 @@ var _ UserMatcher = (*Matcher)(nil)
 func (m *Matcher) Match(ctx context.Context, u GitLabUser) (Result, error) {
 	fallback := Fallback(u)
 
-	// 1. The override is an escape hatch, so it is answered without touching
-	// the directory: it must keep working when users.list does not, and it
-	// must not be second-guessed by the indexes.
-	if id, ok := m.overrides[normalize(u.Username)]; ok {
-		return Result{Status: Matched, SlackID: id, Display: fallback}, nil
+	// 1. The override wins outright — it is the escape hatch for whatever the
+	// indexes get wrong.
+	if v, ok := m.overrides[normalize(u.Username)]; ok {
+		return m.resolveOverride(ctx, v, fallback)
 	}
 
 	probes := make([]struct {
@@ -196,6 +307,68 @@ func (m *Matcher) Match(ctx context.Context, u GitLabUser) (Result, error) {
 
 	// 5.
 	return Result{Status: NotFound, Display: fallback}, nil
+}
+
+// resolveOverride turns one user_map value into a Result.
+//
+// The form of the value — ParseOverride's verdict, never a local re-reading of
+// it — decides whether the directory is consulted, and that is the whole design.
+// A Slack id is answered offline, which is what makes the override an escape
+// hatch worth having: the case it exists for is precisely the one where
+// users.list is unavailable (a missing users:read scope, a rate limit, an
+// outage), and an override that needed the directory would fail exactly then.
+//
+// Handles and emails are accepted because ids are the one identifier an operator
+// cannot look up without the API — which made the escape hatch unusable by hand.
+// They cost a directory read, and they are the forms a human actually knows.
+//
+// A value that does not resolve is NOT quietly retried through the normal probe
+// ladder: an explicit override is a statement about a specific person, and
+// silently substituting a name-similarity guess for it would hide the mistake
+// behind a plausible mention. It reports NotFound with a Note the caller logs.
+func (m *Matcher) resolveOverride(ctx context.Context, value, fallback string) (Result, error) {
+	o := ParseOverride(value)
+
+	var field Field
+	switch o.Form {
+	case OverrideID:
+		// The offline answer, and the reason the escape hatch is worth having.
+		// The id is taken at face value; `doctor` is the side that verifies it.
+		return Result{Status: Matched, SlackID: o.Key, Display: fallback}, nil
+	case OverrideHandle:
+		field = FieldHandle
+	case OverrideEmail:
+		field = FieldEmail
+	case OverrideEmpty:
+		// New drops blank values, so this is unreachable through Match. Handled
+		// anyway rather than probing the directory for "" — which matches
+		// everybody or nobody depending on the index.
+		return Result{Status: NotFound, Display: fallback, Note: "user_map entry is empty"}, nil
+	default:
+		return Result{}, fmt.Errorf("unclassifiable user_map entry %q (%s)", value, o.Form)
+	}
+
+	candidates, err := m.dir.Lookup(ctx, field, o.Key)
+	if err != nil {
+		return Result{}, fmt.Errorf("slack directory lookup by %s for user_map entry %q: %w", field, value, err)
+	}
+	switch candidates = dedupe(candidates); len(candidates) {
+	case 1:
+		c := candidates[0]
+		return Result{Status: Matched, SlackID: c.ID, Display: label(c, fallback)}, nil
+	case 0:
+		return Result{
+			Status:  NotFound,
+			Display: fallback,
+			Note:    fmt.Sprintf("user_map entry %q matched no active Slack account by %s", value, field),
+		}, nil
+	default:
+		return Result{
+			Status:  Ambiguous,
+			Display: fallback,
+			Note:    fmt.Sprintf("user_map entry %q matched %d Slack accounts by %s; use the Slack user id instead", value, len(candidates), field),
+		}, nil
+	}
 }
 
 // Fallback renders a GitLab user the way the digest shows someone it cannot

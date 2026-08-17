@@ -57,16 +57,22 @@ const defaultsPrefix = "[defaults] "
 // are appended by the CLI unless --local is given.
 func Doctor(ctx context.Context, in DoctorInput) []DoctorCheck {
 	cfg := in.Config
+	var defaultsErr error
 	if cfg == nil {
-		cfg = config.DefaultConfig()
+		// Default returns what it built even on error, which is what lets the rest
+		// of the checklist run: a diagnostic that gives up has nothing to report.
+		cfg, defaultsErr = config.Default()
 	}
 
 	var checks []DoctorCheck
 	add := func(name string, status CheckStatus, detail string) {
 		checks = append(checks, DoctorCheck{Name: name, Status: status, Detail: detail})
 	}
+	if defaultsErr != nil {
+		add("config schema", StatusFail, defaultsErr.Error())
+	}
 
-	// usingDefaults: the config did not load, so cfg holds DefaultConfig() and
+	// usingDefaults: the config did not load, so cfg holds config.Default() and
 	// every verdict derived from it describes the defaults, not the operator's
 	// file. Running those checks anyway is right — a broken config must not hide
 	// a missing `git` or an expired login — but presenting "claude auth:

@@ -14,6 +14,13 @@ bin/
 *.out
 coverage*
 
+# The default review.workdir. A local `start` or `review --local` fills it with
+# bare mirrors and worktrees of whatever repositories were reviewed — gigabytes,
+# and somebody else's private source. It is in .gitignore, which is why it was
+# missing here: without this line every `docker build` uploads the lot to the
+# daemon and copies it into the build stage, discarded but written.
+data/
+
 # Local configuration and secrets — these must never reach an image layer, not
 # even a discarded build stage.
 .env

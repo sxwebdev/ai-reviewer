@@ -1,9 +1,16 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/tkcrm/mx/logger"
 
@@ -447,8 +454,11 @@ func TestPrepareWorktree(t *testing.T) {
 	t.Run("no cache means diff-only review", func(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t, withConfig(func(c *Config) { c.AgentMode = true }))
-		dir, agent, cleanup := h.svc.prepareWorktree(t.Context(), testProject(), testHeadSHA)
+		dir, agent, cleanup, err := h.svc.prepareWorktree(t.Context(), testProject(), testHeadSHA)
 		defer cleanup()
+		if err != nil {
+			t.Fatalf("prepareWorktree: %v", err)
+		}
 		if dir != "" || agent {
 			t.Errorf("prepareWorktree = (%q, %v), want diff-only without a git cache", dir, agent)
 		}
@@ -458,8 +468,11 @@ func TestPrepareWorktree(t *testing.T) {
 		t.Parallel()
 		h := newHarness(t)
 		h.svc.cache = git.NewCache(t.TempDir(), logger.ForTests(t))
-		dir, agent, cleanup := h.svc.prepareWorktree(t.Context(), testProject(), testHeadSHA)
+		dir, agent, cleanup, err := h.svc.prepareWorktree(t.Context(), testProject(), testHeadSHA)
 		defer cleanup()
+		if err != nil {
+			t.Fatalf("prepareWorktree: %v", err)
+		}
 		if dir != "" || agent {
 			t.Errorf("prepareWorktree = (%q, %v), want diff-only with agent mode off", dir, agent)
 		}
@@ -472,12 +485,261 @@ func TestPrepareWorktree(t *testing.T) {
 		proj := testProject()
 		proj.HTTPURLToRepo = "file:///definitely/not/a/repository.git"
 
-		dir, agent, cleanup := h.svc.prepareWorktree(t.Context(), proj, testHeadSHA)
+		dir, agent, cleanup, err := h.svc.prepareWorktree(t.Context(), proj, testHeadSHA)
 		defer cleanup()
+		if err != nil {
+			t.Fatalf("an unreachable repository must degrade, not fail the review: %v", err)
+		}
 		if dir != "" || agent {
 			t.Errorf("prepareWorktree = (%q, %v), want a diff-only fallback", dir, agent)
 		}
 	})
+
+	// The failure this pins cost real money on the first live run: Ctrl-C killed
+	// `git fetch` through the process group, the mirror error was read as ordinary
+	// infrastructure trouble, and the review degraded to diff-only and went on to
+	// start LLM passes while the process was already shutting down.
+	t.Run("shutdown aborts the review instead of degrading it", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, withConfig(func(c *Config) { c.AgentMode = true }))
+		h.svc.cache = git.NewCache(t.TempDir(), logger.ForTests(t))
+		proj := testProject()
+		proj.HTTPURLToRepo = "file:///definitely/not/a/repository.git"
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		dir, agent, cleanup, err := h.svc.prepareWorktree(ctx, proj, testHeadSHA)
+		defer cleanup()
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("prepareWorktree err = %v, want a wrapped context.Canceled", err)
+		}
+		if dir != "" || agent {
+			t.Errorf("prepareWorktree = (%q, %v), want nothing on the abort path", dir, agent)
+		}
+	})
+
+	// The other half of that discrimination, and the expensive one to get wrong.
+	// A wrapped context.Canceled from here is what makes recordFailure discard the
+	// attempt row, so returning one for an expired *deadline* means the §6.5 ladder
+	// never counts a head SHA that cannot be reviewed inside jobs.ReviewTimeout —
+	// it is re-enqueued at full price on every scan, forever.
+	t.Run("a job timeout is the merge request's fault and must not read as shutdown", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, withConfig(func(c *Config) { c.AgentMode = true }))
+		h.svc.cache = git.NewCache(t.TempDir(), logger.ForTests(t))
+		proj := testProject()
+		proj.HTTPURLToRepo = "file:///definitely/not/a/repository.git"
+
+		// Already past its deadline, exactly as River's job context is when the
+		// 30-minute budget runs out inside worktree preparation.
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		dir, agent, cleanup, err := h.svc.prepareWorktree(ctx, proj, testHeadSHA)
+		defer cleanup()
+		if err != nil {
+			t.Fatalf("prepareWorktree err = %v, want a degraded diff-only review so the failure stays countable", err)
+		}
+		if errors.Is(err, context.Canceled) {
+			t.Error("a deadline must never surface as context.Canceled: recordFailure would discard the attempt row")
+		}
+		if dir != "" || agent {
+			t.Errorf("prepareWorktree = (%q, %v), want a diff-only fallback", dir, agent)
+		}
+	})
+}
+
+// signallingLocker is a git.Locker that hands out n successful locks and then
+// fails with err. It is the only seam that reaches prepareWorktree's abort paths
+// with a HEALTHY context — the case that actually happened in production, where
+// the terminal killed our git child directly and the child's error is the sole
+// evidence that a shutdown is under way.
+type signallingLocker struct {
+	mu        sync.Mutex
+	remaining int
+	err       error
+}
+
+func (l *signallingLocker) Lock(context.Context, string) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.remaining > 0 {
+		l.remaining--
+		return func() {}, nil
+	}
+	return nil, l.err
+}
+
+// TestPrepareWorktreeAbortErrorCarriesTheCause pins both halves of the abort
+// error at once, because each is useless without the other.
+//
+// The wrapped context.Canceled is load-bearing: recordFailure discriminates on it
+// to discard the attempt row instead of counting it against the merge request.
+// The cause text is what makes the resulting log line answerable — an abort that
+// says only "interrupted: context canceled" names neither the signal nor the
+// operation, which is precisely how a misclassified SIGKILL from the OOM killer
+// survived a live run looking exactly like a clean shutdown.
+func TestPrepareWorktreeAbortErrorCarriesTheCause(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Parallel()
+
+	// A git child killed by SIGINT, as os/exec reports it, wrapped the way
+	// Cache.run wraps it. The context stays healthy throughout: only
+	// git.Signalled can see that this is a shutdown.
+	sigint := func(t *testing.T) error {
+		return fmt.Errorf("fetch mirror: %w", signalledChild(t, syscall.SIGINT))
+	}
+
+	t.Run("mirror fetch", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, withConfig(func(c *Config) { c.AgentMode = true }))
+		h.svc.cache = git.NewCache(t.TempDir(), logger.ForTests(t),
+			git.WithLocker(&signallingLocker{err: sigint(t)}))
+		proj := testProject()
+		// Never reached: the locker fails before any git runs.
+		proj.HTTPURLToRepo = "file:///definitely/not/a/repository.git"
+
+		_, _, cleanup, err := h.svc.prepareWorktree(t.Context(), proj, testHeadSHA)
+		defer cleanup()
+		assertAbortError(t, err, "mirror fetch interrupted")
+	})
+
+	t.Run("worktree checkout", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t, withConfig(func(c *Config) { c.AgentMode = true }))
+		proj := testProject()
+		cache := git.NewCache(t.TempDir(), logger.ForTests(t),
+			// One lock for EnsureMirror, then the failure — so the abort happens at
+			// AddWorktree, the half no test used to reach at all.
+			git.WithLocker(&signallingLocker{remaining: 1, err: sigint(t)}))
+		h.svc.cache = cache
+
+		// A real mirror with a real origin, placed where the cache expects it, so
+		// EnsureMirror takes its fetch path and succeeds.
+		src := initGitRepo(t)
+		proj.HTTPURLToRepo = "file://" + src
+		gitCmd(t, "", "clone", "--mirror", "--quiet", src, cache.BareDir(h.svc.cfg.Host, proj.PathWithNamespace))
+
+		_, _, cleanup, err := h.svc.prepareWorktree(t.Context(), proj, testHeadSHA)
+		defer cleanup()
+		assertAbortError(t, err, "worktree checkout interrupted")
+	})
+}
+
+// assertAbortError checks the two facts an abort error must carry together.
+func assertAbortError(t *testing.T, err error, wantOp string) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepareWorktree err = %v, want a wrapped context.Canceled — recordFailure discriminates on it", err)
+	}
+	if !strings.Contains(err.Error(), wantOp) {
+		t.Errorf("err = %q, want it to name the operation (%q)", err, wantOp)
+	}
+	if !strings.Contains(err.Error(), "signal: interrupt") {
+		t.Errorf("err = %q, want the git failure readable in the message; an abort naming no signal is unanswerable in the log", err)
+	}
+}
+
+// initGitRepo creates a one-commit repository and returns its path.
+func initGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	gitCmd(t, dir, "init", "-q", "-b", "main")
+	gitCmd(t, dir, "config", "user.email", "t@example.com")
+	gitCmd(t, dir, "config", "user.name", "Tester")
+	writeFile(t, dir+"/main.go", mainGoContent)
+	gitCmd(t, dir, "add", ".")
+	gitCmd(t, dir, "commit", "-q", "-m", "init")
+	return dir
+}
+
+func gitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// signalledChild starts a child, kills it with sig and returns the error os/exec
+// reports — the shape a git failure has when the signal reached the child
+// directly rather than through our own context.
+func signalledChild(t *testing.T, sig syscall.Signal) error {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	// SIGQUIT's default disposition is a core dump; keep any core file out of the
+	// package directory.
+	cmd.Dir = t.TempDir()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	if err := cmd.Process.Signal(sig); err != nil {
+		t.Fatalf("signal sleep with %v: %v", sig, err)
+	}
+	err := cmd.Wait()
+	if err == nil {
+		t.Fatalf("a child killed by %v must report an error", sig)
+	}
+	return err
+}
+
+func TestInterruptedByShutdown(t *testing.T) {
+	t.Parallel()
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// A deadline that has already passed: this is River cancelling the review job
+	// at jobs.ReviewTimeout, not an operator stopping the service.
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{name: "healthy", ctx: t.Context(), err: errors.New("remote: repository not found"), want: false},
+		{name: "cancelled context", ctx: cancelled, err: errors.New("fetch mirror: 128"), want: true},
+		// A git child killed by the SIGINT the terminal sent to the whole process
+		// group, as os/exec reports it. This is the case a cancelled context misses:
+		// the child dies before our own cancellation arrives.
+		{
+			name: "signalled child",
+			ctx:  t.Context(),
+			err:  fmt.Errorf("fetch mirror: %w", signalledChild(t, syscall.SIGINT)),
+			want: true,
+		},
+		{
+			name: "SIGTERM child",
+			ctx:  t.Context(),
+			err:  fmt.Errorf("fetch mirror: %w", signalledChild(t, syscall.SIGTERM)),
+			want: true,
+		},
+		// The two cases that must stay countable. An expired deadline is the MR's
+		// own fault, and the OOM killer's SIGKILL on a fetch of a huge mirror is
+		// infrastructure trouble — reading either as shutdown discards the attempt
+		// row and silently re-reviews the same head SHA forever.
+		{name: "expired deadline", ctx: expired, err: errors.New("fetch mirror: 128"), want: false},
+		{
+			name: "OOM-killed child",
+			ctx:  t.Context(),
+			err:  fmt.Errorf("fetch mirror: %w", signalledChild(t, syscall.SIGKILL)),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := interruptedByShutdown(tt.ctx, tt.err); got != tt.want {
+				t.Errorf("interruptedByShutdown = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestChangedLineCount(t *testing.T) {

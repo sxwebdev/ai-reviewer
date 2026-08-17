@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -113,6 +114,12 @@ type Service struct {
 	pool     *pgxpool.Pool
 	deps     Deps
 	schedule scheduler.Daily
+
+	// stopping is closed at the top of Stop. It is what withShutdown watches:
+	// River's soft stop deliberately leaves in-flight jobs running, and one of the
+	// four queues must not be left running. See withShutdown.
+	stopping chan struct{}
+	stopOnce sync.Once
 }
 
 // NewService wires the workers, the periodic schedule and the River client.
@@ -132,7 +139,10 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 		return nil, err
 	}
 
-	s := &Service{log: log, cfg: cfg, pool: pool, deps: deps, schedule: digestSchedule}
+	s := &Service{
+		log: log, cfg: cfg, pool: pool, deps: deps, schedule: digestSchedule,
+		stopping: make(chan struct{}),
+	}
 
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &ScanWorker{log: log, svc: s})
@@ -322,7 +332,46 @@ func (s *Service) Start(ctx context.Context) error {
 // whichever comes first) and then cancels the rest, which stay durable. The
 // service must therefore be registered with a ShutdownTimeout greater than
 // DrainTimeout, or mx's default 10s would cut the drain short.
-func (s *Service) Stop(ctx context.Context) error { return s.client.Stop(ctx) }
+//
+// Reviews are exempt from the drain — see withShutdown — so the wait here is the
+// publish and Slack queues finishing their seconds-long work, not a review that
+// could never have finished anyway.
+func (s *Service) Stop(ctx context.Context) error {
+	s.beginStop()
+	return s.client.Stop(ctx)
+}
+
+// beginStop announces the shutdown to every context withShutdown handed out. It
+// runs before River is asked to drain, so a review is cancelled while the drain
+// is still ahead of it rather than at the end of it.
+func (s *Service) beginStop() { s.stopOnce.Do(func() { close(s.stopping) }) }
+
+// withShutdown derives a context that is cancelled as soon as Stop begins.
+//
+// The drain window exists so in-flight work can finish, and for publish and Slack
+// it does: those jobs are network calls measured in seconds. A review is measured
+// in minutes — 4 to 10 of them — against a one-minute default drain, so it can
+// never finish. Left running it does exactly two things: it holds the shutdown
+// open for the full window, and it keeps paying the model for a result that is
+// thrown away when the window closes. Cancelling it immediately costs nothing new,
+// because the cancellation is already a first-class path: service.recordFailure
+// recognises our own shutdown, discards the attempt row rather than counting it
+// against the head SHA, and the next scan enqueues the same SHA again.
+//
+// The goroutine is a lifecycle watcher, not deferred work — the rule that deferred
+// work must be a River job does not apply to it. There is one per in-flight review,
+// bounded by the review queue's worker count, and each ends with its job.
+func (s *Service) withShutdown(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-s.stopping:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
 
 // Interval is how often mx polls Healthy for the /readyz overlay.
 func (s *Service) Interval() time.Duration { return 15 * time.Second }

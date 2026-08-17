@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/sxwebdev/ai-reviewer/internal/app"
@@ -28,7 +29,13 @@ func doctorCommand(boot logger.ExtendedLogger) *cli.Command {
 			a, err := app.New(ctx, boot, options(cmd))
 			if err != nil {
 				in.ConfigErr = err
-				in.Config = config.DefaultConfig()
+				// Default's own error is joined rather than dropped: a malformed
+				// `default:` tag would otherwise look like the operator's mistake.
+				cfg, derr := config.Default()
+				in.Config = cfg
+				if derr != nil {
+					in.ConfigErr = errors.Join(err, derr)
+				}
 			} else {
 				defer func() { _ = a.Close() }()
 				in.Config = a.Config

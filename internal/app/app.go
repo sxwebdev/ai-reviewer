@@ -42,7 +42,10 @@ func New(ctx context.Context, boot logger.Logger, opts Options) (*App, error) {
 		paths = []string{config.DefaultConfigPath}
 	}
 
-	cfg := config.DefaultConfig()
+	cfg, err := config.Default()
+	if err != nil {
+		return nil, err
+	}
 	res, err := config.Load(ctx, boot, cfg, paths)
 	if err != nil {
 		return nil, err
@@ -68,12 +71,15 @@ func New(ctx context.Context, boot logger.Logger, opts Options) (*App, error) {
 // has a database URL and nothing else: no GitLab token, no Slack token, no
 // teams. Requiring the full config there would make applying the schema depend
 // on credentials the schema never touches.
-func Minimal(opts Options) *App {
-	cfg := config.DefaultConfig()
+func Minimal(opts Options) (*App, error) {
+	cfg, err := config.Default()
+	if err != nil {
+		return nil, err
+	}
 	if opts.Debug {
 		cfg.Log.Level = logger.LogLevelDebug
 	}
-	return &App{Config: cfg, Log: NewLogger(cfg.Log)}
+	return &App{Config: cfg, Log: NewLogger(cfg.Log)}, nil
 }
 
 // Close releases resources acquired during the load (the Vault client and its

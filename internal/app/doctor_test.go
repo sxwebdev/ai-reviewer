@@ -8,6 +8,18 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/config"
 )
 
+// defaultConfig is config.Default() for tests: the only error it can return is a
+// malformed `default:` tag in the schema, which stops the test rather than
+// becoming a branch.
+func defaultConfig(t *testing.T) *config.Config {
+	t.Helper()
+	c, err := config.Default()
+	if err != nil {
+		t.Fatalf("config.Default: %v", err)
+	}
+	return c
+}
+
 // TestDoctorReportsInsecureTLS: gitlab.insecure_skip_verify disables
 // certificate verification on every GitLab call, and those calls all carry the
 // PAT in a header. Nothing else in the process mentions it — no startup
@@ -33,7 +45,7 @@ func TestDoctorReportsInsecureTLS(t *testing.T) {
 
 	t.Run("on", func(t *testing.T) {
 		t.Parallel()
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.GitLab.InsecureSkipVerify = true
 
 		got := find(t, Doctor(t.Context(), DoctorInput{Config: cfg}))
@@ -50,7 +62,7 @@ func TestDoctorReportsInsecureTLS(t *testing.T) {
 
 	t.Run("off", func(t *testing.T) {
 		t.Parallel()
-		got := find(t, Doctor(t.Context(), DoctorInput{Config: testConfig()}))
+		got := find(t, Doctor(t.Context(), DoctorInput{Config: testConfig(t)}))
 		if got.Status != StatusOK {
 			t.Errorf("status = %v (%s), want ok", got.Status, got.Detail)
 		}
@@ -58,7 +70,7 @@ func TestDoctorReportsInsecureTLS(t *testing.T) {
 
 	t.Run("a private CA is reported as what it is", func(t *testing.T) {
 		t.Parallel()
-		cfg := testConfig()
+		cfg := testConfig(t)
 		cfg.GitLab.CACertPath = "/etc/ssl/corp.pem"
 
 		got := find(t, Doctor(t.Context(), DoctorInput{Config: cfg}))
@@ -69,7 +81,7 @@ func TestDoctorReportsInsecureTLS(t *testing.T) {
 }
 
 // TestDoctorMarksChecksThatRanAgainstDefaults: when the config does not load,
-// the CLI hands Doctor DefaultConfig() so the environment checks still run —
+// the CLI hands Doctor defaultConfig(t) so the environment checks still run —
 // that fallback is right, a broken config must not hide a missing `git`. What
 // is not right is presenting the resulting verdicts as facts about the
 // operator's file: "claude auth: existing-login" reads as a finding even when
@@ -79,7 +91,7 @@ func TestDoctorMarksChecksThatRanAgainstDefaults(t *testing.T) {
 
 	// Exactly what internal/cli does on a load failure.
 	checks := Doctor(t.Context(), DoctorInput{
-		Config:    config.DefaultConfig(),
+		Config:    defaultConfig(t),
 		ConfigErr: errors.New("gitlab.base_url is empty"),
 	})
 
@@ -128,7 +140,7 @@ func TestDoctorMarksChecksThatRanAgainstDefaults(t *testing.T) {
 func TestDoctorDoesNotMarkAValidConfig(t *testing.T) {
 	t.Parallel()
 
-	checks := Doctor(t.Context(), DoctorInput{Config: testConfig()})
+	checks := Doctor(t.Context(), DoctorInput{Config: testConfig(t)})
 	for _, c := range checks {
 		if c.Name == "config source" {
 			t.Errorf("a valid config produced a fallback warning: %+v", c)

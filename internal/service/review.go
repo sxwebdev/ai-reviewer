@@ -177,9 +177,7 @@ func (s *Service) RunReview(ctx context.Context, req ReviewRequest, onPersist On
 
 	// The failure count for this SHA becomes the attempt number on whatever row
 	// this run writes — the same rows the §6.5 ladder counts.
-	failures, err := s.st.Review().FailureStats(ctx, repo_review.FailureStatsParams{
-		ProjectID: proj.ID, MrIid: req.MRIID, HeadSha: head,
-	})
+	failures, err := s.failureStats(ctx, proj.ID, req.MRIID, head)
 	if err != nil {
 		return nil, fmt.Errorf("failure stats: %w", err)
 	}
@@ -202,8 +200,14 @@ func (s *Service) RunReview(ctx context.Context, req ReviewRequest, onPersist On
 			errors.New("no reviewable changed files (binary, generated, vendored and ignored files are excluded)"))
 	}
 
-	workDir, agentMode, cleanup := s.prepareWorktree(ctx, proj, head)
+	workDir, agentMode, cleanup, err := s.prepareWorktree(ctx, proj, head)
 	defer cleanup()
+	if err != nil {
+		// Only ever our own shutdown (prepareWorktree degrades on everything else),
+		// and recordFailure discards the attempt instead of counting it: stopping
+		// the service must not blacklist a healthy head SHA.
+		return nil, s.recordFailure(ctx, req, proj, inFlight, head, attempt, failReasonCanceled, err)
+	}
 
 	// The enrichment builders are independent best-effort I/O (worktree reads,
 	// raw-file fetches, test runs, git history), so total latency is the max
@@ -289,6 +293,12 @@ func (s *Service) RunReview(ctx context.Context, req ReviewRequest, onPersist On
 	}
 
 	metrics.ObserveReview(req.Team, duration, result.CostUSD)
+	// Recorded here rather than inside the engine: internal/review performs no
+	// observability of its own — same rule internal/gitlab follows, where the
+	// composition root injects an Observer instead. The engine reports the counts
+	// on its Result and this layer, which already owns the team label, publishes
+	// them.
+	metrics.ReviewFindingsSuppressed(req.Team, result.SuppressedCounts)
 	s.log.Infow("review complete",
 		"project", proj.PathWithNamespace, "iid", req.MRIID, "head_sha", head,
 		"status", rev.Status, "findings", rev.FindingsCount, "risk", rev.RiskLevel,
@@ -693,18 +703,37 @@ func jsonOrEmpty(v any, log logger.Logger) dbtypes.JSON {
 // discriminator: context.Canceled is somebody stopping us, while a job timeout
 // arrives as context.DeadlineExceeded and IS the MR's fault (a diff so large the
 // pipeline cannot finish is exactly the pathological case the ladder is for).
+//
+// The cause is checked as well as the context, because on a terminal Ctrl-C the
+// signal reaches our git and claude children directly: a child can be dead —
+// and its error already on its way up — a moment before the cancellation lands
+// here. prepareWorktree is the path that turns that into a wrapped
+// context.Canceled.
+//
+// That half of the predicate carries an obligation for anything added to the review
+// path: only a deliberate "this was our shutdown" may wrap context.Canceled. Every
+// derived context in this path today is a WithTimeout, so a genuine failure surfaces
+// as DeadlineExceeded and cannot be mistaken for a stop; introduce a WithCancel or
+// an errgroup.WithContext whose cancellation escapes as the returned error, and its
+// failures start silently discarding attempt rows instead of counting them.
 func (s *Service) recordFailure(ctx context.Context, req ReviewRequest, proj *gitlab.Project, inFlight uuid.UUID, headSHA string, attempt int32, reason string, cause error) error {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 
-	if errors.Is(ctx.Err(), context.Canceled) {
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(cause, context.Canceled) {
 		metrics.ReviewFailed(req.Team, failReasonCanceled)
 		s.log.Warnw("review cancelled by shutdown; not counting it against the merge request",
 			"project", proj.PathWithNamespace, "iid", req.MRIID, "head_sha", headSHA,
 			"attempt", attempt, "reason", reason, "err", cause)
 		if inFlight != uuid.Nil {
 			if _, err := s.st.Review().DiscardAttempt(writeCtx, inFlight); err != nil {
-				s.log.Errorw("discarding the cancelled review attempt failed; the backoff ladder will count it",
+				// The row survives carrying the in-flight marker, so it does not
+				// become a strike immediately: failureStats reads it as a live
+				// attempt and the scanner reports "review already in progress"
+				// until it ages past ReviewGrace (jobs.ReviewTimeout + 5m). Only
+				// then does the ladder count it — so this SHA is first invisible
+				// for that window, and penalised afterwards.
+				s.log.Errorw("discarding the cancelled review attempt failed; this head SHA looks in-flight until the grace window passes, then counts as a failure",
 					"review_id", inFlight, "err", err)
 			}
 		}

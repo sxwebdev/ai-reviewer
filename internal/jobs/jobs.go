@@ -74,12 +74,21 @@ const (
 	cleanupMaxAttempts   = 1
 )
 
+// ReviewTimeout is how long one review job may run before River cancels it.
+//
+// Exported because it is also the age at which an attempt row stops meaning "a
+// review is running" and starts meaning "a review died without a word": the
+// composition root passes it into service.Config.ReviewGrace. internal/service
+// cannot import this package, and a second copy of the number over there is
+// exactly the kind of duplicate that drifts.
+const ReviewTimeout = 30 * time.Minute
+
 // Per-kind timeouts (§6.2). River's default is one minute, which every job here
 // except the dispatchers would exceed.
 const (
 	scanTimeout      = 2 * time.Minute
 	scanRepoTimeout  = 10 * time.Minute
-	reviewTimeout    = 30 * time.Minute
+	reviewTimeout    = ReviewTimeout
 	publishTimeout   = 5 * time.Minute
 	digestTimeout    = 10 * time.Minute
 	slackSendTimeout = 2 * time.Minute
