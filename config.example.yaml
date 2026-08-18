@@ -63,6 +63,15 @@ gitlab:
   max_attempts: 4
   max_retry_after: 60s
 
+linear:
+  # Optional read-only digest source. The key is required only when at least one
+  # teams[].linear_team_ids list is non-empty. Keep it in env or Vault.
+  endpoint: https://api.linear.app/graphql
+  api_key: "" # AI_REVIEWER_LINEAR_API_KEY
+  timeout: 15s
+  max_attempts: 4
+  max_retry_after: 60s
+
 slack:
   token: "" # AI_REVIEWER_SLACK_TOKEN
   directory_ttl: 15m # in-process TTL of the users.list cache
@@ -172,9 +181,12 @@ teams:
   - name: payments
     slack_channel: C012345678
     ai_review: { enabled: false }
+    # Linear team UUIDs: open the team in Linear, Cmd/Ctrl+K → Copy model UUID.
+    linear_team_ids: []
     repositories: [backend/payments, backend/billing, frontend/checkout]
 
   - name: platform
     slack_channel: C987654321
     ai_review: { enabled: false }
+    linear_team_ids: []
     repositories: [platform/auth, platform/gateway]

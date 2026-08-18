@@ -14,7 +14,7 @@ import (
 )
 
 const getBySlot = `-- name: GetBySlot :one
-SELECT id, team, slot, run_date, attempt, status, parts, mr_count, error, created_at FROM digest_runs
+SELECT id, team, slot, run_date, attempt, status, parts, mr_count, error, created_at, linear_issue_count FROM digest_runs
 WHERE team = $1
   AND run_date = $2
   AND slot = $3
@@ -44,12 +44,13 @@ func (q *Queries) GetBySlot(ctx context.Context, arg GetBySlotParams) (*models.D
 		&i.MrCount,
 		&i.Error,
 		&i.CreatedAt,
+		&i.LinearIssueCount,
 	)
 	return &i, err
 }
 
 const getBySlotAttempt = `-- name: GetBySlotAttempt :one
-SELECT id, team, slot, run_date, attempt, status, parts, mr_count, error, created_at FROM digest_runs
+SELECT id, team, slot, run_date, attempt, status, parts, mr_count, error, created_at, linear_issue_count FROM digest_runs
 WHERE team = $1
   AND run_date = $2
   AND slot = $3
@@ -88,6 +89,7 @@ func (q *Queries) GetBySlotAttempt(ctx context.Context, arg GetBySlotAttemptPara
 		&i.MrCount,
 		&i.Error,
 		&i.CreatedAt,
+		&i.LinearIssueCount,
 	)
 	return &i, err
 }
@@ -122,16 +124,18 @@ UPDATE digest_runs
 SET status = $1,
     parts = $2,
     mr_count = $3,
-    error = $4
-WHERE id = $5
+    linear_issue_count = $4,
+    error = $5
+WHERE id = $6
 `
 
 type SetStatusParams struct {
-	Status  string    `db:"status" json:"status"`
-	Parts   int32     `db:"parts" json:"parts"`
-	MrCount int32     `db:"mr_count" json:"mr_count"`
-	Error   string    `db:"error" json:"error"`
-	ID      uuid.UUID `db:"id" json:"id"`
+	Status           string    `db:"status" json:"status"`
+	Parts            int32     `db:"parts" json:"parts"`
+	MrCount          int32     `db:"mr_count" json:"mr_count"`
+	LinearIssueCount int32     `db:"linear_issue_count" json:"linear_issue_count"`
+	Error            string    `db:"error" json:"error"`
+	ID               uuid.UUID `db:"id" json:"id"`
 }
 
 // SetStatus closes out the BUILD half of a run: 'built' when the payload is
@@ -143,6 +147,7 @@ func (q *Queries) SetStatus(ctx context.Context, arg SetStatusParams) error {
 		arg.Status,
 		arg.Parts,
 		arg.MrCount,
+		arg.LinearIssueCount,
 		arg.Error,
 		arg.ID,
 	)

@@ -40,6 +40,7 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
 	"github.com/sxwebdev/ai-reviewer/internal/git"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/sxwebdev/ai-reviewer/internal/slack"
@@ -108,6 +109,12 @@ const defaultReviewGrace = 45 * time.Minute
 // httptest server or a stub without the digest builder depending on either.
 type SlackAPI interface {
 	PostMessage(ctx context.Context, req slack.PostMessageRequest) (*slack.PostMessageResult, error)
+}
+
+// LinearAPI is the read-only Linear surface the digest needs.
+type LinearAPI interface {
+	ListIssuesInReview(ctx context.Context, teamIDs []string) ([]linear.Issue, error)
+	ListIssuesByNumbers(ctx context.Context, teamIDs []string, numbers []int) ([]linear.Issue, error)
 }
 
 // RiskSettings configures the deterministic risk score fed to the engine.
@@ -195,6 +202,8 @@ type Deps struct {
 	// GraphQL is optional: nil (or gitlab.graphql_enabled=false) means every
 	// reviewer keeps ReviewStateUnknown and the REST heuristic classifies them.
 	GraphQL gitlab.GraphQLAPI
+	// Linear is optional unless a team declares LinearTeamIDs.
+	Linear LinearAPI
 	// Slack and Matcher are required for the digest path only.
 	Slack   SlackAPI
 	Matcher match.UserMatcher
@@ -213,6 +222,7 @@ type Deps struct {
 type Service struct {
 	gl      gitlab.API
 	gql     gitlab.GraphQLAPI
+	linear  LinearAPI
 	slack   SlackAPI
 	matcher match.UserMatcher
 	st      *store.Store
@@ -266,6 +276,7 @@ func newService(deps Deps, cfg Config) *Service {
 	return &Service{
 		gl:      deps.GitLab,
 		gql:     deps.GraphQL,
+		linear:  deps.Linear,
 		slack:   deps.Slack,
 		matcher: deps.Matcher,
 		st:      deps.Store,

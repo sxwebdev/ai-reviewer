@@ -13,6 +13,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/models"
@@ -281,6 +282,30 @@ type recordingSlack struct {
 	ts    string
 }
 
+type fakeLinear struct {
+	issues          []linear.Issue
+	issuesByNumbers []linear.Issue
+	err             error
+	lookupErr       error
+	calls           int
+	lookupCalls     int
+	teamIDs         []string
+	numbers         []int
+}
+
+func (f *fakeLinear) ListIssuesByNumbers(_ context.Context, teamIDs []string, numbers []int) ([]linear.Issue, error) {
+	f.lookupCalls++
+	f.teamIDs = append([]string(nil), teamIDs...)
+	f.numbers = append([]int(nil), numbers...)
+	return append([]linear.Issue(nil), f.issuesByNumbers...), f.lookupErr
+}
+
+func (f *fakeLinear) ListIssuesInReview(_ context.Context, teamIDs []string) ([]linear.Issue, error) {
+	f.calls++
+	f.teamIDs = append([]string(nil), teamIDs...)
+	return append([]linear.Issue(nil), f.issues...), f.err
+}
+
 func (r *recordingSlack) PostMessage(_ context.Context, req slack.PostMessageRequest) (*slack.PostMessageResult, error) {
 	r.posts = append(r.posts, req)
 	if r.err != nil {
@@ -303,6 +328,7 @@ type harness struct {
 	llm     *llm.FakeClient
 	slack   *recordingSlack
 	matcher match.UserMatcher
+	linear  *fakeLinear
 	st      *store.Store
 	pool    *pgxpool.Pool
 	svc     *Service
@@ -340,6 +366,11 @@ func withConfig(fn func(*Config)) harnessOption {
 	return func(h *harness) { fn(&h.cfg) }
 }
 
+// withoutLinear builds the service with no Linear collaborator at all, the
+// shape a team carrying linear_team_ids sees when the process decided no client
+// was needed.
+func withoutLinear(h *harness) { h.linear = nil }
+
 func withLLM(resp *llm.ReviewResponse) harnessOption {
 	return func(h *harness) { h.llm.Response = resp }
 }
@@ -355,6 +386,7 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 		llm:     &llm.FakeClient{Response: &llm.ReviewResponse{Summary: "nothing to report"}},
 		slack:   &recordingSlack{},
 		matcher: stubMatcher{},
+		linear:  &fakeLinear{},
 		cfg:     defaultTestConfig(),
 	}
 	for _, o := range opts {
@@ -370,6 +402,12 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 		Store:   h.st,
 		Engine:  review.NewEngine(h.llm, log),
 		Log:     log,
+	}
+	// Assigned conditionally for the same reason app.linearAPI exists: a nil
+	// *fakeLinear stored in the interface is a typed nil, and withoutLinear could
+	// not reach the not-configured path through one.
+	if h.linear != nil {
+		deps.Linear = h.linear
 	}
 	if h.st == nil {
 		// Tests that only exercise the snapshot loader need no database.

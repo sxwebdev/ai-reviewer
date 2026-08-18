@@ -46,6 +46,13 @@ const (
 	MatchMatched   = "matched"
 	MatchNotFound  = "not_found"
 	MatchAmbiguous = "ambiguous"
+
+	// digest source labels. Both exist because a digest has exactly two external
+	// sources and an operator reading digest_source_errors_total needs to tell
+	// them apart; a counter that only ever carries one of its label values reads
+	// as "the other source never fails".
+	SourceGitLab = "gitlab"
+	SourceLinear = "linear"
 )
 
 // statusTransport labels a GitLab failure that never produced an HTTP status
@@ -125,6 +132,27 @@ var (
 		Name: "gitlab_request_errors_total",
 		Help: "Failed GitLab API requests by endpoint template and HTTP status (or 'transport').",
 	}, []string{"endpoint", "status"})
+
+	LinearRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ai_reviewer_linear_requests_total",
+		Help: "Linear GraphQL requests by operation and result (ok|error).",
+	}, []string{"operation", "result"})
+
+	LinearRequestDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "ai_reviewer_linear_request_duration_seconds",
+		Help:    "Duration of one Linear GraphQL HTTP attempt.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"operation"})
+
+	LinearIssuesInReview = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ai_reviewer_linear_issues_in_review",
+		Help: "Linear issues currently included in a team's In Review digest.",
+	}, []string{"team"})
+
+	DigestSourceErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ai_reviewer_digest_source_errors_total",
+		Help: "Digest source failures by configured team and source.",
+	}, []string{"team", "source"})
 
 	MergeRequestsScannedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "merge_requests_scanned_total",
@@ -264,6 +292,44 @@ func GitLabRequest(endpoint, method string) {
 // non-positive value) when the request never reached a response.
 func GitLabRequestError(endpoint string, status int) {
 	GitLabRequestErrorsTotal.WithLabelValues(endpoint, statusLabel(status)).Inc()
+}
+
+// ObserveLinearRequest records one completed Linear HTTP attempt.
+func ObserveLinearRequest(operation string, d time.Duration, err error) {
+	result := ResultOK
+	if err != nil {
+		result = ResultError
+	}
+	LinearRequestsTotal.WithLabelValues(operation, result).Inc()
+	LinearRequestDurationSeconds.WithLabelValues(operation).Observe(d.Seconds())
+}
+
+// SetLinearIssuesInReview publishes the Linear board total a digest build just
+// measured. Same gauge rule as SetTeamState: call it on every build of a team
+// whose count is known, including a healthy zero.
+func SetLinearIssuesInReview(team string, n int) {
+	LinearIssuesInReview.WithLabelValues(team).Set(float64(n))
+}
+
+// ClearLinearIssuesInReview removes the team's series, which is the only honest
+// answer when the count is *unknown* — Linear was unreachable, or the team no
+// longer declares linear_team_ids.
+//
+// Absent, not zero, and not left alone. Zero is a claim the board is empty, and
+// this gauge is the one an operator watches to see work piling up in review, so
+// a false zero reads as "the queue drained". Leaving the series untouched is
+// worse still: it keeps reporting the last good number, so a Linear outage looks
+// like a board that stopped moving, and a team that dropped Linear months ago
+// still publishes a count forever.
+func ClearLinearIssuesInReview(team string) {
+	LinearIssuesInReview.DeleteLabelValues(team)
+}
+
+// DigestSourceError records a source failure that degraded a digest: one
+// increment per source per build, so linear and gitlab stay comparable even
+// though one counts repositories and the other does not.
+func DigestSourceError(team, source string) {
+	DigestSourceErrorsTotal.WithLabelValues(team, source).Inc()
 }
 
 // statusLabel keeps the status label a small closed set of HTTP codes plus one

@@ -124,9 +124,9 @@ func TestFromServiceDigest(t *testing.T) {
 	}
 	runID, msg := uuid.New(), uuid.New()
 	got := fromServiceDigest(&service.DigestOutcome{
-		RunID: runID, Messages: []uuid.UUID{msg}, Status: "built", MRCount: 9,
+		RunID: runID, Messages: []uuid.UUID{msg}, Status: "built", MRCount: 9, LinearIssueCount: 4,
 	})
-	if got.RunID != runID || got.Status != "built" || got.MRCount != 9 ||
+	if got.RunID != runID || got.Status != "built" || got.MRCount != 9 || got.LinearIssueCount != 4 ||
 		len(got.Messages) != 1 || got.Messages[0] != msg {
 		t.Errorf("outcome = %+v", got)
 	}

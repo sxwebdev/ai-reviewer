@@ -552,6 +552,105 @@ func TestValidateTeams(t *testing.T) {
 	}
 }
 
+func TestValidateLinear(t *testing.T) {
+	const (
+		linearTeamA = "9cfb482a-81e3-4154-b5b9-2c805e70a02d"
+		linearTeamB = "6f9568f2-3e89-4f54-9ab2-76d14bc90f3e"
+	)
+	base := func() *Config {
+		c := defaultConfig(t)
+		c.GitLab.BaseURL = "https://gitlab.example.com"
+		c.GitLab.Token = "glpat-x"
+		c.Slack.Token = "xoxb-x"
+		c.Postgres.Username = "ai_reviewer"
+		c.Teams = []TeamConfig{{
+			Name: "payments", SlackChannel: "C012345678", Repositories: []string{"a/b"},
+			LinearTeamIDs: []string{linearTeamA},
+		}}
+		return c
+	}
+
+	t.Run("configured", func(t *testing.T) {
+		c := base()
+		c.Linear.APIKey = "lin_api_key"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "missing key",
+			mutate: func(*Config) {},
+			want:   "AI_REVIEWER_LINEAR_API_KEY",
+		},
+		{
+			name: "invalid uuid",
+			mutate: func(c *Config) {
+				c.Linear.APIKey = "lin_api_key"
+				c.Teams[0].LinearTeamIDs = []string{"PAY"}
+			},
+			want: "is not a UUID",
+		},
+		{
+			name: "team claimed twice",
+			mutate: func(c *Config) {
+				c.Linear.APIKey = "lin_api_key"
+				c.Teams = append(c.Teams, TeamConfig{
+					Name: "platform", SlackChannel: "C987654321", Repositories: []string{"c/d"},
+					LinearTeamIDs: []string{linearTeamA, linearTeamB},
+				})
+			},
+			want: "claimed by both team",
+		},
+		{
+			name: "insecure endpoint",
+			mutate: func(c *Config) {
+				c.Linear.APIKey = "lin_api_key"
+				c.Linear.Endpoint = "http://linear.example/graphql"
+			},
+			want: "absolute HTTPS URL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := base()
+			tt.mutate(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+
+	t.Run("unused block needs no key", func(t *testing.T) {
+		c := base()
+		c.Teams[0].LinearTeamIDs = nil
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	})
+}
+
+func TestLinearAPIKeyEnvironmentName(t *testing.T) {
+	t.Setenv("AI_REVIEWER_LINEAR_API_KEY", "lin_api_from_env")
+	path := writeConfig(t, minimalYAML+`
+linear:
+  endpoint: https://api.linear.app/graphql
+`)
+	cfg, err := loadFile(t, path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Linear.APIKey.Unmask(); got != "lin_api_from_env" {
+		t.Errorf("linear.api_key = %q, want env value", got)
+	}
+}
+
 func TestValidateClaudeAuthMode(t *testing.T) {
 	base := func() *Config {
 		c := defaultConfig(t)

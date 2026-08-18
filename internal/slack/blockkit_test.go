@@ -52,6 +52,56 @@ func sampleDigest() slack.DigestData {
 	}
 }
 
+func rendered(m slack.Message) string {
+	var b strings.Builder
+	for _, block := range m.Blocks {
+		if block.Text != nil {
+			b.WriteString(block.Text.Text)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func TestLinearSummaryAndMoveAction(t *testing.T) {
+	t.Parallel()
+	d := slack.DigestData{
+		Team:                "payments",
+		LinearEnabled:       true,
+		LinearInReviewCount: 8,
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{Display: "Ann & Bob"},
+			Own: []slack.AuthorItem{{
+				IID: 42, Title: "PAY-42 <checkout>", WebURL: "https://gitlab/42",
+				MoveLinear: true, LinearIdentifier: "PAY-42", LinearWebURL: "https://linear.app/PAY-42",
+			}},
+		}},
+	}
+	msgs := slack.BuildDigest(d)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+	text := rendered(msgs[0])
+	for _, want := range []string{
+		"Linear · In Review: 8", "Ann &amp; Bob", "move <https://linear.app/PAY-42|PAY-42> forward in Linear",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("render is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLinearHealthyZeroStillRendersSummary(t *testing.T) {
+	t.Parallel()
+	msgs := slack.BuildDigest(slack.DigestData{Team: "payments", LinearEnabled: true})
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want one", len(msgs))
+	}
+	if text := rendered(msgs[0]); !strings.Contains(text, "Linear · In Review: 0") {
+		t.Errorf("healthy zero summary is missing:\n%s", text)
+	}
+}
+
 func TestBuildDigestLayout(t *testing.T) {
 	t.Parallel()
 

@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A self-hosted GitLab review agent for engineering teams. It scans the open merge
+A self-hosted GitLab review agent for engineering teams, with an optional
+read-only Linear source for Slack digests. It scans the open merge
 requests of configured repositories, reviews each one with the Claude Code CLI
 when its head SHA changes, publishes validated findings as inline discussions
 from a service account, classifies human-review and author-action state, and
@@ -53,8 +54,9 @@ Runtime: `ai-reviewer {start,scan,review,digest,doctor,migrations}`.
   mode, timezone, Postgres, pending migrations, River tables, GitLab auth and
   every repository, `head_pipeline` visibility, Slack membership per channel,
   the Slack **directory** (`users.list` — the scope failure that silently breaks
-  every mention) and every `slack.user_map` entry resolved against it, workdir
-  writability. Non-zero exit on any failure. Run it after config changes.
+  every mention) and every `slack.user_map` entry resolved against it, Linear
+  auth/team/status mappings when configured, and workdir writability. Non-zero
+  exit on any failure. Run it after config changes.
 - `<ref>` accepts a full MR URL, `group/sub/repo!123` or `project-id:iid`
   (`internal/gitlab/ref.go`).
 
@@ -85,17 +87,18 @@ the built-in**, so exactly one `uuidv7()` exists anywhere. The shim reproduces
 the built-in's sub-millisecond `rand_a` precision, so id ordering does not differ
 between dev and production. Do not write PG18-only SQL.
 
-The whole schema is **one migration**, `0001_init`; nothing was ever deployed
-from an intermediate state. Everything from here gets its own numbered pair —
-do not amend `0001_init`.
+The baseline schema is the single `0001_init` migration; nothing was ever
+deployed from an intermediate state. Later changes use numbered pairs (currently
+`0002_linear_digest_count`) — do not amend `0001_init`.
 
 ## Architecture
 
 ```text
 GitLab (truth about MRs) ──REST v4 + GraphQL──┐
+Linear (digest only) ───────────GraphQL───────┤
                                               ▼
-   cli ──► app ──► jobs (River) ──► service ──► {store, gitlab, slack, match,
-                                                 git, llm, review, domain}
+   cli ──► app ──► jobs (River) ──► service ──► {store, gitlab, linear, slack,
+                                                 match, git, llm, review, domain}
                         │                                      │
                         ▼                                      ▼
                    PostgreSQL                              security
@@ -186,8 +189,16 @@ example — it is why `internal/service` never imports River).
   removes the file from the finding-eligible set: an excluded path must be unable
   to *receive* a comment, not merely be absent from a prompt. `ignore_globs` is
   checked on **both sides of a rename**.
-- **GitLab is the source of truth about merge requests; Postgres holds this
-  service's operational state.** Never mirror GitLab into Postgres.
+- **GitLab is the source of truth about merge requests and Linear is the source
+  of truth about digest issues; Postgres holds only this service's operational
+  state and aggregate counts.** Never mirror either source into Postgres.
+- **Linear gates linked MR review; it is not a second task list.** Match a valid
+  identifier in the title, then source branch, case-insensitively. A linked MR
+  with one approval stops notifying remaining reviewers; if its card remains
+  `In Review`, nudge the MR author to move it. Zero approvals, no matching issue,
+  Linear failure, or any `REQUESTED_CHANGES` verdict must fail open to the
+  ordinary GitLab classifier. Never let board state hide an unapproved or
+  changes-requested MR.
 - **Team isolation.** A repository belongs to exactly one team (validated
   fail-fast, the error naming both). One team's failure must not affect another's
   digest.

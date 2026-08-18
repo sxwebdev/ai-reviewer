@@ -35,16 +35,17 @@ func (s ColumnNames) Strings() []string {
 }
 
 const (
-	ColumnNameDigestRunsId        ColumnName = "id"
-	ColumnNameDigestRunsTeam      ColumnName = "team"
-	ColumnNameDigestRunsSlot      ColumnName = "slot"
-	ColumnNameDigestRunsRunDate   ColumnName = "run_date"
-	ColumnNameDigestRunsAttempt   ColumnName = "attempt"
-	ColumnNameDigestRunsStatus    ColumnName = "status"
-	ColumnNameDigestRunsParts     ColumnName = "parts"
-	ColumnNameDigestRunsMrCount   ColumnName = "mr_count"
-	ColumnNameDigestRunsError     ColumnName = "error"
-	ColumnNameDigestRunsCreatedAt ColumnName = "created_at"
+	ColumnNameDigestRunsId               ColumnName = "id"
+	ColumnNameDigestRunsTeam             ColumnName = "team"
+	ColumnNameDigestRunsSlot             ColumnName = "slot"
+	ColumnNameDigestRunsRunDate          ColumnName = "run_date"
+	ColumnNameDigestRunsAttempt          ColumnName = "attempt"
+	ColumnNameDigestRunsStatus           ColumnName = "status"
+	ColumnNameDigestRunsParts            ColumnName = "parts"
+	ColumnNameDigestRunsMrCount          ColumnName = "mr_count"
+	ColumnNameDigestRunsError            ColumnName = "error"
+	ColumnNameDigestRunsCreatedAt        ColumnName = "created_at"
+	ColumnNameDigestRunsLinearIssueCount ColumnName = "linear_issue_count"
 )
 
 func DigestRunsColumnNames() ColumnNames {
@@ -59,5 +60,6 @@ func DigestRunsColumnNames() ColumnNames {
 		ColumnNameDigestRunsMrCount,
 		ColumnNameDigestRunsError,
 		ColumnNameDigestRunsCreatedAt,
+		ColumnNameDigestRunsLinearIssueCount,
 	}
 }

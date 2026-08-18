@@ -65,6 +65,10 @@ services:
       AI_REVIEWER_POSTGRES_SSL_MODE: disable
 
       AI_REVIEWER_GITLAB_TOKEN: ${AI_REVIEWER_GITLAB_TOKEN:?set it in .env}
+      # Optional: required only when config.yaml declares linear_team_ids.
+      # A null Compose value forwards it only when present, so an absent value
+      # does not overwrite YAML/Vault with an empty environment variable.
+      AI_REVIEWER_LINEAR_API_KEY:
       AI_REVIEWER_SLACK_TOKEN: ${AI_REVIEWER_SLACK_TOKEN:?set it in .env}
 
       # `existing-login` cannot work in a container — it inherits a login from

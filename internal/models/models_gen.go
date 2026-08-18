@@ -24,16 +24,17 @@ type DigestMessage struct {
 }
 
 type DigestRun struct {
-	ID        uuid.UUID `db:"id" json:"id"`
-	Team      string    `db:"team" json:"team"`
-	Slot      string    `db:"slot" json:"slot"`
-	RunDate   time.Time `db:"run_date" json:"run_date"`
-	Attempt   int32     `db:"attempt" json:"attempt"`
-	Status    string    `db:"status" json:"status"`
-	Parts     int32     `db:"parts" json:"parts"`
-	MrCount   int32     `db:"mr_count" json:"mr_count"`
-	Error     string    `db:"error" json:"error"`
-	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	ID               uuid.UUID `db:"id" json:"id"`
+	Team             string    `db:"team" json:"team"`
+	Slot             string    `db:"slot" json:"slot"`
+	RunDate          time.Time `db:"run_date" json:"run_date"`
+	Attempt          int32     `db:"attempt" json:"attempt"`
+	Status           string    `db:"status" json:"status"`
+	Parts            int32     `db:"parts" json:"parts"`
+	MrCount          int32     `db:"mr_count" json:"mr_count"`
+	Error            string    `db:"error" json:"error"`
+	CreatedAt        time.Time `db:"created_at" json:"created_at"`
+	LinearIssueCount int32     `db:"linear_issue_count" json:"linear_issue_count"`
 }
 
 type MrFinding struct {

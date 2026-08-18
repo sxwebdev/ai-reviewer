@@ -64,6 +64,14 @@ type DigestData struct {
 	// Grouping by person and asking "what does this person owe" answers the only
 	// question a reader has.
 	People []PersonDigest
+	// LinearEnabled distinguishes a healthy zero from an unavailable or
+	// unconfigured source. The digest shows only the aggregate; Linear state is
+	// otherwise used to classify the GitLab rows below.
+	LinearEnabled       bool
+	LinearInReviewCount int
+	// Warnings name external sources that were unavailable. They are generated
+	// by the service, not copied from an external response.
+	Warnings []string
 	// FailedRepos is how many repositories could not be inspected during the
 	// run. When non-zero the digest carries a partial-data warning rather
 	// than pretending it saw everything.
@@ -111,8 +119,8 @@ type ReviewItem struct {
 }
 
 // AuthorItem is one MR needing action from its author. Rows render in a fixed
-// order — threads, conflicts, pipeline — so the digest reads the same way
-// every day.
+// order — requested changes, threads, conflicts, pipeline, Linear board — so
+// the digest reads the same way every day.
 type AuthorItem struct {
 	Project string
 	IID     int64
@@ -129,6 +137,11 @@ type AuthorItem struct {
 	// PipelineWebURL links "pipeline failed" straight at the failed
 	// pipeline. Empty renders the row without a link.
 	PipelineWebURL string
+	// MoveLinear is set when GitLab already has an approval but the linked task
+	// is still In Review. The author owns advancing the board status.
+	MoveLinear       bool
+	LinearIdentifier string
+	LinearWebURL     string
 }
 
 // Message is one Slack post. A digest that exceeds the block or character
@@ -226,8 +239,16 @@ func (b Builder) maxSectionChars() int {
 // nothing left for pagination to re-emit at a part boundary.
 func (b Builder) blocks(d DigestData) []Block {
 	var out []Block
+	if d.LinearEnabled {
+		out = append(out, sectionBlock(fmt.Sprintf("*Linear · In Review: %d*", d.LinearInReviewCount)))
+	}
 	if d.FailedRepos > 0 {
 		out = append(out, sectionBlock(partialLine(d.FailedRepos)))
+	}
+	for _, warning := range d.Warnings {
+		if warning = strings.TrimSpace(warning); warning != "" {
+			out = append(out, sectionBlock("⚠️ "+escape(collapseLines(warning))))
+		}
 	}
 
 	for _, p := range d.People {
@@ -524,6 +545,13 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 	}
 	if mr.PipelineFailed {
 		flags = append(flags, "❌ "+link(mr.PipelineWebURL, "pipeline"))
+	}
+	if mr.MoveLinear {
+		identifier := escape(strings.TrimSpace(mr.LinearIdentifier))
+		if identifier == "" {
+			identifier = "task"
+		}
+		flags = append(flags, "➡️ move "+link(mr.LinearWebURL, identifier)+" forward in Linear")
 	}
 	if len(flags) > 0 {
 		b.WriteString(" · ")

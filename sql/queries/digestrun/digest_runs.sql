@@ -41,6 +41,7 @@ UPDATE digest_runs
 SET status = @status,
     parts = @parts,
     mr_count = @mr_count,
+    linear_issue_count = @linear_issue_count,
     error = @error
 WHERE id = @id;
 

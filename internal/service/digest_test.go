@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/metrics"
 	"github.com/sxwebdev/ai-reviewer/internal/models"
@@ -145,6 +147,309 @@ func TestBuildDigestPersistsRunAndParts(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("digest is missing %q:\n%s", want, rendered)
 		}
+	}
+}
+
+func TestBuildDigestShowsOnlyLinearInReviewCount(t *testing.T) {
+	h := digestHarness(t)
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	h.linear.issues = []linear.Issue{
+		{
+			ID: "i2", Identifier: "OPS-9", Number: 9, URL: "https://linear.app/ops/OPS-9",
+			State: linear.WorkflowState{Name: linear.InReviewState}, Team: linear.Team{Key: "OPS"},
+		},
+		{
+			ID: "i1", Identifier: "PAY-2", Number: 2, URL: "https://linear.app/pay/PAY-2",
+			State: linear.WorkflowState{Name: linear.InReviewState}, Team: linear.Team{Key: "PAY"},
+		},
+	}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.LinearIssueCount != 2 {
+		t.Fatalf("linear issue count = %d, want 2", out.LinearIssueCount)
+	}
+	if h.linear.calls != 1 || !slices.Equal(h.linear.teamIDs, team.LinearTeamIDs) {
+		t.Errorf("Linear calls/team ids = %d/%v", h.linear.calls, h.linear.teamIDs)
+	}
+
+	msgs := h.digestMessages(t, out.RunID)
+	var message slack.Message
+	if err := json.Unmarshal(msgs[0].Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	text := renderedText(message)
+	// Rita is the seeded GitLab reviewer, not a Linear assignee: the two sections
+	// coexist, and only the Linear one is collapsed to a count.
+	for _, want := range []string{"Linear · In Review: 2", "Rita Reviewer"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest is missing %q:\n%s", want, text)
+		}
+	}
+	// Titles are no longer expressible here — linear.Issue does not carry one, so
+	// no query can fetch one and no renderer can print one. The identifiers are
+	// the remaining way a per-issue row could leak in.
+	for _, unwanted := range []string{"OPS-9", "PAY-2"} {
+		if strings.Contains(text, unwanted) {
+			t.Errorf("digest still renders Linear issue %q as a separate row:\n%s", unwanted, text)
+		}
+	}
+
+	run, err := h.st.DigestRun().GetByID(t.Context(), out.RunID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if run.LinearIssueCount != 2 {
+		t.Errorf("persisted linear issue count = %d", run.LinearIssueCount)
+	}
+}
+
+func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-184 Scheduler wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	setApprovals(h.fake, proj, testMRIID, &gitlab.Approvals{ApprovedBy: []gitlab.ApprovedBy{{
+		User: gitlab.User{ID: 77, Username: "approver", Name: "Alice Approver"},
+	}}})
+	issue := linear.Issue{
+		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+		URL:   "https://linear.app/CHAIN-184",
+		State: linear.WorkflowState{Name: linear.InReviewState},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+	}
+	h.linear.issues = []linear.Issue{issue}
+	h.linear.issuesByNumbers = []linear.Issue{issue}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.MRCount != 1 || out.LinearIssueCount != 1 {
+		t.Errorf("outcome = %+v, want one author action and one Linear issue", out)
+	}
+	if h.linear.lookupCalls != 1 || !slices.Equal(h.linear.numbers, []int{184}) {
+		t.Errorf("Linear lookup calls/numbers = %d/%v, want 1/[184]", h.linear.lookupCalls, h.linear.numbers)
+	}
+
+	msgs := h.digestMessages(t, out.RunID)
+	var message slack.Message
+	if err := json.Unmarshal(msgs[0].Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	text := renderedText(message)
+	for _, want := range []string{"Linear · In Review: 1", "Ann Author", "move <https://linear.app/CHAIN-184|CHAIN-184> forward in Linear"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest is missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Rita Reviewer") || strings.Contains(text, "review 1") {
+		t.Errorf("approved linked MR still asks its remaining reviewer:\n%s", text)
+	}
+}
+
+func TestBuildDigestLinearFailureIsPartial(t *testing.T) {
+	h := digestHarness(t)
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	h.linear.err = errors.New("Linear unavailable")
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial || out.LinearIssueCount != 0 {
+		t.Errorf("outcome = %+v, want partial with no Linear issues", out)
+	}
+	msgs := h.digestMessages(t, out.RunID)
+	var message slack.Message
+	if err := json.Unmarshal(msgs[0].Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if text := renderedText(message); !strings.Contains(text, "Linear could not be inspected") {
+		t.Errorf("partial warning is missing:\n%s", text)
+	}
+}
+
+// The batch lookup is the *link* half of Linear. Failing it must fail the
+// reviewer gate open, and must not throw away the board total the first call
+// already delivered: rendering a known 8 as no count, persisting it as 0 and
+// leaving the gauge stale is the false zero §7 forbids.
+func TestBuildDigestLinearLinkLookupFailureKeepsGitLabReviewersAndTheCount(t *testing.T) {
+	h := digestHarness(t)
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	for _, mr := range h.fake.MRs {
+		mr.Title = "CHAIN-481 Add payment retries"
+	}
+	h.linear.issues = []linear.Issue{{
+		ID: "i1", Identifier: "PAY-4", URL: "https://linear/PAY-4",
+		State: linear.WorkflowState{Name: linear.InReviewState}, Team: linear.Team{Key: "PAY"},
+	}}
+	h.linear.lookupErr = errors.New("Linear lookup unavailable")
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial || h.linear.lookupCalls != 1 {
+		t.Errorf("outcome/lookup calls = %+v/%d, want partial/1", out, h.linear.lookupCalls)
+	}
+	if out.LinearIssueCount != 1 {
+		t.Errorf("linear issue count = %d, want the count the board already returned", out.LinearIssueCount)
+	}
+	run, err := h.st.DigestRun().GetByID(t.Context(), out.RunID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if run.LinearIssueCount != 1 {
+		t.Errorf("persisted linear issue count = %d, want 1", run.LinearIssueCount)
+	}
+
+	msgs := h.digestMessages(t, out.RunID)
+	var message slack.Message
+	if err := json.Unmarshal(msgs[0].Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	text := renderedText(message)
+	for _, want := range []string{"Rita Reviewer", "Linear · In Review: 1", "issue links could not be resolved"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("fail-open digest is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+// A team configured for Linear against a service that has no client is a
+// configuration mistake, and the one thing it may not do is take the digest
+// worker down: the guard has to be reachable, which it is not when a typed nil
+// is stored in the interface.
+func TestBuildDigestWithoutALinearClientDegradesInsteadOfPanicking(t *testing.T) {
+	h := digestHarness(t, withoutLinear)
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial || out.LinearIssueCount != 0 {
+		t.Errorf("outcome = %+v, want partial with no Linear count", out)
+	}
+	msgs := h.digestMessages(t, out.RunID)
+	var message slack.Message
+	if err := json.Unmarshal(msgs[0].Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	// Fail-open: the GitLab half is still reported in full.
+	text := renderedText(message)
+	for _, want := range []string{"Rita Reviewer", "Linear could not be inspected"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestBuildDigestUsesLinearWhenAllGitLabRepositoriesFail(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.Repositories = []string{"backend/gone"}
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	h.gl.failProject[url.PathEscape("backend/gone")] = errors.New("GitLab unavailable")
+	h.linear.issues = []linear.Issue{{
+		ID: "i1", Identifier: "PAY-4", Number: 4, URL: "https://linear/PAY-4",
+		State: linear.WorkflowState{Name: linear.InReviewState}, Team: linear.Team{Key: "PAY"},
+	}}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial || out.MRCount != 0 || out.LinearIssueCount != 1 {
+		t.Errorf("outcome = %+v", out)
+	}
+	if len(out.Messages) == 0 {
+		t.Fatal("available Linear data was not persisted for delivery")
+	}
+}
+
+// Both sources report into digest_source_errors_total, and they report from a
+// run that never got as far as building anything too — a total outage is the
+// failure an operator most wants counted, and it was the one path that skipped
+// the counter entirely. The Linear gauge must go absent rather than keep the
+// last good number.
+func TestBuildDigestCountsBothSourcesAndClearsTheLinearGaugeOnFailure(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.Name = "metrics-" + t.Name()
+	team.Repositories = []string{"backend/gone"}
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	h.gl.failProject[url.PathEscape("backend/gone")] = errors.New("GitLab unavailable")
+
+	// A healthy build first, so the gauge holds a number worth losing.
+	h.linear.issues = []linear.Issue{{
+		ID: "i1", Identifier: "PAY-4", Number: 4, URL: "https://linear/PAY-4",
+		State: linear.WorkflowState{Name: linear.InReviewState}, Team: linear.Team{Key: "PAY"},
+	}}
+	if _, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0); err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.LinearIssuesInReview.WithLabelValues(team.Name)); got != 1 {
+		t.Fatalf("linear gauge = %v, want the healthy count 1", got)
+	}
+	seriesWithGauge := testutil.CollectAndCount(metrics.LinearIssuesInReview)
+
+	// That build already lost its one repository, so the GitLab source is counted
+	// on an ordinary partial run too, not only on a total outage.
+	sourceErrors := func(source string) float64 {
+		return testutil.ToFloat64(metrics.DigestSourceErrorsTotal.WithLabelValues(team.Name, source))
+	}
+	if got := sourceErrors(metrics.SourceGitLab); got != 1 {
+		t.Fatalf("digest_source_errors_total{source=gitlab} = %v after a partial build, want 1", got)
+	}
+	beforeGitLab, beforeLinear := sourceErrors(metrics.SourceGitLab), sourceErrors(metrics.SourceLinear)
+
+	// Now lose Linear as well. The run fails outright, and that is exactly when
+	// the counters have to have been written already — the early return used to
+	// skip them.
+	h.linear.err = errors.New("Linear unavailable")
+	if _, err := h.svc.BuildDigest(t.Context(), team, "16:30", digestDay, 0); err == nil {
+		t.Fatal("BuildDigest succeeded with every configured source unavailable")
+	}
+
+	for _, tc := range []struct {
+		source string
+		before float64
+	}{{metrics.SourceGitLab, beforeGitLab}, {metrics.SourceLinear, beforeLinear}} {
+		if got := sourceErrors(tc.source); got != tc.before+1 {
+			t.Errorf("digest_source_errors_total{source=%q} = %v, want %v: the failed run did not count it",
+				tc.source, got, tc.before+1)
+		}
+	}
+	if got := testutil.CollectAndCount(metrics.LinearIssuesInReview); got != seriesWithGauge-1 {
+		t.Errorf("linear gauge series = %d, want %d: an unknown count is still exported", got, seriesWithGauge-1)
+	}
+}
+
+func TestBuildDigestFailsWhenGitLabAndLinearAreUnavailable(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.Repositories = []string{"backend/gone"}
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	h.gl.failProject[url.PathEscape("backend/gone")] = errors.New("GitLab unavailable")
+	h.linear.err = errors.New("Linear unavailable")
+
+	if _, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0); err == nil {
+		t.Fatal("BuildDigest succeeded with every configured source unavailable")
 	}
 }
 
@@ -495,7 +800,7 @@ func TestTeamStateCountsEachMROnce(t *testing.T) {
 		Mergeability: domain.Mergeability{HasConflicts: true, DetailedStatus: "conflict", Known: true},
 		Pipeline:     domain.Pipeline{SHA: "aaa", Status: "failed", Known: true},
 	}
-	got := teamState([]domain.MergeRequestSnapshot{snap})
+	got := teamState([]domain.MergeRequestSnapshot{snap}, linearDigestState{})
 	if got.WaitingHumanReview != 1 {
 		t.Errorf("WaitingHumanReview = %d, want 1 — two idle reviewers are still one MR",
 			got.WaitingHumanReview)
@@ -509,7 +814,7 @@ func TestTeamStateReportsZerosSoGaugesCannotGoStale(t *testing.T) {
 	t.Parallel()
 	// The gauges are overwritten every pass; a team that drops to zero has to
 	// report zero rather than keep its last non-zero value forever.
-	if got := teamState(nil); got != (metrics.TeamState{}) {
+	if got := teamState(nil, linearDigestState{}); got != (metrics.TeamState{}) {
 		t.Errorf("teamState(nil) = %+v, want every counter at 0", got)
 	}
 }

@@ -82,9 +82,10 @@ type DigestOutcome struct {
 	RunID uuid.UUID
 	// Messages is one id per digest_messages row, in delivery order. Each
 	// becomes one slack_send job.
-	Messages []uuid.UUID
-	Status   string // built | dry_run | partial | failed
-	MRCount  int
+	Messages         []uuid.UUID
+	Status           string // built | dry_run | partial | failed
+	MRCount          int
+	LinearIssueCount int
 }
 
 // StatusDryRun is the DigestOutcome/ReviewOutcome status that means "everything

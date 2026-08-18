@@ -7,8 +7,9 @@ How the pieces fit, what one review actually does, and where state lives.
 ## Overview
 
 ```text
-                            GitLab (source of truth about MRs)
-                                       │  REST v4 + a little GraphQL
+              GitLab (source of truth about MRs)      Linear (In Review issues)
+                         │ REST v4 + GraphQL              │ GraphQL, read-only
+                         └──────────────────┬──────────────┘
                                        ▼
    ┌──────────────────────────────────────────────────────────────────┐
    │  ai-reviewer  (N replicas)                                        │
@@ -39,6 +40,7 @@ Package layering, strictly downward
 | `internal/domain`                    | pure classifiers over an MR snapshot — no I/O, fully unit-tested                               |
 | `internal/store` + `internal/models` | pgx pool, transactions, pgxgen-generated repositories                                          |
 | `internal/gitlab`                    | REST v4 client, GraphQL review states, comment markers                                         |
+| `internal/linear`                    | read-only GraphQL client for paginated `In Review` digest issues                                |
 | `internal/slack` + `internal/match`  | Slack client + Block Kit builder; GitLab user → Slack user matching                            |
 | `internal/review`                    | the review engine: passes, skeptic, **validator**, line mapper, verifiers, risk, completeness   |
 | `internal/llm`                       | `Client` interface + the Claude Code CLI provider + deterministic auth env                     |
@@ -107,6 +109,7 @@ teams:
   - name: payments
     slack_channel: C012345678
     ai_review: { enabled: true }
+    linear_team_ids: ["9cfb482a-81e3-4154-b5b9-2c805e70a02d"]
     repositories: [backend/payments, backend/billing, frontend/checkout]
 
   - name: platform
@@ -120,6 +123,12 @@ validated fail-fast at startup: team names must be unique (case-insensitively),
 every team needs at least one repository and a Slack channel, and **one
 repository may not belong to two teams** — the error names both.
 
+`linear_team_ids` is optional. Each UUID may belong to only one application
+team. Linear provides an `In Review` aggregate and a completion gate for linked
+GitLab MRs: title identifier first, source branch fallback. One approval is
+enough to stop notifying remaining reviewers unless `REQUESTED_CHANGES` exists;
+an approved card still in `In Review` becomes an author action.
+
 `ai_review.enabled: false` turns off automated review for that team while
 keeping it in the digest. Digest scheduling is per team, so one team's failure
 does not affect another's.
@@ -128,8 +137,8 @@ does not affect another's.
 
 ## The state model
 
-**GitLab is the source of truth about merge requests. PostgreSQL holds the
-service's operational state.** The service never mirrors GitLab's data; it
+**GitLab and Linear remain the sources of truth for their work items. PostgreSQL
+holds the service's operational state.** The service never mirrors their data; it
 records what *it* did.
 
 There is a deliberate second record: every note the service publishes carries a

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
 )
 
@@ -66,6 +67,25 @@ func (c *Config) Validate() error {
 		// its Meta["env"], which already carries EnvPrefix. Naming the bare key
 		// here would send an operator to store the secret where nothing reads it.
 		add("gitlab.token is empty (set %s_GITLAB_TOKEN, or the Vault key %s_GITLAB_TOKEN)", EnvPrefix, EnvPrefix)
+	}
+
+	// --- linear -------------------------------------------------------------
+	if c.hasLinearTeams() {
+		if !c.Linear.APIKey.IsSet() {
+			add("linear.api_key is empty but teams declare linear_team_ids (set %s_LINEAR_API_KEY, or the Vault key %s_LINEAR_API_KEY)", EnvPrefix, EnvPrefix)
+		}
+		if u, err := url.Parse(c.Linear.Endpoint); err != nil || !u.IsAbs() || u.Scheme != "https" || u.Host == "" {
+			add("linear.endpoint must be an absolute HTTPS URL, got %q", c.Linear.Endpoint)
+		}
+	}
+	if c.Linear.Timeout <= 0 {
+		add("linear.timeout must be positive, got %s", c.Linear.Timeout)
+	}
+	if c.Linear.MaxAttempts < 1 {
+		add("linear.max_attempts must be at least 1, got %d", c.Linear.MaxAttempts)
+	}
+	if c.Linear.MaxRetryAfter <= 0 {
+		add("linear.max_retry_after must be positive, got %s", c.Linear.MaxRetryAfter)
 	}
 
 	// --- llm ----------------------------------------------------------------
@@ -138,8 +158,9 @@ func (c *Config) validateTeams() []error {
 		return errs
 	}
 
-	seenName := map[string]int{}     // lower(name) -> index
-	repoOwner := map[string]string{} // repository -> owning team name
+	seenName := map[string]int{}          // lower(name) -> index
+	repoOwner := map[string]string{}      // repository -> owning team name
+	linearOwner := map[uuid.UUID]string{} // Linear team UUID -> owning team name
 	for i, t := range c.Teams {
 		label := fmt.Sprintf("teams[%d]", i)
 		if t.Name != "" {
@@ -179,6 +200,18 @@ func (c *Config) validateTeams() []error {
 			}
 			repoOwner[r] = t.Name
 		}
+		for _, rawID := range t.LinearTeamIDs {
+			id, err := uuid.Parse(strings.TrimSpace(rawID))
+			if err != nil {
+				add("%s: linear_team_id %q is not a UUID", label, rawID)
+				continue
+			}
+			if owner, dup := linearOwner[id]; dup {
+				add("Linear team %q is claimed by both team %q and team %q", id, owner, t.Name)
+				continue
+			}
+			linearOwner[id] = t.Name
+		}
 	}
 	return errs
 }
@@ -198,6 +231,15 @@ func (c *Config) ClaudeAuthConfig() llm.AuthConfig {
 func (c *Config) hasSlackChannel() bool {
 	for _, t := range c.Teams {
 		if strings.TrimSpace(t.SlackChannel) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) hasLinearTeams() bool {
+	for _, t := range c.Teams {
+		if len(t.LinearTeamIDs) > 0 {
 			return true
 		}
 	}

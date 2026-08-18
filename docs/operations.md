@@ -56,7 +56,8 @@ uniqueness, retries and metrics as a scheduled one.
 `claude` binary and `claude auth status --json` **under the configured auth
 mode**, the `Europe/Moscow` timezone, PostgreSQL connectivity, pending
 migrations, River's tables, GitLab authentication (`GET /user`), GraphQL
-availability, every configured repository, `head_pipeline` visibility, Slack
+availability, every configured repository, `head_pipeline` visibility, Linear
+authentication/team UUIDs/`In Review` states, Slack
 `auth.test`, bot membership of each channel, the Slack **directory**
 (`users.list` — it names the missing scope, and warns when no member exposes an
 email), every `slack.user_map` entry resolved against that directory, and whether
@@ -149,19 +150,38 @@ Reading it:
 - **Age markers** are 🔴 from a week, 🟡 from two days, ▫️ below that. They
   classify; they do not filter.
 - **Own merge requests** are the `🛠` rows, with the flags in a fixed order:
-  changes requested → threads → conflicts → pipeline.
+  changes requested → threads → conflicts → pipeline → move Linear card.
 - **The project name** sits in the title when the digest covers one repository,
   and moves into each row when it covers several — it is what tells two `!1404`s
   apart.
 - **Titles** are cut to 55 characters at a word boundary. The ticket key comes
   first in practice, so it survives the cut.
-- **Nothing is filtered.** A merge request nobody has touched in 110 days, a
-  draft, and one pushed 38 minutes ago are all listed. A reviewer who is on four
-  merge requests sees four rows, and a merge request with four reviewers appears
-  under each of them — as one line, not as a two-line entry.
+- **Linear-aware completion:** a linked MR with at least one approval stops
+  notifying its remaining reviewers. If its issue is still `In Review`, the
+  author gets `move CHAIN-N forward in Linear`. Zero approvals, a missing issue
+  or any `REQUESTED_CHANGES` verdict keep the ordinary GitLab flow.
 
-A person who owes nothing is not listed, and a digest with nothing in it is not
-posted at all.
+A person who owes nothing is not listed. Without Linear, a digest with no
+actions is not posted; with Linear enabled, the healthy `In Review` aggregate
+is itself reportable and may produce a count-only digest.
+
+When a team declares `linear_team_ids`, the message contains the aggregate
+`Linear · In Review: N`; individual Linear issues are not duplicated as rows.
+MR linkage prefers a valid identifier in the title and falls back to the source
+branch, case-insensitively.
+
+Linear is read while the digest payload is built. The payload is then persisted,
+so a `slack_send` retry never reads Linear again. A Linear outage degrades an
+otherwise available digest to `partial` and adds a visible warning; if GitLab
+and Linear are both unavailable, no misleading digest is created.
+
+The two Linear reads degrade separately, and the warning says which one failed.
+Losing the board query removes the count entirely — *Partial data: Linear could
+not be inspected.* — because an unknown count must never render as a zero.
+Losing only the per-MR issue lookup keeps the count and says so — *Partial data:
+Linear issue links could not be resolved; the In Review count is current.* — and
+every reviewer falls back to the ordinary GitLab classification, so no merge
+request is hidden by a link the service could not resolve.
 
 ---
 
@@ -276,6 +296,9 @@ Metrics worth alerting on:
 | `ai_review_duration_seconds`, `ai_review_cost_usd_total` | cost and latency of reviews             |
 | `ai_reviewer_scans_total{result}`, `ai_reviewer_scan_duration_seconds` | scan health              |
 | `gitlab_requests_total{endpoint,method,status}`, `gitlab_request_errors_total` | API health (templated paths, low cardinality) |
+| `ai_reviewer_linear_requests_total{operation,result}`, `ai_reviewer_linear_request_duration_seconds{operation}` | Linear GraphQL health and latency |
+| `ai_reviewer_linear_issues_in_review{team}` | last successfully collected Linear issue count |
+| `ai_reviewer_digest_source_errors_total{team,source}` | source failures that degraded a digest |
 | `merge_requests_scanned_total{team}`               | counter: open MRs inspected                    |
 | `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten on every digest build — twice a day, not every scan, because the classification needs a whole team at once. A flat line between 09:00 and 16:30 is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
 | `slack_digest_runs_total{team,result}`, `slack_messages_sent_total`, `slack_send_errors_total`, `slack_resend_uncertain_total` | digest delivery |
@@ -325,6 +348,7 @@ no secret values, so its output is safe to paste into a ticket.
 | `held back by the failure backoff` for a healthy MR  | Fixed: a running review is reported as `review already in progress`. A WARN now means real failures |
 | `claude auth` check fails                           | The mode and the credential disagree. `oauth-token` needs `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`; `existing-login` will not work in a container |
 | Reviewer states look coarse                         | GraphQL is disabled or unsupported; the REST heuristic is in use. `doctor` says which                    |
+| Linear section is missing                           | The team declares no `linear_team_ids`, or Linear failed — an empty board still renders `Linear · In Review: 0`, so an absent line never means "no issues". A failure also adds a warning and marks the run `partial`. Run `doctor` to validate the key, UUIDs and workflow state |
 | A review job runs but publishes nothing             | It ran as a dry run. Re-run with `ai-reviewer review <ref> --publish --wait`                              |
 | `scan --team X` reports it was folded in            | A full scan was already in flight; scan uniqueness is by kind. Wait for the next pass                    |
 | A finding lost its line anchor                      | GitLab rejected the stored position; the finding is posted as an unpositioned discussion rather than lost |

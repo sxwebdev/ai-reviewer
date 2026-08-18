@@ -127,10 +127,11 @@ func fromServiceDigest(out *service.DigestOutcome) *jobs.DigestOutcome {
 		return nil
 	}
 	return &jobs.DigestOutcome{
-		RunID:    out.RunID,
-		Messages: out.Messages,
-		Status:   out.Status,
-		MRCount:  out.MRCount,
+		RunID:            out.RunID,
+		Messages:         out.Messages,
+		Status:           out.Status,
+		MRCount:          out.MRCount,
+		LinearIssueCount: out.LinearIssueCount,
 	}
 }
 

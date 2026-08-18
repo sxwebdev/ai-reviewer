@@ -15,6 +15,7 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/git"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/jobs"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/metrics"
@@ -35,6 +36,7 @@ type Runtime struct {
 	Postgres *postgres.Postgres
 	Store    *store.Store
 	GitLab   *gitlab.Client
+	Linear   *linear.Client
 	Service  *service.Service
 	Jobs     *jobs.Service
 }
@@ -216,6 +218,12 @@ func (a *App) Runtime(ctx context.Context) (*Runtime, error) {
 		gql = gl.GraphQL()
 	}
 
+	linearClient, err := a.linearClient()
+	if err != nil {
+		return fail(err)
+	}
+	rt.Linear = linearClient
+
 	slackAPI, matcher := a.slack()
 
 	engine := review.NewEngine(a.llmClient(), a.Log)
@@ -224,6 +232,7 @@ func (a *App) Runtime(ctx context.Context) (*Runtime, error) {
 	svc, err := service.New(service.Deps{
 		GitLab:  gl,
 		GraphQL: gql,
+		Linear:  linearAPI(linearClient),
 		Slack:   slackAPI,
 		Matcher: matcher,
 		Store:   st,
@@ -302,6 +311,57 @@ func (a *App) gitlabClient() (*gitlab.Client, error) {
 		return nil, fmt.Errorf("build gitlab client: %w", err)
 	}
 	return c, nil
+}
+
+// linearClient builds one read-only Linear client for the process. A nil
+// client is the valid "no team uses Linear" configuration.
+func (a *App) linearClient() (*linear.Client, error) {
+	if !usesLinear(a.Config) {
+		return nil, nil
+	}
+	cfg := a.Config.Linear
+	client, err := linear.New(linear.Config{
+		Endpoint:      cfg.Endpoint,
+		APIKey:        cfg.APIKey.Unmask(),
+		Timeout:       cfg.Timeout,
+		MaxAttempts:   cfg.MaxAttempts,
+		MaxRetryAfter: cfg.MaxRetryAfter,
+		Observer: func(operation string, _ int, duration time.Duration, err error) {
+			metrics.ObserveLinearRequest(operation, duration, err)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build Linear client: %w", err)
+	}
+	return client, nil
+}
+
+// linearAPI hands the concrete client to the service as the interface it
+// declares, mapping "no client" onto a nil interface rather than a nil pointer
+// inside one.
+//
+// The distinction is the whole reason this function exists. Assigning
+// *linear.Client directly stores a typed nil, and a typed nil interface is not
+// nil: service.gatherLinear's "linear client is not configured" guard could
+// never fire, so the case it was written for — a team carrying linear_team_ids
+// while usesLinear said no client was needed — would reach a method call on a
+// nil receiver and panic inside the digest worker instead of degrading the run
+// to partial. The two cannot disagree today; this keeps the intended error
+// reachable for the day they do.
+func linearAPI(c *linear.Client) service.LinearAPI {
+	if c == nil {
+		return nil
+	}
+	return c
+}
+
+func usesLinear(cfg *config.Config) bool {
+	for _, team := range cfg.Teams {
+		if len(team.LinearTeamIDs) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // slack builds the Slack client, the workspace directory and the user matcher.
@@ -420,10 +480,11 @@ func Teams(cfg *config.Config) []domain.Team {
 	out := make([]domain.Team, 0, len(cfg.Teams))
 	for _, t := range cfg.Teams {
 		out = append(out, domain.Team{
-			Name:         t.Name,
-			SlackChannel: t.SlackChannel,
-			AIReview:     t.AIReview.Enabled,
-			Repositories: t.Repositories,
+			Name:          t.Name,
+			SlackChannel:  t.SlackChannel,
+			AIReview:      t.AIReview.Enabled,
+			LinearTeamIDs: append([]string(nil), t.LinearTeamIDs...),
+			Repositories:  t.Repositories,
 		})
 	}
 	return out

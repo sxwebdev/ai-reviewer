@@ -89,6 +89,42 @@ heuristic automatically; `doctor` reports which of the two you are on.
 
 ---
 
+## Linear setup (optional)
+
+Linear is a read-only digest source. Create a personal API key in Linear under
+**Settings → Security & access → Personal API keys**. Prefer a technical account
+that can access only the teams the service needs. Put the key in
+`AI_REVIEWER_LINEAR_API_KEY` (or the Vault key with the same name), not in the
+committed YAML. For the bundled Docker Compose deployment, uncomment the
+corresponding line in `.env` (copied from `.env.example`).
+
+For every application team that should use Linear-aware MR classification:
+
+1. Open the corresponding team in Linear.
+2. Press `Cmd+K` / `Ctrl+K` and select **Copy model UUID**.
+3. Add the copied UUID to that application's `linear_team_ids` list.
+
+```yaml
+linear:
+  api_key: "" # AI_REVIEWER_LINEAR_API_KEY
+
+teams:
+  - name: payments
+    slack_channel: C012345678
+    linear_team_ids:
+      - "your-linear-team-uuid"
+    repositories: [backend/payments]
+```
+
+The service matches an identifier such as `CHAIN-184` in the MR title, then the
+source branch, without regard to case. One GitLab approval completes review for
+a linked issue unless any reviewer has `REQUESTED_CHANGES`; an approved issue
+still in `In Review` becomes an action for the MR author to move it forward.
+With zero approvals or no matching issue, the ordinary GitLab reviewer flow is
+kept. Run `ai-reviewer doctor`: it authenticates the key, resolves every UUID
+and verifies that each Linear team has exactly one matching workflow status. If
+`linear_team_ids` is absent everywhere, Linear is skipped and no key is required.
+
 ## Slack setup
 
 Create a Slack app with a bot token and these **scopes**:

@@ -19,7 +19,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/sxwebdev/ai-reviewer/internal/config"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/slack"
@@ -36,6 +38,21 @@ const serviceProbeTimeout = 60 * time.Second
 // watches dozens of repositories, and firing all of them at once at a GitLab
 // instance that is already unhealthy is how a diagnostic becomes an outage.
 const repoProbeConcurrency = 8
+
+// linearProbeTimeout is the Linear check's own slice of serviceProbeTimeout.
+//
+// The Linear client retries with backoff, so one unhealthy instance answering
+// 503 can spend the *entire* service budget before returning — and the checks
+// that run after it inherit an already-cancelled context, so `doctor` reported a
+// perfectly healthy Slack workspace as `context deadline exceeded`. Diagnosing
+// Slack because Linear is down is the exact opposite of the complete picture
+// ServiceChecks promises, and the bound is what keeps one source's outage from
+// spreading to every check behind it.
+const linearProbeTimeout = 20 * time.Second
+
+// linearTeamProbeConcurrency bounds the parallel team lookups, same reasoning as
+// repoProbeConcurrency.
+const linearTeamProbeConcurrency = 4
 
 // checkCollector accumulates results in call order.
 type checkCollector struct {
@@ -73,10 +90,122 @@ func (a *App) ServiceChecks(ctx context.Context) []DoctorCheck {
 	if gl != nil {
 		a.checkRepositories(ctx, col, gl)
 	}
+	a.checkLinear(ctx, col)
 	a.checkSlack(ctx, col)
 	a.checkWorkdir(col)
 
 	return col.checks
+}
+
+type linearDoctorAPI interface {
+	Viewer(context.Context) (*linear.User, error)
+	GetTeam(context.Context, string) (*linear.Team, error)
+}
+
+func (a *App) checkLinear(ctx context.Context, col *checkCollector) {
+	if !usesLinear(a.Config) {
+		col.add("linear", StatusOK, "not configured; skipped")
+		return
+	}
+	client, err := a.linearClient()
+	if err != nil {
+		col.add("linear", StatusFail, "%s", err)
+		return
+	}
+	checkLinearAPI(ctx, col, client, a.Config)
+}
+
+// linearTeamProbe is one configured UUID's verdict. Like repoProbe, the probes
+// run in parallel and write into a pre-sized slice, so the summary reads in
+// config order rather than completion order.
+type linearTeamProbe struct {
+	mapping string
+	problem string
+}
+
+func checkLinearAPI(ctx context.Context, col *checkCollector, api linearDoctorAPI, cfg *config.Config) {
+	// The budget is taken here rather than at the caller so it covers every
+	// request this check makes and is exercised by the tests that drive it.
+	ctx, cancel := context.WithTimeout(ctx, linearProbeTimeout)
+	defer cancel()
+
+	viewer, err := api.Viewer(ctx)
+	if err != nil {
+		col.add("linear", StatusFail, "authentication failed: %s", err)
+		return
+	}
+	name := strings.TrimSpace(viewer.Name)
+	if name == "" {
+		name = viewer.ID
+	}
+	col.add("linear", StatusOK, "authenticated as %s", name)
+
+	type target struct {
+		team string
+		id   string
+	}
+	var targets []target
+	for _, appTeam := range cfg.Teams {
+		for _, id := range appTeam.LinearTeamIDs {
+			targets = append(targets, target{team: appTeam.Name, id: id})
+		}
+	}
+
+	// Every mapping is probed, exactly like checkRepositories: returning on the
+	// first bad UUID reported one broken team while hiding all the others, so an
+	// operator fixing a five-team config learned about one problem per run — and
+	// the mappings collected before it were thrown away, leaving no OK line at
+	// all for the teams that were fine.
+	probes := make([]linearTeamProbe, len(targets))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(linearTeamProbeConcurrency)
+	for i, tg := range targets {
+		g.Go(func() error {
+			probes[i] = probeLinearTeam(gctx, api, tg.team, tg.id)
+			return nil
+		})
+	}
+	_ = g.Wait() // every probe records its own verdict; none returns an error
+
+	var mappings, problems []string
+	for _, p := range probes {
+		if p.problem != "" {
+			problems = append(problems, p.problem)
+			continue
+		}
+		mappings = append(mappings, p.mapping)
+	}
+	if len(problems) > 0 {
+		// The working mappings are named alongside, same rule as checkUserMap: a
+		// summary that prints only what is broken leaves an operator unable to tell
+		// a team that passed from one that was never probed.
+		detail := fmt.Sprintf("%d of %d unusable: %s", len(problems), len(targets), strings.Join(problems, "; "))
+		if len(mappings) > 0 {
+			detail += "; resolved: " + strings.Join(mappings, ", ")
+		}
+		col.add("linear teams", StatusFail, "%s", detail)
+		return
+	}
+	col.add("linear teams", StatusOK, "%s", strings.Join(mappings, ", "))
+}
+
+func probeLinearTeam(ctx context.Context, api linearDoctorAPI, appTeam, id string) linearTeamProbe {
+	team, err := api.GetTeam(ctx, id)
+	if err != nil {
+		return linearTeamProbe{problem: fmt.Sprintf("%s → %s: %s", appTeam, id, security.Mask(err.Error()))}
+	}
+	matches := 0
+	for _, state := range team.States {
+		if strings.EqualFold(strings.TrimSpace(state.Name), linear.InReviewState) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return linearTeamProbe{problem: fmt.Sprintf(
+			"%s → %s (%s): expected exactly one %q workflow state, found %d",
+			appTeam, team.Name, team.Key, linear.InReviewState, matches)}
+	}
+	return linearTeamProbe{mapping: fmt.Sprintf("%s → %s (%s)", appTeam, team.Name, team.Key)}
 }
 
 // checkPostgres verifies the connection, the application's migration state and

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/sxwebdev/ai-reviewer/internal/config"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/review"
 	"github.com/tkcrm/mx/logger"
 )
@@ -36,7 +37,9 @@ func testConfig(t *testing.T) *config.Config {
 
 func TestTeamsMapping(t *testing.T) {
 	t.Parallel()
-	got := Teams(testConfig(t))
+	cfg := testConfig(t)
+	cfg.Teams[0].LinearTeamIDs = []string{"linear-payments"}
+	got := Teams(cfg)
 	if len(got) != 2 {
 		t.Fatalf("teams = %d, want 2", len(got))
 	}
@@ -51,8 +54,48 @@ func TestTeamsMapping(t *testing.T) {
 	if !slices.Equal(got[0].Repositories, []string{"backend/payments", "backend/billing"}) {
 		t.Errorf("repositories = %v", got[0].Repositories)
 	}
+	if !slices.Equal(got[0].LinearTeamIDs, []string{"linear-payments"}) {
+		t.Errorf("linear team ids = %v", got[0].LinearTeamIDs)
+	}
 	if len(Teams(defaultConfig(t))) != 0 {
 		t.Error("a config with no teams must map to no teams")
+	}
+}
+
+func TestLinearClientIsBuiltOnlyWhenUsed(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	a := &App{Config: cfg, Log: quietLogger()}
+	client, err := a.linearClient()
+	if err != nil || client != nil {
+		t.Fatalf("unused Linear client = (%v, %v), want nil", client, err)
+	}
+
+	cfg.Teams[0].LinearTeamIDs = []string{"linear-team"}
+	cfg.Linear.Endpoint = "https://api.linear.app/graphql"
+	cfg.Linear.APIKey = "lin_api_key"
+	client, err = a.linearClient()
+	if err != nil || client == nil {
+		t.Fatalf("configured Linear client = (%v, %v)", client, err)
+	}
+}
+
+// The absent client must reach the service as a nil *interface*. Passing the
+// pointer straight through stores a typed nil, which is non-nil as an
+// interface, so service.gatherLinear's "not configured" guard could never fire
+// and a team carrying linear_team_ids without a client would panic on a nil
+// receiver inside the digest worker instead of degrading the run.
+func TestLinearAPIMapsAnAbsentClientOntoANilInterface(t *testing.T) {
+	t.Parallel()
+	if got := linearAPI(nil); got != nil {
+		t.Errorf("linearAPI(nil) = %#v (%T), want a nil interface", got, got)
+	}
+	client, err := linear.New(linear.Config{Endpoint: linear.DefaultEndpoint, APIKey: "lin_api_key"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if linearAPI(client) == nil {
+		t.Error("linearAPI dropped a real client")
 	}
 }
 

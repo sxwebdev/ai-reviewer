@@ -67,7 +67,8 @@ func (w *DigestWorker) Work(ctx context.Context, job *river.Job[DigestArgs]) err
 			"operation", "digest", "team", team.Name, "slot", args.Slot,
 			"run_date", args.RunDate, "attempt", args.Attempt,
 			"run_id", out.RunID, "parts", len(out.Messages),
-			"merge_requests", out.MRCount, "result", out.Status, "job_id", job.ID,
+			"merge_requests", out.MRCount, "linear_issues", out.LinearIssueCount,
+			"result", out.Status, "job_id", job.ID,
 		}
 
 		// Dry run: the digest is built and persisted in full, every part is a

@@ -7,7 +7,9 @@
 **A self-hosted GitLab review agent for engineering teams.** It watches the open
 merge requests of the repositories you configure, reviews each one with Claude
 Code when its head commit changes, posts the findings that survive validation as
-inline discussions, and sends every team a Slack digest twice a day.
+inline discussions, and sends every team a Slack digest twice a day. Optionally,
+Linear workflow state prevents already-approved work from nagging every remaining
+reviewer and identifies approved MRs whose cards are still stuck in `In Review`.
 
 It plugs into GitLab and Slack and changes nothing about how you already work —
 no CI job to add, no bot to invite into a workflow, nothing for reviewers to
@@ -48,7 +50,8 @@ Hard invariants, not settings:
 ## Install
 
 You need a GitLab personal access token (`api` scope), a Slack bot token and a
-Claude Code OAuth token. PostgreSQL comes with the stack.
+Claude Code OAuth token. A Linear API key is optional for Linear-aware MR
+classification and the `In Review` summary. PostgreSQL comes with the stack.
 
 ```bash
 git clone https://github.com/sxwebdev/ai-reviewer && cd ai-reviewer

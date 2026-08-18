@@ -258,6 +258,7 @@ func newVaultClient(ctx context.Context, lg logger.Logger, cfg VaultConfig) (*xc
 func (c *Config) RegisterSecrets() {
 	for _, s := range []Secret{
 		c.GitLab.Token,
+		c.Linear.APIKey,
 		c.Slack.Token,
 		c.LLM.Claude.Auth.OAuthToken,
 		c.LLM.Claude.Auth.APIKey,

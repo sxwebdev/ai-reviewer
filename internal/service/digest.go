@@ -13,6 +13,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/dbtypes"
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
+	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/metrics"
 	"github.com/sxwebdev/ai-reviewer/internal/models"
@@ -32,9 +33,10 @@ type DigestOutcome struct {
 	// Messages are the persisted parts that still need delivering, in order —
 	// one slack_send job each. It is empty for a dry run: the rows exist and
 	// can be inspected, but no delivery job may be created for them (§13.5).
-	Messages []uuid.UUID
-	Status   string // built | dry_run | partial | failed
-	MRCount  int
+	Messages         []uuid.UUID
+	Status           string // built | dry_run | partial | failed
+	MRCount          int
+	LinearIssueCount int
 }
 
 // BuildDigest assembles one team's digest and persists it. It never calls
@@ -66,39 +68,83 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 	}
 
 	snapshots, failedRepos := s.gatherTeam(ctx, team)
-	// This is the only place that sees a whole team at once, so it is the only
-	// place that can set the per-team gauges honestly. They are overwritten
-	// every pass, including when every count is zero: a team that drops to zero
-	// must report zero rather than keep its last non-zero value forever.
-	metrics.SetTeamState(team.Name, teamState(snapshots))
+	linearState, linearErr := s.gatherLinear(ctx, team, snapshots)
 
-	if failedRepos > 0 && len(snapshots) == 0 && len(team.Repositories) > 0 {
+	gitLabUnavailable := failedRepos > 0 && len(snapshots) == 0 && len(team.Repositories) > 0
+	linearConfigured := len(team.LinearTeamIDs) > 0
+	// Two different questions. linearDegraded asks whether anything failed, and
+	// drives the partial status and the warning; linearState.enabled asks whether
+	// the board total actually arrived, and is the only one allowed to decide
+	// that Linear contributed nothing at all.
+	linearDegraded := linearConfigured && linearErr != nil
+
+	// Every metric this build owns is published here, before the early return
+	// below: a run that learned nothing is still a run, and a source failure that
+	// aborts the digest is the one an operator most wants counted. This is also
+	// the only place that sees a whole team at once, so it is the only place that
+	// can set the per-team gauges honestly — overwritten every pass, including
+	// when every count is zero, because a team that drops to zero must report
+	// zero rather than keep its last non-zero value forever.
+	metrics.SetTeamState(team.Name, teamState(snapshots, linearState))
+	if linearState.enabled {
+		metrics.SetLinearIssuesInReview(team.Name, linearState.inReviewCount)
+	} else {
+		// Unknown, so the series goes absent rather than stale or falsely zero —
+		// see metrics.ClearLinearIssuesInReview. Covers both the outage and the
+		// team that no longer declares linear_team_ids.
+		metrics.ClearLinearIssuesInReview(team.Name)
+	}
+	if failedRepos > 0 {
+		metrics.DigestSourceError(team.Name, metrics.SourceGitLab)
+	}
+	if linearDegraded {
+		metrics.DigestSourceError(team.Name, metrics.SourceLinear)
+	}
+
+	if gitLabUnavailable && (!linearConfigured || !linearState.enabled) {
 		// Nothing was learned at all, so there is no digest to build — as
 		// opposed to a partial one, which is a normal result.
-		err := fmt.Errorf("digest for team %q: all %d repositories failed inspection", team.Name, failedRepos)
+		err := fmt.Errorf("digest for team %q: all configured sources failed (GitLab repositories: %d, Linear configured: %t)", team.Name, failedRepos, linearConfigured)
 		s.recordDigestFailure(ctx, team, slot, day, attempt, reuseID, err)
 		metrics.DigestRun(team.Name, metrics.ResultError)
 		return nil, err
 	}
 
-	data, mrCount := s.digestData(ctx, team, snapshots, failedRepos)
+	data, mrCount := s.digestData(ctx, team, snapshots, failedRepos, linearState)
+	if linearDegraded {
+		// The two warnings are not interchangeable. "could not be inspected"
+		// explains an absent count; with the count present it would read as a
+		// contradiction of the line right above it, and hide which half is stale.
+		warning := "Partial data: Linear could not be inspected."
+		if linearState.enabled {
+			warning = "Partial data: Linear issue links could not be resolved; the In Review count is current."
+		}
+		data.Warnings = append(data.Warnings, warning)
+		s.log.Warnw("Linear could not be fully inspected for the digest",
+			"team", team.Name, "count_known", linearState.enabled, "err", linearErr)
+	}
 	messages := slack.BuildDigest(data)
 
-	status, messageStatus := digestStatuses(s.cfg.SlackSendEnabled, failedRepos)
+	failedSources := failedRepos
+	if linearDegraded {
+		failedSources++
+	}
+	status, messageStatus := digestStatuses(s.cfg.SlackSendEnabled, failedSources)
 	if !s.cfg.SlackSendEnabled {
 		s.logDigestPreview(team, messages)
 	}
 
 	runID, ids, err := s.persistDigest(ctx, persistDigestInput{
-		reuseID:       reuseID,
-		team:          team,
-		slot:          slot,
-		runDate:       day,
-		attempt:       attempt,
-		status:        status,
-		messageStatus: messageStatus,
-		mrCount:       mrCount,
-		messages:      messages,
+		reuseID:          reuseID,
+		team:             team,
+		slot:             slot,
+		runDate:          day,
+		attempt:          attempt,
+		status:           status,
+		messageStatus:    messageStatus,
+		mrCount:          mrCount,
+		linearIssueCount: linearState.inReviewCount,
+		messages:         messages,
 	})
 	if err != nil {
 		metrics.DigestRun(team.Name, metrics.ResultError)
@@ -112,9 +158,10 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 	metrics.DigestRun(team.Name, result)
 	s.log.Infow("digest built",
 		"team", team.Name, "slot", slot, "run_date", day.Format(time.DateOnly), "attempt", attempt,
-		"status", status, "parts", len(messages), "mrs", mrCount, "failed_repos", failedRepos)
+		"status", status, "parts", len(messages), "mrs", mrCount,
+		"linear_issues", linearState.inReviewCount, "failed_repos", failedRepos, "linear_degraded", linearDegraded)
 
-	out := &DigestOutcome{RunID: runID, Status: status, MRCount: mrCount}
+	out := &DigestOutcome{RunID: runID, Status: status, MRCount: mrCount, LinearIssueCount: linearState.inReviewCount}
 	if s.cfg.SlackSendEnabled {
 		out.Messages = ids
 	}
@@ -164,7 +211,10 @@ func (s *Service) outcomeForRun(ctx context.Context, run *models.DigestRun) (*Di
 	if err != nil {
 		return nil, fmt.Errorf("list digest messages: %w", err)
 	}
-	out := &DigestOutcome{RunID: run.ID, Status: run.Status, MRCount: int(run.MrCount)}
+	out := &DigestOutcome{
+		RunID: run.ID, Status: run.Status, MRCount: int(run.MrCount),
+		LinearIssueCount: int(run.LinearIssueCount),
+	}
 	if run.Status != DigestDryRun {
 		for _, m := range msgs {
 			out.Messages = append(out.Messages, m.ID)
@@ -195,6 +245,66 @@ func (s *Service) gatherTeam(ctx context.Context, team domain.Team) ([]domain.Me
 		snapshots = append(snapshots, snaps...)
 	}
 	return snapshots, failed
+}
+
+func (s *Service) gatherLinear(
+	ctx context.Context,
+	team domain.Team,
+	snapshots []domain.MergeRequestSnapshot,
+) (linearDigestState, error) {
+	if len(team.LinearTeamIDs) == 0 {
+		return linearDigestState{}, nil
+	}
+	if s.linear == nil {
+		return linearDigestState{}, errors.New("linear client is not configured")
+	}
+	inReview, err := s.linear.ListIssuesInReview(ctx, team.LinearTeamIDs)
+	if err != nil {
+		return linearDigestState{}, err
+	}
+
+	// The board total is known from here on, and every later failure degrades
+	// only the per-MR *links*. Both are returned together for that reason: an
+	// earlier version discarded the whole state when the batch lookup failed, so
+	// a Linear board the service had just counted at 8 was rendered as no count
+	// at all, persisted as linear_issue_count = 0 and left the gauge stale —
+	// which is precisely the false zero §7 forbids. The reviewer gate needs no
+	// protection here: an empty issuesByMR already fails it open.
+	state := linearDigestState{
+		enabled:       true,
+		inReviewCount: len(inReview),
+		issuesByMR:    make(map[string]linear.Issue),
+	}
+
+	issues := make(map[string]linear.Issue, len(inReview))
+	for _, issue := range inReview {
+		issues[strings.ToUpper(issue.Identifier)] = issue
+	}
+	numbers := linearIssueNumbers(snapshots)
+	if len(numbers) > 0 {
+		linked, err := s.linear.ListIssuesByNumbers(ctx, team.LinearTeamIDs, numbers)
+		if err != nil {
+			return state, err
+		}
+		for _, issue := range linked {
+			issues[strings.ToUpper(issue.Identifier)] = issue
+		}
+	}
+
+	for _, snapshot := range snapshots {
+		match := matchLinearIssue(snapshot.MR, issues)
+		if !match.found {
+			continue
+		}
+		state.issuesByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)] = match.issue
+		if len(match.conflicts) > 0 {
+			s.log.Warnw("merge request references multiple Linear issues; using the first valid match",
+				"project", snapshot.Project.FullPath, "iid", snapshot.MR.IID,
+				"selected", match.issue.Identifier, "selected_from", match.matchField,
+				"ignored", match.conflicts)
+		}
+	}
+	return state, nil
 }
 
 // inspectRepository loads every open MR of one repository through the shared
@@ -231,11 +341,12 @@ func (s *Service) inspectRepository(ctx context.Context, loader *snapshotLoader,
 }
 
 // teamState counts the four per-team gauges from a pass's snapshots.
-func teamState(snapshots []domain.MergeRequestSnapshot) metrics.TeamState {
+func teamState(snapshots []domain.MergeRequestSnapshot, linearState linearDigestState) metrics.TeamState {
 	var st metrics.TeamState
 	for _, snap := range snapshots {
+		_, linked := linearState.issueFor(snap)
 		for _, r := range snap.Reviewers {
-			if domain.NeedsHumanReview(snap, r) {
+			if needsReviewerAction(snap, r, linked) {
 				st.WaitingHumanReview++
 				break
 			}
@@ -259,7 +370,13 @@ func teamState(snapshots []domain.MergeRequestSnapshot) metrics.TeamState {
 
 // digestData turns classified snapshots into the Block Kit builder's input and
 // reports how many distinct MRs the digest actually mentions.
-func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []domain.MergeRequestSnapshot, failedRepos int) (slack.DigestData, int) {
+func (s *Service) digestData(
+	ctx context.Context,
+	team domain.Team,
+	snapshots []domain.MergeRequestSnapshot,
+	failedRepos int,
+	linearState linearDigestState,
+) (slack.DigestData, int) {
 	now := s.now()
 	mentions := map[string]slack.Mention{}
 
@@ -309,9 +426,10 @@ func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []
 
 	for _, snap := range ordered {
 		key := snapshotKey(snap.Project.ID, snap.MR.IID)
+		issue, linked := linearState.issueFor(snap)
 
 		for _, r := range snap.Reviewers {
-			if !domain.NeedsHumanReview(snap, r) {
+			if !needsReviewerAction(snap, r, linked) {
 				continue
 			}
 			p := at(r.User)
@@ -327,7 +445,8 @@ func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []
 		}
 
 		actions := domain.ClassifyAuthorActions(snap)
-		if !actions.Any() {
+		moveLinear := needsLinearMove(snap, issue, linked)
+		if !actions.Any() && !moveLinear {
 			continue
 		}
 		// The reviewers who asked for changes are named, so the author knows who to
@@ -348,12 +467,18 @@ func (s *Service) digestData(ctx context.Context, team domain.Team, snapshots []
 			MergeConflicts:     actions.HasConflicts,
 			PipelineFailed:     actions.PipelineFailed,
 			PipelineWebURL:     actions.Pipeline.WebURL,
+			MoveLinear:         moveLinear,
+			LinearIdentifier:   issue.Identifier,
+			LinearWebURL:       issue.URL,
 		})
 		counted[key] = true
 		noteProject(snap.Project.FullPath)
 	}
 
-	data := slack.DigestData{Team: team.Name, FailedRepos: failedRepos}
+	data := slack.DigestData{
+		Team: team.Name, FailedRepos: failedRepos,
+		LinearEnabled: linearState.enabled, LinearInReviewCount: linearState.inReviewCount,
+	}
 	// Only a single-project digest can drop the per-row project label.
 	if projectCount == 1 {
 		data.Project = projectLabel(soleProject)
@@ -439,15 +564,16 @@ func (s *Service) mention(ctx context.Context, cache map[string]slack.Mention, u
 type persistDigestInput struct {
 	// reuseID is set when a previous failed attempt already owns the row for
 	// this (team, run_date, slot, attempt).
-	reuseID       uuid.UUID
-	team          domain.Team
-	slot          string
-	runDate       time.Time
-	attempt       int
-	status        string
-	messageStatus string
-	mrCount       int
-	messages      []slack.Message
+	reuseID          uuid.UUID
+	team             domain.Team
+	slot             string
+	runDate          time.Time
+	attempt          int
+	status           string
+	messageStatus    string
+	mrCount          int
+	linearIssueCount int
+	messages         []slack.Message
 }
 
 // persistDigest writes the run and all its parts in one transaction: a run row
@@ -462,19 +588,21 @@ func (s *Service) persistDigest(ctx context.Context, in persistDigestInput) (uui
 		if in.reuseID != uuid.Nil {
 			runID = in.reuseID
 			if err := s.st.SetDigestRunStatus(ctx, repo_digestrun.SetStatusParams{
-				Status: in.status, Parts: int32(len(in.messages)), MrCount: int32(in.mrCount), ID: runID,
+				Status: in.status, Parts: int32(len(in.messages)), MrCount: int32(in.mrCount),
+				LinearIssueCount: int32(in.linearIssueCount), ID: runID,
 			}, store.WithTx(tx)); err != nil {
 				return fmt.Errorf("update digest run: %w", err)
 			}
 		} else {
 			created, err := s.st.CreateDigestRun(ctx, repo_digestrun.CreateParams{
-				Team:    in.team.Name,
-				Slot:    in.slot,
-				RunDate: in.runDate,
-				Attempt: int32(in.attempt),
-				Status:  in.status,
-				Parts:   int32(len(in.messages)),
-				MrCount: int32(in.mrCount),
+				Team:             in.team.Name,
+				Slot:             in.slot,
+				RunDate:          in.runDate,
+				Attempt:          int32(in.attempt),
+				Status:           in.status,
+				Parts:            int32(len(in.messages)),
+				MrCount:          int32(in.mrCount),
+				LinearIssueCount: int32(in.linearIssueCount),
 			}, store.WithTx(tx))
 			if err != nil {
 				return fmt.Errorf("create digest run: %w", err)

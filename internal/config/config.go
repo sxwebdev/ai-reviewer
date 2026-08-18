@@ -55,6 +55,7 @@ type Config struct {
 	Postgres PostgresConfig `yaml:"postgres"`
 	Jobs     JobsConfig     `yaml:"jobs"`
 	GitLab   GitLabConfig   `yaml:"gitlab"`
+	Linear   LinearConfig   `yaml:"linear"`
 	Slack    SlackConfig    `yaml:"slack"`
 	LLM      LLMConfig      `yaml:"llm"`
 	Review   ReviewConfig   `yaml:"review"`
@@ -150,6 +151,17 @@ type GitLabConfig struct {
 	MaxRetryAfter      time.Duration `yaml:"max_retry_after" env:"GITLAB_MAX_RETRY_AFTER" default:"60s" usage:"Upper bound on an honoured Retry-After header"`
 	InsecureSkipVerify bool          `yaml:"insecure_skip_verify" env:"GITLAB_INSECURE_SKIP_VERIFY" usage:"Skip TLS verification (self-managed only, explicit opt-in)"`
 	CACertPath         string        `yaml:"ca_cert_path" env:"GITLAB_CA_CERT_PATH" usage:"Optional custom CA bundle path"`
+}
+
+// LinearConfig holds the read-only Linear GraphQL connection used by digests.
+// The feature is enabled per application team by teams[].linear_team_ids; an
+// unused Linear block therefore needs no credential.
+type LinearConfig struct {
+	Endpoint      string        `yaml:"endpoint" default:"https://api.linear.app/graphql" validate:"required,url" usage:"Linear GraphQL endpoint"`
+	APIKey        Secret        `yaml:"api_key" env:"LINEAR_API_KEY" secret:"true" vault:"true" usage:"Linear personal API key used for read-only digest queries"`
+	Timeout       time.Duration `yaml:"timeout" default:"15s" usage:"Per-request timeout"`
+	MaxAttempts   int           `yaml:"max_attempts" default:"4" validate:"min=1" usage:"Retry budget per request (rate limit/5xx/transport)"`
+	MaxRetryAfter time.Duration `yaml:"max_retry_after" default:"60s" usage:"Upper bound on an honoured Retry-After header"`
 }
 
 // SlackConfig holds the digest delivery settings.
@@ -305,10 +317,11 @@ type NodeCoverage struct {
 // the expanded path (AI_REVIEWER_TEAMS_0_NAME), and an explicit leaf tag would
 // drop the index and collide across elements.
 type TeamConfig struct {
-	Name         string             `yaml:"name" validate:"required" usage:"Team name (unique, case-insensitive)"`
-	SlackChannel string             `yaml:"slack_channel" validate:"required" usage:"Slack channel id the digest is posted to"`
-	AIReview     TeamAIReviewConfig `yaml:"ai_review"`
-	Repositories []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
+	Name          string             `yaml:"name" validate:"required" usage:"Team name (unique, case-insensitive)"`
+	SlackChannel  string             `yaml:"slack_channel" validate:"required" usage:"Slack channel id the digest is posted to"`
+	AIReview      TeamAIReviewConfig `yaml:"ai_review"`
+	LinearTeamIDs []string           `yaml:"linear_team_ids" usage:"Linear team UUIDs whose In Review issues are included in the digest"`
+	Repositories  []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
 }
 
 // TeamAIReviewConfig toggles automated review for one team; the digest is

@@ -26,6 +26,10 @@ var allNames = []string{
 	"ai_review_findings_suppressed_total",
 	"gitlab_requests_total",
 	"gitlab_request_errors_total",
+	"ai_reviewer_linear_requests_total",
+	"ai_reviewer_linear_request_duration_seconds",
+	"ai_reviewer_linear_issues_in_review",
+	"ai_reviewer_digest_source_errors_total",
 	"merge_requests_scanned_total",
 	"merge_requests_waiting_human_review_total",
 	"merge_requests_with_changes_requested_total",
@@ -74,6 +78,14 @@ func vecCases() []vecCase {
 			func(l prometheus.Labels) error { _, err := GitLabRequestsTotal.GetMetricWith(l); return err }},
 		{"gitlab_request_errors_total", prometheus.Labels{"endpoint": "/projects/:key", "status": "500"},
 			func(l prometheus.Labels) error { _, err := GitLabRequestErrorsTotal.GetMetricWith(l); return err }},
+		{"ai_reviewer_linear_requests_total", prometheus.Labels{"operation": "viewer", "result": ResultOK},
+			func(l prometheus.Labels) error { _, err := LinearRequestsTotal.GetMetricWith(l); return err }},
+		{"ai_reviewer_linear_request_duration_seconds", prometheus.Labels{"operation": "viewer"},
+			func(l prometheus.Labels) error { _, err := LinearRequestDurationSeconds.GetMetricWith(l); return err }},
+		{"ai_reviewer_linear_issues_in_review", prometheus.Labels{"team": "payments"},
+			func(l prometheus.Labels) error { _, err := LinearIssuesInReview.GetMetricWith(l); return err }},
+		{"ai_reviewer_digest_source_errors_total", prometheus.Labels{"team": "payments", "source": SourceLinear},
+			func(l prometheus.Labels) error { _, err := DigestSourceErrorsTotal.GetMetricWith(l); return err }},
 		{"merge_requests_scanned_total", prometheus.Labels{"team": "payments"},
 			func(l prometheus.Labels) error { _, err := MergeRequestsScannedTotal.GetMetricWith(l); return err }},
 		{"merge_requests_waiting_human_review_total", prometheus.Labels{"team": "payments"},
@@ -278,6 +290,53 @@ func TestHelpersUpdateEveryCollector(t *testing.T) {
 		ObserveJob(kind, "completed", time.Second)
 		if got := testutil.ToFloat64(RiverJobsTotal.WithLabelValues(kind, "completed")); got != 1 {
 			t.Errorf("river_jobs_total = %v, want 1", got)
+		}
+	})
+
+	t.Run("ObserveLinearRequest", func(t *testing.T) {
+		operation := uniqueLabel("linear-operation")
+		before := testutil.CollectAndCount(LinearRequestDurationSeconds)
+		ObserveLinearRequest(operation, time.Second, nil)
+		if got := testutil.ToFloat64(LinearRequestsTotal.WithLabelValues(operation, ResultOK)); got != 1 {
+			t.Errorf("linear_requests_total = %v, want 1", got)
+		}
+		if got := testutil.CollectAndCount(LinearRequestDurationSeconds); got != before+1 {
+			t.Errorf("linear_request_duration_seconds series = %d, want %d", got, before+1)
+		}
+	})
+
+	t.Run("SetLinearIssuesInReview overwrites", func(t *testing.T) {
+		linearTeam := uniqueLabel("linear-team")
+		SetLinearIssuesInReview(linearTeam, 4)
+		SetLinearIssuesInReview(linearTeam, 1)
+		if got := testutil.ToFloat64(LinearIssuesInReview.WithLabelValues(linearTeam)); got != 1 {
+			t.Errorf("linear_issues_in_review = %v, want 1", got)
+		}
+	})
+
+	// An unknown count must go absent, never stale and never zero: this is the
+	// gauge an operator watches for work piling up in review, so a Linear outage
+	// that left the last good number behind read as a board that stopped moving,
+	// and a zero would have read as a board that drained.
+	t.Run("ClearLinearIssuesInReview removes the series", func(t *testing.T) {
+		linearTeam := uniqueLabel("linear-cleared-team")
+		before := testutil.CollectAndCount(LinearIssuesInReview)
+		SetLinearIssuesInReview(linearTeam, 8)
+		if got := testutil.CollectAndCount(LinearIssuesInReview); got != before+1 {
+			t.Fatalf("series = %d, want %d after publishing a count", got, before+1)
+		}
+		ClearLinearIssuesInReview(linearTeam)
+		if got := testutil.CollectAndCount(LinearIssuesInReview); got != before {
+			t.Errorf("series = %d, want %d: the team's series is still exported", got, before)
+		}
+	})
+
+	t.Run("DigestSourceError", func(t *testing.T) {
+		sourceTeam := uniqueLabel("source-error-team")
+		before := testutil.ToFloat64(DigestSourceErrorsTotal.WithLabelValues(sourceTeam, SourceLinear))
+		DigestSourceError(sourceTeam, SourceLinear)
+		if got := testutil.ToFloat64(DigestSourceErrorsTotal.WithLabelValues(sourceTeam, SourceLinear)); got != before+1 {
+			t.Errorf("digest_source_errors_total = %v, want %v", got, before+1)
 		}
 	})
 

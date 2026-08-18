@@ -102,6 +102,12 @@ Two defaults are worth reading before you trust the table:
 | `AI_REVIEWER_GITLAB_MAX_RETRY_AFTER`              | `gitlab.max_retry_after`             | `60s`               |
 | `AI_REVIEWER_GITLAB_INSECURE_SKIP_VERIFY`         | `gitlab.insecure_skip_verify`        | `false`             |
 | `AI_REVIEWER_GITLAB_CA_CERT_PATH`                 | `gitlab.ca_cert_path`                | —                   |
+| **Linear (optional digest source)**               |                                      |                     |
+| `AI_REVIEWER_LINEAR_ENDPOINT`                     | `linear.endpoint`                    | `https://api.linear.app/graphql` |
+| ★ `AI_REVIEWER_LINEAR_API_KEY`                    | `linear.api_key`                     | —                   |
+| `AI_REVIEWER_LINEAR_TIMEOUT`                      | `linear.timeout`                     | `15s`               |
+| `AI_REVIEWER_LINEAR_MAX_ATTEMPTS`                 | `linear.max_attempts`                | `4`                 |
+| `AI_REVIEWER_LINEAR_MAX_RETRY_AFTER`              | `linear.max_retry_after`             | `60s`               |
 | **Slack**                                         |                                      |                     |
 | ★ `AI_REVIEWER_SLACK_TOKEN`                       | `slack.token`                        | —                   |
 | `AI_REVIEWER_SLACK_DIRECTORY_TTL`                 | `slack.directory_ttl`                | `15m`               |
@@ -156,6 +162,7 @@ Two defaults are worth reading before you trust the table:
 | `AI_REVIEWER_TEAMS_N_SLACK_CHANNEL`               | `teams[N].slack_channel`             | —                   |
 | `AI_REVIEWER_TEAMS_N_REPOSITORIES`                | `teams[N].repositories` (comma-separated) | —              |
 | `AI_REVIEWER_TEAMS_N_AI_REVIEW_ENABLED`           | `teams[N].ai_review.enabled`         | —                   |
+| `AI_REVIEWER_TEAMS_N_LINEAR_TEAM_IDS`             | `teams[N].linear_team_ids` (comma-separated UUIDs) | —       |
 
 Note the two that break the pattern: the Claude credentials are
 `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN` and `AI_REVIEWER_ANTHROPIC_API_KEY`, not
@@ -173,6 +180,19 @@ an id from a handle — Slack lower-cases handles — so `wendy` is a handle and
 `W01WENDY` is an id. An override that resolves to nothing, or to more than one
 person, is a configuration error rather than a quiet fall-back to name matching:
 `doctor` resolves every entry and prints what each became.
+
+Linear is enabled per application team by `teams[].linear_team_ids`. Get each
+UUID by opening that team in Linear and choosing `Cmd/Ctrl+K` → **Copy model
+UUID**. The example UUID from Linear's API documentation is not your team id.
+When no team declares an id, the Linear client is not built and no key is
+required. When at least one id is present, `linear.api_key` becomes required.
+The digest shows the total `In Review` count and links an MR to a Linear issue
+by identifier in the MR title, falling back to the source branch. Linked MRs
+with at least one approval stop notifying their remaining reviewers; if the
+issue is still `In Review`, the MR author is reminded to advance it. Zero
+approvals, a missing issue, or any `REQUESTED_CHANGES` verdict keep the ordinary
+GitLab flow. The status name is an invariant, not a setting: `doctor` rejects a
+team without exactly one case-insensitive `In Review` workflow state.
 
 `llm.claude.passthrough_env` is the seam for a deployment whose `claude` needs a
 variable the built-in inheritance allowlist does not carry (see [Security
@@ -206,7 +226,7 @@ carries the prefix. Vault is registered last, so it has the final say over both
 the file and the environment.
 
 The Vault-backed fields are the ones marked ★ above: `AI_REVIEWER_GITLAB_TOKEN`,
-`AI_REVIEWER_SLACK_TOKEN`, `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`,
+`AI_REVIEWER_LINEAR_API_KEY`, `AI_REVIEWER_SLACK_TOKEN`, `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`,
 `AI_REVIEWER_ANTHROPIC_API_KEY`, `AI_REVIEWER_POSTGRES_USERNAME`,
 `AI_REVIEWER_POSTGRES_PASSWORD`.
 
