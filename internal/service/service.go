@@ -112,9 +112,17 @@ type SlackAPI interface {
 }
 
 // LinearAPI is the read-only Linear surface the digest needs.
+//
+// GetTeam is here for its workflow states, not its name: "is this card before In
+// Review" is a question about one team's own column order, and the issue queries
+// carry each issue's state but never the board it sits on. One call per
+// configured Linear team per digest build — bounded by the configuration, not by
+// the merge requests, which is why it does not need the batching §6 gives the
+// issue lookups.
 type LinearAPI interface {
 	ListIssuesInReview(ctx context.Context, teamIDs []string) ([]linear.Issue, error)
 	ListIssuesByNumbers(ctx context.Context, teamIDs []string, numbers []int) ([]linear.Issue, error)
+	GetTeam(ctx context.Context, id string) (*linear.Team, error)
 }
 
 // RiskSettings configures the deterministic risk score fed to the engine.

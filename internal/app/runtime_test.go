@@ -80,6 +80,39 @@ func TestLinearClientIsBuiltOnlyWhenUsed(t *testing.T) {
 	}
 }
 
+// Teams resolves each team's schedule and must not hand two teams the same
+// backing array: the resolver returns the global slice for an inheriting team, so
+// without the copy one team's append would rewrite the other's schedule.
+func TestTeamsResolveDigestSchedulePerTeam(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	cfg.Digest.Timezone = "Europe/Moscow"
+	cfg.Digest.Slots = []string{"09:00", "17:30"}
+	cfg.Teams = append(cfg.Teams, config.TeamConfig{
+		Name: "lisbon", SlackChannel: "C9", Repositories: []string{"x/y"},
+		Digest: config.TeamDigestConfig{Timezone: "Europe/Lisbon", Slots: []string{"10:00"}},
+	})
+
+	teams := Teams(cfg)
+	if len(teams) != 3 {
+		t.Fatalf("teams = %d, want the fixture's two plus the appended one", len(teams))
+	}
+	inherited, overridden := teams[0], teams[2]
+	if !slices.Equal(inherited.DigestSlots, []string{"09:00", "17:30"}) || inherited.DigestTimezone != "Europe/Moscow" {
+		t.Errorf("inheriting team = %v %q", inherited.DigestSlots, inherited.DigestTimezone)
+	}
+	if !slices.Equal(overridden.DigestSlots, []string{"10:00"}) || overridden.DigestTimezone != "Europe/Lisbon" {
+		t.Errorf("overriding team = %v %q", overridden.DigestSlots, overridden.DigestTimezone)
+	}
+
+	// The copy: mutating the resolved slice must not reach the config the next
+	// call reads from.
+	inherited.DigestSlots[0] = "23:59"
+	if got := Teams(cfg)[0].DigestSlots[0]; got != "09:00" {
+		t.Errorf("a team's slice aliases the global schedule: re-read gives %q", got)
+	}
+}
+
 // The absent client must reach the service as a nil *interface*. Passing the
 // pointer straight through stores a typed nil, which is non-nil as an
 // interface, so service.gatherLinear's "not configured" guard could never fire

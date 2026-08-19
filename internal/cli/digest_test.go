@@ -45,7 +45,7 @@ func digestFixture(t *testing.T) (*jobs.Queue, *store.Store, domain.Team) {
 
 func testSchedule(t *testing.T) scheduler.Daily {
 	t.Helper()
-	s, err := scheduler.NewDigest()
+	s, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestDigestForceTakesTheNextAttempt(t *testing.T) {
 func TestDigestQueuesAFreshSlot(t *testing.T) {
 	q, st, team := digestFixture(t)
 	sched := testSchedule(t)
-	now := time.Date(2026, 8, 13, 13, 30, 0, 0, time.UTC) // 16:30 Moscow
+	now := time.Date(2026, 8, 13, 13, 30, 0, 0, time.UTC) // 16:30 Moscow, inside the 14:00 slot
 
 	if err := enqueueDigest(t.Context(), q, st, team, sched, now, false); err != nil {
 		t.Fatalf("enqueueDigest: %v", err)

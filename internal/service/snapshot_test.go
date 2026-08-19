@@ -532,6 +532,73 @@ func TestSnapshotDatesAnUncommentedRequestedChangesVerdict(t *testing.T) {
 	})
 }
 
+// ApprovalsKnown is the whole fix for the outage that made the Linear completion
+// rules inert with nothing reporting it, so all three of its cases are pinned:
+// loaded, refused, and never asked for.
+func TestSnapshotApprovalsKnownSeparatesUnapprovedFromUnreadable(t *testing.T) {
+	t.Parallel()
+	approval := &gitlab.Approvals{ApprovedBy: []gitlab.ApprovedBy{{
+		User: gitlab.User{ID: 77, Username: "approver"},
+	}}}
+
+	t.Run("read", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		proj := testProject()
+		seedGitLab(h.fake, proj, testMR(testMRIID))
+		setApprovals(h.fake, proj, testMRIID, approval)
+
+		loaded, err := h.svc.newSnapshotLoader(depthDigest).load(t.Context(), testTeam, proj, testMRIID)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if !loaded.Snapshot.ApprovalsKnown || len(loaded.Snapshot.ApprovedBy) != 1 {
+			t.Errorf("snapshot = known %v, approvers %d; want known with one approver",
+				loaded.Snapshot.ApprovalsKnown, len(loaded.Snapshot.ApprovedBy))
+		}
+	})
+
+	t.Run("refused", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		proj := testProject()
+		seedGitLab(h.fake, proj, testMR(testMRIID))
+		// The approval exists; GitLab will not say so. An empty ApprovedBy here
+		// must not be readable as "nobody approved".
+		setApprovals(h.fake, proj, testMRIID, approval)
+		h.gl.failApprovals = &gitlab.APIError{Status: 403, Path: "/approvals"}
+
+		loaded, err := h.svc.newSnapshotLoader(depthDigest).load(t.Context(), testTeam, proj, testMRIID)
+		if err != nil {
+			t.Fatalf("load: %v — losing approvals must not cost the snapshot", err)
+		}
+		if loaded.Snapshot.ApprovalsKnown {
+			t.Error("a refused /approvals still claimed the approval list was complete")
+		}
+	})
+
+	t.Run("never asked", func(t *testing.T) {
+		t.Parallel()
+		h := newHarness(t)
+		proj := testProject()
+		seedGitLab(h.fake, proj, testMR(testMRIID))
+		setApprovals(h.fake, proj, testMRIID, approval)
+
+		// The review path does not pay for /approvals, so "unknown" is its honest
+		// answer too — the flag is a claim about completeness, not about failure.
+		loaded, err := h.svc.newSnapshotLoader(depthReview).load(t.Context(), testTeam, proj, testMRIID)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if loaded.Snapshot.ApprovalsKnown {
+			t.Error("depthReview claimed to know the approvals it never requested")
+		}
+		if h.gl.approvalCalls != 0 {
+			t.Errorf("approval calls = %d, want 0 at depthReview", h.gl.approvalCalls)
+		}
+	})
+}
+
 func TestSnapshotIsLoadedOncePerMergeRequest(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

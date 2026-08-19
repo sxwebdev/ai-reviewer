@@ -340,7 +340,7 @@ func TestTrackedRecordsTerminalState(t *testing.T) {
 // yesterday's digest at 03:00.
 func TestDigestSlotForNow(t *testing.T) {
 	t.Parallel()
-	sched, err := scheduler.NewDigest()
+	sched, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,11 +358,13 @@ func TestDigestSlotForNow(t *testing.T) {
 		// the slot elapsed, so these must always insert.
 		{"exactly on the morning slot", at(9, 0), "09:00", "2026-08-13", true},
 		{"a moment after the morning slot", at(9, 0).Add(31 * time.Second), "09:00", "2026-08-13", true},
-		{"exactly on the afternoon slot", at(16, 30), "16:30", "2026-08-13", true},
+		{"exactly on the midday slot", at(14, 0), "14:00", "2026-08-13", true},
+		{"exactly on the evening slot", at(17, 30), "17:30", "2026-08-13", true},
 		// The RunOnStart firings: a leader elected later in the day still owes
 		// today's slot, and a repeat is absorbed by digest_runs' unique index.
 		{"a leader elected at 11:00 still owes the 09:00 slot", at(11, 0), "09:00", "2026-08-13", true},
-		{"late evening owes the 16:30 slot", at(23, 59), "16:30", "2026-08-13", true},
+		{"a leader elected at 16:00 owes the 14:00 slot", at(16, 0), "14:00", "2026-08-13", true},
+		{"late evening owes the 17:30 slot", at(23, 59), "17:30", "2026-08-13", true},
 		// Before the first slot of the day the instant belongs to yesterday's
 		// last one. Yesterday's digest is not worth sending.
 		{"03:00 belongs to yesterday and is refused", at(3, 0), "", "", false},
@@ -396,6 +398,15 @@ func TestDigestSlotForNow(t *testing.T) {
 	}
 }
 
+// scheduledTeam is a domain.Team carrying a resolved schedule, which is what
+// app.Teams hands the service for every configured team.
+func scheduledTeam(name string, slots ...string) domain.Team {
+	if len(slots) == 0 {
+		slots = []string{"09:00", "14:00", "17:30"}
+	}
+	return domain.Team{Name: name, DigestSlots: slots, DigestTimezone: "Europe/Moscow"}
+}
+
 // TestDigestPeriodicJobRunsOnStart pins the flag itself. digestSlotForNow is
 // only reachable from the periodic constructor, and with RunOnStart off the
 // constructor is never called outside a scheduled firing — which is exactly the
@@ -406,13 +417,13 @@ func TestDigestSlotForNow(t *testing.T) {
 // whose outcome depends on the wall-clock hour it runs at.
 func TestDigestPeriodicJobRunsOnStart(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Teams: []domain.Team{{Name: "payments"}}}.normalized()
-	sched, err := scheduler.NewDigest()
+	cfg := Config{Teams: []domain.Team{scheduledTeam("payments")}}.normalized()
+	schedules, err := teamSchedules(cfg.Teams)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	jobs := periodicJobs(cfg, sched)
+	jobs := periodicJobs(cfg, schedules)
 	digest := jobs[len(jobs)-1] // scan, cleanup, then one per team
 
 	opts := reflect.ValueOf(digest).Elem().FieldByName("opts")
@@ -432,21 +443,28 @@ func TestDigestPeriodicJobRunsOnStart(t *testing.T) {
 // only the first team's digest, silently.
 func TestPeriodicJobsCoverEveryTeam(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Teams: []domain.Team{{Name: "payments"}, {Name: "platform"}}}.normalized()
-	sched, err := scheduler.NewDigest()
+	cfg := Config{Teams: []domain.Team{scheduledTeam("payments"), scheduledTeam("platform")}}.normalized()
+	schedules, err := teamSchedules(cfg.Teams)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	got := periodicJobs(cfg, sched)
+	got := periodicJobs(cfg, schedules)
 	if len(got) != 2+len(cfg.Teams) {
 		t.Fatalf("periodic jobs = %d, want scan + cleanup + one digest per team", len(got))
 	}
 
 	// No teams still leaves the two interval jobs: cleanup must run even in a
 	// deployment that has not been given a team yet.
-	if got := periodicJobs(Config{}.normalized(), sched); len(got) != 2 {
+	if got := periodicJobs(Config{}.normalized(), nil); len(got) != 2 {
 		t.Errorf("periodic jobs without teams = %d, want scan + cleanup", len(got))
+	}
+
+	// A team whose schedule is missing from the map is skipped rather than
+	// scheduled against another team's: the two cannot drift today, and if they
+	// ever do, a digest in the wrong zone is worse than a digest not sent.
+	if got := periodicJobs(cfg, map[string]scheduler.Daily{"payments": schedules["payments"]}); len(got) != 3 {
+		t.Errorf("periodic jobs with one schedule missing = %d, want scan + cleanup + one digest", len(got))
 	}
 }
 
@@ -490,11 +508,12 @@ func TestDigestWorkerUsesTheScheduleAccessor(t *testing.T) {
 	svc := &Service{log: quietLogger(), cfg: Config{
 		Teams:            []domain.Team{{Name: "payments"}},
 		SlackSendEnabled: false, // returns before the queue is touched
-	}}
+	},
+		// Times set, Loc deliberately nil — the shape a hand-built schedule has.
+		schedules: map[string]scheduler.Daily{"payments": {Times: []scheduler.Clock{{Hour: 9}}}},
+	}
 	dg := &recordingDigester{}
-	// Times set, Loc deliberately nil — the shape a hand-built schedule has.
-	w := &DigestWorker{log: quietLogger(), svc: svc, digester: dg,
-		schedule: scheduler.Daily{Times: []scheduler.Clock{{Hour: 9}}}}
+	w := &DigestWorker{log: quietLogger(), svc: svc, digester: dg}
 
 	err := w.Work(t.Context(), testJob(DigestArgs{Team: "payments", Slot: "09:00", RunDate: "2026-08-13"}))
 	if err != nil {

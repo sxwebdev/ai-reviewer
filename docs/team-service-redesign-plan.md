@@ -41,7 +41,7 @@
 | Публикация и Slack — inline в потоке    | **Вся отложенная работа — джобы River** (`publish_review`, `slack_send`, …)  |
 | Web UI + ручное approve/reject/publish  | Automation-first: валидные findings публикуются автоматически                |
 | `serve` = локальный UI + воркер         | `start` = production-сервис на `/mx` (health/metrics/graceful/ops)           |
-| watch-daemon по назначенным MR          | River periodic job `scan` + periodic job `digest` (09:00 / 16:30 MSK)        |
+| watch-daemon по назначенным MR          | River periodic job `scan` + periodic job `digest` (09:00 / 14:00 / 17:30 MSK) |
 | Токен в `config.yaml`                   | **YAML → env → Vault** (`xconfigvault`), тип `config.Secret`                 |
 | `log/slog` + redacting slog-handler     | **`mx/logger` (zap)** + redaction как `zapcore.Core`-обёртка                 |
 | Только REST GitLab                      | REST + **точечный GraphQL** (review state ревьюеров)                         |
@@ -73,7 +73,7 @@ binary/vendor/generated, scrubbing секретов; провайдер Claude C
    от имени service account;
 3. классифицирует MR: кому из ревьюеров нужно действие, у каких MR unresolved threads,
    merge conflicts и **упавшие пайплайны**;
-4. дважды в день (09:00 и 16:30 Europe/Moscow) шлёт per-team Slack digest с тегами реальных Slack-пользователей;
+4. трижды в день (09:00, 14:00 и 17:30 Europe/Moscow) шлёт per-team Slack digest с тегами реальных Slack-пользователей;
 5. отдаёт health/readiness/metrics, корректно завершается по SIGTERM (drain River-джобов).
 
 **Никогда не делает** (жёсткие инварианты):
@@ -181,7 +181,7 @@ internal/
   models/       сгенерированные pgxgen-модели
   jobs/         River: client-сервис, воркеры (scan / review / publish_review / digest /
                 slack_send / cleanup), periodic-джобы, enqueue-API
-  scheduler/    Daily-расписание 09:00 / 16:30 Europe/Moscow (river.PeriodicSchedule)
+  scheduler/    Daily-расписание на команду из её digest.slots/timezone (river.PeriodicSchedule)
   gitlab/       REST v4 + GraphQL + маркеры + публикация findings
   slack/        API-клиент (users.list, chat.postMessage, auth.test) + Block Kit builder
   match/        GitLab user → Slack user (matcher + in-memory справочник с TTL и индексами)
@@ -321,7 +321,7 @@ CREATE UNIQUE INDEX mr_findings_fp_uniq ON mr_findings (project_id, mr_iid, fing
 CREATE TABLE digest_runs (
     id          uuid PRIMARY KEY DEFAULT uuidv7(),
     team        text        NOT NULL,
-    slot        text        NOT NULL,       -- '09:00' | '16:30' | 'manual'
+    slot        text        NOT NULL,       -- '09:00' | '14:00' | '17:30' | 'manual'
     run_date    date        NOT NULL,       -- дата в Europe/Moscow
     -- attempt: 0 — плановый прогон слота; 1,2,… — явные ручные повторы.
     -- Именно он делает `ai-reviewer digest --force` возможным без снятия
@@ -428,7 +428,7 @@ ai-reviewer migrations create  -p ./sql/migrations -name add_x
 | `scan_repo`      | из `scan`                                       | `default` | `ByArgs` (project_path), `ByState` in-flight     | 3           | 10m     |
 | `review`         | из `scan_repo`, из CLI `review`                 | `review`  | `ByArgs` (project_id, mr_iid, head_sha)          | **1**       | 30m     |
 | `publish_review` | из `review` (в одной транзакции), из `scan_repo` | `publish` | `ByArgs` (review_id), `ByState` in-flight        | 10          | 5m      |
-| `digest`         | periodic `Daily{09:00,16:30 MSK}`, CLI `digest` | `default` | `ByArgs` (team, slot, run_date, attempt)         | 3           | 10m     |
+| `digest`         | periodic `Daily{team's slots, team's TZ}`, CLI `digest` | `default` | `ByArgs` (team, slot, run_date, attempt) | 3           | 10m     |
 | `slack_send`     | из `digest`                                     | `slack`   | `ByArgs` (digest_message_id), `ByState` in-flight | 10          | 2m      |
 | `cleanup`        | periodic 1h                                     | `default` | `ByState` in-flight, по kind                     | 1           | 5m      |
 
@@ -573,9 +573,36 @@ type Daily struct {
 func (d Daily) Next(current time.Time) time.Time
 ```
 
-09:00 и 16:30 — продуктовое требование, в конфиг не выносятся. Таймзона задаётся явно
-(`time.LoadLocation("Europe/Moscow")`), локальная TZ контейнера не используется;
-в `main` добавляется `import _ "time/tzdata"`, чтобы база таймзон была вшита в бинарь.
+Расписание задаётся в `digest` (`timezone` + `slots`) и переопределяется per team в
+`teams[].digest`; по умолчанию Europe/Moscow и 09:00, 14:00, 17:30. Зона всегда задаётся
+явно через `time.LoadLocation`, локальная TZ контейнера не используется; в `internal/scheduler`
+есть `import _ "time/tzdata"`, чтобы база таймзон была вшита в бинарь.
+
+> Уточнение 18 августа 2026: слотов стало три (добавлен 14:00, последний сдвинут
+> с 16:30 на 17:30), и всё расписание — и времена, и зона — переехало из констант в
+> конфиг, с переопределением на уровне команды.
+>
+> Исходное решение «в конфиг не выносятся» держалось на том, что это продуктовое
+> требование. Требование продуктовое, но оно *меняется*, а каждая смена была пересборкой
+> плюс правкой всех комментариев, которые эти значения повторяли. Значения теперь
+> записаны ровно в двух местах: тег `default:` и переопределение команды.
+>
+> Зона стала per team по той же причине, по которой per team стали слоты: слот означает
+> «09:00 там, где команда», и распределённой команде выражение её утра в чужой зоне —
+> самая незаметная из ошибок, потому что digest всё равно приходит. Половины наследуются
+> независимо: команда в другой стране обычно сохраняет корпоративные времена, а команда со
+> своим ритмом — корпоративную зону.
+>
+> `scheduler.DigestTZ` и `config.DigestLocation` удалены: одной зоны больше нет, а две
+> копии строки `"Europe/Moscow"` были в одной правке от сервиса, который валидирует одну
+> зону, а планирует в другой.
+>
+> Число слотов нигде не несущее (`Next` и `SlotAt` идут по `Times`), а вот значения
+> несущие: это имена в `digest_runs.slot`. Строки под снятым именем его сохраняют —
+> корректная история, миграции не требует. То же и при смене зоны: имена слотов остаются,
+> а моменты, которые они означают, сдвигаются. На практике: если деплой приходит после
+> нового последнего слота в день, когда снятый последний уже отработал, новый слот тоже
+> будет собран, и команда получит один лишний digest. Однократно.
 
 `digest_runs` с уникальным индексом `(team, run_date, slot, attempt)` даёт второй слой
 идемпотентности и журнал для отладки/метрик: плановый прогон всегда `attempt = 0`, поэтому
@@ -1104,7 +1131,13 @@ Slack возвращает ошибки с HTTP 200 и `{"ok":false,"error":"...
 `ratelimited` ретраится с уважением `Retry-After` (`users.list` — Tier 2, ~20 запросов/минуту).
 
 **Scopes бота:** `users:read`, `users:read.email` (иначе email в `users.list` недоступен),
-`chat:write` (бот должен быть в каналах).
+`chat:write` (бот должен быть в каналах), `channels:read` — и `groups:read` для приватных
+каналов.
+
+> Уточнение 18 августа 2026: `channels:read` в списке не было, хотя `conversations.info`
+> вызывался с самого начала. Список перечислял то, что нужно доставке, и пропускал то, что
+> нужно диагностике: без этого скоупа digest уходит нормально, а `doctor` падает на проверке
+> членства в канале.
 
 ### 13.2 Matcher
 
@@ -1592,7 +1625,7 @@ Claude CLI — через fake-executable (`os.Args[0]` + `TestHelperProcess`, �
 
 **Scheduler**
 
-- `Daily.Next` даёт ровно 09:00 и 16:30 Europe/Moscow при `TZ=UTC` и `TZ=Asia/Tokyo`;
+- `Daily.Next` даёт ровно настроенные слоты в настроенной зоне при `TZ=UTC` и `TZ=Asia/Tokyo`;
 - переход через полночь и через сутки; корректная работа как `river.PeriodicSchedule`.
 
 **Конкуренция (River)**
@@ -1633,7 +1666,7 @@ Claude CLI — через fake-executable (`os.Args[0]` + `TestHelperProcess`, �
 Разделы: overview; architecture; team model; configuration (YAML/env/Vault); PostgreSQL и миграции;
 GitLab permissions (PAT service account, scope `api`, роль не ниже Reporter — в том числе ради
 видимости `head_pipeline`); Slack permissions
-(`users:read`, `users:read.email`, `chat:write`); Claude auth modes; subscription token setup
+(`users:read`, `users:read.email`, `chat:write`, `channels:read`); Claude auth modes; subscription token setup
 (`claude setup-token` → Vault/Secret); API key setup; Docker; Kubernetes (реплики, init-контейнер
 миграций, probes, emptyDir); dry-run modes; AI review scheduler; Slack digest scheduler;
 Europe/Moscow; модель состояния (Postgres + GitLab-маркеры); user matching; security model;
@@ -1757,7 +1790,7 @@ GitLab self-managed ограничивает запросы на пользов�
       совпадают с реально читаемыми (проверено тестом на derived-имена)
 - [ ] Slack digest, user matching, unresolved threads, conflicts, **упавшие пайплайны**,
       review requirements реализованы
-- [ ] 09:00 / 16:30 Europe/Moscow реализованы и покрыты тестами независимо от TZ машины
+- [ ] расписание из конфига (per team, с наследованием) покрыто тестами независимо от TZ машины
 - [ ] Slack dry-run и AI publish dry-run реализованы как полноценные прогоны
 - [ ] health/readiness/metrics работают, graceful shutdown чистит worktree'ы
 - [ ] README и CLAUDE.md переписаны, Docker/K8s деплой описан

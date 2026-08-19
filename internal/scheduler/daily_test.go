@@ -1,11 +1,21 @@
 package scheduler
 
 import (
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/riverqueue/river"
 )
+
+// testTimes is this package's own fixture, deliberately not the product
+// schedule: Daily's job is snapping and ordering, and a test that read the
+// configured default would start failing whenever a product decision changed
+// without anything in this package being wrong. The default itself is pinned in
+// internal/config, next to the tag that declares it.
+const testTZ = "Europe/Moscow"
+
+var testTimes = []Clock{{Hour: 9, Minute: 0}, {Hour: 14, Minute: 0}, {Hour: 17, Minute: 30}}
 
 // setLocal points time.Local at name for the duration of the test. Every
 // assertion below constructs its times explicitly, so the schedule must be
@@ -39,8 +49,8 @@ func TestDailyNext(t *testing.T) {
 		t.Run("host="+host, func(t *testing.T) {
 			setLocal(t, host)
 
-			msk := mustLoad(t, DigestTZ)
-			d := Daily{Times: DigestTimes, Loc: msk}
+			msk := mustLoad(t, testTZ)
+			d := Daily{Times: testTimes, Loc: msk}
 
 			at := func(y int, m time.Month, day, h, min, sec int) time.Time {
 				return time.Date(y, m, day, h, min, sec, 0, msk)
@@ -56,19 +66,32 @@ func TestDailyNext(t *testing.T) {
 				{"one second before first slot", at(2026, 8, 13, 8, 59, 59), at(2026, 8, 13, 9, 0, 0)},
 				// Strictly-after is the River contract: called with the instant a run
 				// fired, Next must return the following run, not the same one.
-				{"exactly at first slot", at(2026, 8, 13, 9, 0, 0), at(2026, 8, 13, 16, 30, 0)},
-				{"one second after first slot", at(2026, 8, 13, 9, 0, 1), at(2026, 8, 13, 16, 30, 0)},
-				{"between slots", at(2026, 8, 13, 12, 0, 0), at(2026, 8, 13, 16, 30, 0)},
-				{"exactly at second slot", at(2026, 8, 13, 16, 30, 0), at(2026, 8, 14, 9, 0, 0)},
-				{"after last slot", at(2026, 8, 13, 17, 0, 0), at(2026, 8, 14, 9, 0, 0)},
+				{"exactly at first slot", at(2026, 8, 13, 9, 0, 0), at(2026, 8, 13, 14, 0, 0)},
+				{"one second after first slot", at(2026, 8, 13, 9, 0, 1), at(2026, 8, 13, 14, 0, 0)},
+				{"between first and middle", at(2026, 8, 13, 12, 0, 0), at(2026, 8, 13, 14, 0, 0)},
+				{"exactly at middle slot", at(2026, 8, 13, 14, 0, 0), at(2026, 8, 13, 17, 30, 0)},
+				{"between middle and last", at(2026, 8, 13, 16, 0, 0), at(2026, 8, 13, 17, 30, 0)},
+				{"one second before last slot", at(2026, 8, 13, 17, 29, 59), at(2026, 8, 13, 17, 30, 0)},
+				{"exactly at last slot", at(2026, 8, 13, 17, 30, 0), at(2026, 8, 14, 9, 0, 0)},
+				{"after last slot", at(2026, 8, 13, 18, 0, 0), at(2026, 8, 14, 9, 0, 0)},
 				{"across midnight", at(2026, 8, 13, 23, 59, 59), at(2026, 8, 14, 9, 0, 0)},
 				{"across month boundary", at(2026, 8, 31, 20, 0, 0), at(2026, 9, 1, 9, 0, 0)},
 				{"across year boundary", at(2026, 12, 31, 20, 0, 0), at(2027, 1, 1, 9, 0, 0)},
 				// 05:30Z is 08:30 MSK: the caller's zone must not matter.
 				{"current in UTC", time.Date(2026, 8, 13, 5, 30, 0, 0, time.UTC), at(2026, 8, 13, 9, 0, 0)},
-				// 23:00 Tokyo on the 13th is 17:00 MSK — past both slots, so the
-				// answer is the 14th even though the host date already rolled over.
-				{"current in host zone", time.Date(2026, 8, 13, 23, 0, 0, 0, time.Local), at(2026, 8, 14, 9, 0, 0)},
+				// Zones are named explicitly rather than taken from time.Local: the
+				// row used to build its instant from the host, so the instant under
+				// test differed between the two subtests and they agreed only because
+				// both answers happened to be 09:00 the next day. The middle slot
+				// ended that coincidence, which is the bug this shape prevents.
+				//
+				// 23:00 UTC on the 13th is already 02:00 MSK on the 14th, so the next
+				// firing is that morning.
+				{"instant past Moscow midnight", time.Date(2026, 8, 13, 23, 0, 0, 0, time.UTC), at(2026, 8, 14, 9, 0, 0)},
+				// 23:00 Tokyo on the 13th is 17:00 MSK — the host date has rolled over
+				// while Moscow still has a slot to come, so a naive local-time
+				// implementation answers the 14th here and is wrong.
+				{"instant in a third zone", time.Date(2026, 8, 13, 23, 0, 0, 0, mustLoad(t, "Asia/Tokyo")), at(2026, 8, 13, 17, 30, 0)},
 			}
 
 			for _, tc := range cases {
@@ -92,8 +115,8 @@ func TestDailyNext(t *testing.T) {
 					if !slot.At.Equal(got) {
 						t.Errorf("SlotAt(%s).At = %s, want the same instant", got, slot.At)
 					}
-					if slot.Name != "09:00" && slot.Name != "16:30" {
-						t.Errorf("slot = %q, want one of the two product slots", slot.Name)
+					if !slices.ContainsFunc(testTimes, func(c Clock) bool { return c.String() == slot.Name }) {
+						t.Errorf("slot = %q, want one of the schedule under test %v", slot.Name, testTimes)
 					}
 				})
 			}
@@ -105,14 +128,16 @@ func TestDailyNext(t *testing.T) {
 // way River does, and pins the exact sequence across a day boundary.
 func TestDailyNextSequence(t *testing.T) {
 	setLocal(t, "Asia/Tokyo")
-	msk := mustLoad(t, DigestTZ)
-	d := Daily{Times: DigestTimes, Loc: msk}
+	msk := mustLoad(t, testTZ)
+	d := Daily{Times: testTimes, Loc: msk}
 
 	want := []time.Time{
 		time.Date(2026, 8, 13, 9, 0, 0, 0, msk),
-		time.Date(2026, 8, 13, 16, 30, 0, 0, msk),
+		time.Date(2026, 8, 13, 14, 0, 0, 0, msk),
+		time.Date(2026, 8, 13, 17, 30, 0, 0, msk),
 		time.Date(2026, 8, 14, 9, 0, 0, 0, msk),
-		time.Date(2026, 8, 14, 16, 30, 0, 0, msk),
+		time.Date(2026, 8, 14, 14, 0, 0, 0, msk),
+		time.Date(2026, 8, 14, 17, 30, 0, 0, msk),
 		time.Date(2026, 8, 15, 9, 0, 0, 0, msk),
 	}
 
@@ -161,11 +186,11 @@ func TestDailyNextAcrossDST(t *testing.T) {
 }
 
 func TestDailyNextIsRiverPeriodicSchedule(t *testing.T) {
-	msk := mustLoad(t, DigestTZ)
-	var sched river.PeriodicSchedule = Daily{Times: DigestTimes, Loc: msk}
+	msk := mustLoad(t, testTZ)
+	var sched river.PeriodicSchedule = Daily{Times: testTimes, Loc: msk}
 
 	got := sched.Next(time.Date(2026, 8, 13, 10, 0, 0, 0, msk))
-	if want := time.Date(2026, 8, 13, 16, 30, 0, 0, msk); !got.Equal(want) {
+	if want := time.Date(2026, 8, 13, 14, 0, 0, 0, msk); !got.Equal(want) {
 		t.Errorf("through river.PeriodicSchedule: got %s, want %s", got, want)
 	}
 }
@@ -195,41 +220,107 @@ func TestDailyNextDegenerate(t *testing.T) {
 func TestNewDigest(t *testing.T) {
 	setLocal(t, "Asia/Tokyo")
 
-	d, err := NewDigest()
+	d, err := NewDigest([]string{"09:00", "14:00", "17:30"}, testTZ)
 	if err != nil {
 		t.Fatalf("NewDigest: %v", err)
 	}
-	if d.Loc == nil || d.Loc.String() != DigestTZ {
-		t.Fatalf("location = %v, want %s", d.Loc, DigestTZ)
+	if d.Loc == nil || d.Loc.String() != testTZ {
+		t.Fatalf("location = %v, want %s", d.Loc, testTZ)
 	}
 
-	// 09:00 and 16:30 Europe/Moscow, in wall-clock terms, are the product
-	// requirement — pin them here so a config-driven "improvement" fails loudly.
-	start := time.Date(2026, 8, 13, 0, 0, 0, 0, d.Loc)
-	first := d.Next(start)
-	second := d.Next(first)
-	if got := first.In(d.Loc).Format("15:04"); got != "09:00" {
-		t.Errorf("first slot = %s, want 09:00", got)
+	// The configured strings become the schedule in order, and each firing names
+	// itself rather than the slot before it.
+	want := []string{"09:00", "14:00", "17:30"}
+	at := time.Date(2026, 8, 13, 0, 0, 0, 0, d.Loc)
+	for i, w := range want {
+		at = d.Next(at)
+		if got := at.In(d.Loc).Format(SlotLayout); got != w {
+			t.Errorf("slot %d = %s, want %s", i+1, got, w)
+		}
+		if slot, ok := d.SlotAt(at); !ok || slot.Name != w {
+			t.Errorf("SlotAt(slot %d) = %q (ok=%v), want %s", i+1, slot.Name, ok, w)
+		}
 	}
-	if got := second.In(d.Loc).Format("15:04"); got != "16:30" {
-		t.Errorf("second slot = %s, want 16:30", got)
+	// And the day wraps back to the first slot rather than producing a fourth.
+	if got := d.Next(at).In(d.Loc).Format("2006-01-02 15:04"); got != "2026-08-14 09:00" {
+		t.Errorf("after the last slot = %s, want 2026-08-14 09:00", got)
 	}
-	slot, ok := d.SlotAt(second)
-	if !ok || slot.Name != "16:30" {
-		t.Errorf("SlotAt = %q (ok=%v), want 16:30", slot.Name, ok)
+
+	// Order in config must not matter: Next and SlotAt scan Times rather than
+	// assuming it is sorted, so an operator listing the slots out of order gets
+	// the same schedule instead of a silently broken one.
+	shuffled, err := NewDigest([]string{"17:30", "09:00", "14:00"}, testTZ)
+	if err != nil {
+		t.Fatalf("NewDigest(shuffled): %v", err)
+	}
+	if got := shuffled.Next(time.Date(2026, 8, 13, 0, 0, 0, 0, d.Loc)); got.Format(SlotLayout) != "09:00" {
+		t.Errorf("shuffled first firing = %s, want 09:00", got.Format(SlotLayout))
+	}
+
+	// A schedule this service cannot name must not be constructible.
+	if _, err := NewDigest(nil, testTZ); err == nil {
+		t.Error("NewDigest(nil, testTZ) succeeded; a Daily with no slots cannot name a digest")
+	}
+	if _, err := NewDigest([]string{"9:00"}, testTZ); err == nil {
+		t.Error("NewDigest accepted an unpadded slot, which never round-trips through Clock.String")
+	}
+}
+
+func TestParseClock(t *testing.T) {
+	t.Parallel()
+	t.Run("accepted", func(t *testing.T) {
+		t.Parallel()
+		for in, want := range map[string]Clock{
+			"00:00":    {Hour: 0, Minute: 0},
+			"09:00":    {Hour: 9, Minute: 0},
+			"17:30":    {Hour: 17, Minute: 30},
+			"23:59":    {Hour: 23, Minute: 59},
+			"  14:00 ": {Hour: 14, Minute: 0},
+		} {
+			got, err := ParseClock(in)
+			if err != nil || got != want {
+				t.Errorf("ParseClock(%q) = (%v, %v), want %v", in, got, err, want)
+			}
+		}
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		t.Parallel()
+		// "9:00" is the one that matters: time.Parse accepts it, and accepting it
+		// here would put a name in digest_runs.slot that Clock.String never writes,
+		// so the same slot would appear under two spellings.
+		for _, in := range []string{"", "9:00", "09:0", "24:00", "09:60", "0900", "09:00:00", "9am", "09-00"} {
+			if got, err := ParseClock(in); err == nil {
+				t.Errorf("ParseClock(%q) = %v, want an error", in, got)
+			}
+		}
+	})
+}
+
+func TestParseClocksRejectsEmptyAndDuplicates(t *testing.T) {
+	t.Parallel()
+	if _, err := ParseClocks(nil); err == nil {
+		t.Error("an empty schedule was accepted")
+	}
+	if _, err := ParseClocks([]string{"09:00", "14:00", "09:00"}); err == nil {
+		t.Error("a duplicated slot was accepted; the second can only be absorbed by the unique index")
+	}
+	got, err := ParseClocks([]string{"09:00", "17:30"})
+	if err != nil || len(got) != 2 || got[0].String() != "09:00" || got[1].String() != "17:30" {
+		t.Errorf("ParseClocks = (%v, %v)", got, err)
 	}
 }
 
 // TestDailySlotAt pins the snapping. Every expectation here is a name from
-// DigestTimes and a calendar date — a formatting-only implementation reproduces
-// only the two "exactly on a slot" rows and fails the rest.
+// the schedule's own Times and a calendar date — a formatting-only implementation reproduces
+// only the "exactly on a slot" rows and fails the rest.
 func TestDailySlotAt(t *testing.T) {
 	for _, host := range []string{"UTC", "Asia/Tokyo"} {
 		t.Run("host="+host, func(t *testing.T) {
 			setLocal(t, host)
 
-			msk := mustLoad(t, DigestTZ)
-			d := Daily{Times: DigestTimes, Loc: msk}
+			msk := mustLoad(t, testTZ)
+			d := Daily{Times: testTimes, Loc: msk}
 
 			at := func(y int, m time.Month, day, h, min, sec int) time.Time {
 				return time.Date(y, m, day, h, min, sec, 0, msk)
@@ -244,30 +335,35 @@ func TestDailySlotAt(t *testing.T) {
 				// Exactly on a slot: the instant belongs to its own slot, never to
 				// the previous one.
 				{"exactly at 09:00", at(2026, 8, 13, 9, 0, 0), "09:00", "2026-08-13"},
-				{"exactly at 16:30", at(2026, 8, 13, 16, 30, 0), "16:30", "2026-08-13"},
+				{"exactly at 14:00", at(2026, 8, 13, 14, 0, 0), "14:00", "2026-08-13"},
+				{"exactly at 17:30", at(2026, 8, 13, 17, 30, 0), "17:30", "2026-08-13"},
 				// River fires near the instant, not on it.
 				{"31 seconds after 09:00", at(2026, 8, 13, 9, 0, 31), "09:00", "2026-08-13"},
-				// Between the slots.
-				{"between slots", at(2026, 8, 13, 11, 0, 0), "09:00", "2026-08-13"},
-				{"one second before 16:30", at(2026, 8, 13, 16, 29, 59), "09:00", "2026-08-13"},
+				{"31 seconds after 14:00", at(2026, 8, 13, 14, 0, 31), "14:00", "2026-08-13"},
+				// Between the slots. The middle slot is what makes these rows worth
+				// having: an afternoon instant now belongs to 14:00, not to 09:00.
+				{"between 09:00 and 14:00", at(2026, 8, 13, 11, 0, 0), "09:00", "2026-08-13"},
+				{"one second before 14:00", at(2026, 8, 13, 13, 59, 59), "09:00", "2026-08-13"},
+				{"between 14:00 and 17:30", at(2026, 8, 13, 16, 0, 0), "14:00", "2026-08-13"},
+				{"one second before 17:30", at(2026, 8, 13, 17, 29, 59), "14:00", "2026-08-13"},
 				// After the last slot — the case that motivated this method.
-				{"manual run at 18:33", at(2026, 8, 13, 18, 33, 0), "16:30", "2026-08-13"},
-				{"just before midnight", at(2026, 8, 13, 23, 59, 59), "16:30", "2026-08-13"},
+				{"manual run at 18:33", at(2026, 8, 13, 18, 33, 0), "17:30", "2026-08-13"},
+				{"just before midnight", at(2026, 8, 13, 23, 59, 59), "17:30", "2026-08-13"},
 				// Before the first slot of the day: yesterday's last slot, and
 				// crucially yesterday's date.
-				{"midnight", at(2026, 8, 13, 0, 0, 0), "16:30", "2026-08-12"},
-				{"early morning", at(2026, 8, 13, 3, 0, 0), "16:30", "2026-08-12"},
-				{"one second before 09:00", at(2026, 8, 13, 8, 59, 59), "16:30", "2026-08-12"},
+				{"midnight", at(2026, 8, 13, 0, 0, 0), "17:30", "2026-08-12"},
+				{"early morning", at(2026, 8, 13, 3, 0, 0), "17:30", "2026-08-12"},
+				{"one second before 09:00", at(2026, 8, 13, 8, 59, 59), "17:30", "2026-08-12"},
 				// Across month and year boundaries, backwards.
-				{"first instant of a month", at(2026, 9, 1, 0, 30, 0), "16:30", "2026-08-31"},
-				{"first instant of a year", at(2027, 1, 1, 2, 0, 0), "16:30", "2026-12-31"},
+				{"first instant of a month", at(2026, 9, 1, 0, 30, 0), "17:30", "2026-08-31"},
+				{"first instant of a year", at(2027, 1, 1, 2, 0, 0), "17:30", "2026-12-31"},
 				// The caller's zone must not matter: 22:00 UTC is already 01:00 MSK
-				// on the 14th, so the run belongs to the 13th's 16:30.
-				{"current in UTC, past Moscow midnight", time.Date(2026, 8, 13, 22, 0, 0, 0, time.UTC), "16:30", "2026-08-13"},
+				// on the 14th, so the run belongs to the 13th's 17:30.
+				{"current in UTC, past Moscow midnight", time.Date(2026, 8, 13, 22, 0, 0, 0, time.UTC), "17:30", "2026-08-13"},
 				// 12:00 Tokyo on the 13th is 06:00 MSK — before the first slot.
 				// Constructed in Tokyo explicitly, never in time.Local: a case whose
 				// expectation depends on the host is exactly what this test is for.
-				{"current in a third zone", time.Date(2026, 8, 13, 12, 0, 0, 0, mustLoad(t, "Asia/Tokyo")), "16:30", "2026-08-12"},
+				{"current in a third zone", time.Date(2026, 8, 13, 12, 0, 0, 0, mustLoad(t, "Asia/Tokyo")), "17:30", "2026-08-12"},
 			}
 
 			for _, tc := range cases {
@@ -303,8 +399,8 @@ func TestDailySlotAt(t *testing.T) {
 // that same firing, on every step across a day boundary.
 func TestDailySlotAtRoundTripsNext(t *testing.T) {
 	setLocal(t, "Asia/Tokyo")
-	msk := mustLoad(t, DigestTZ)
-	d := Daily{Times: DigestTimes, Loc: msk}
+	msk := mustLoad(t, testTZ)
+	d := Daily{Times: testTimes, Loc: msk}
 
 	cur := time.Date(2026, 8, 13, 3, 0, 0, 0, msk)
 	for range 6 {
@@ -335,7 +431,7 @@ func TestDailySlotAtDegenerate(t *testing.T) {
 	})
 
 	t.Run("nil location resolves in UTC not host local", func(t *testing.T) {
-		d := Daily{Times: DigestTimes}
+		d := Daily{Times: testTimes}
 		// 12:00 UTC is past 09:00 UTC; in Tokyo-local terms it would be the 13th
 		// at 21:00, and in Moscow terms 15:00 — all three would still say 09:00,
 		// so use an instant where the zones disagree: 00:30 UTC on the 13th is
@@ -344,8 +440,8 @@ func TestDailySlotAtDegenerate(t *testing.T) {
 		if !ok {
 			t.Fatal("SlotAt could not name a slot")
 		}
-		if got.Name != "16:30" || got.At.Format("2006-01-02") != "2026-08-12" {
-			t.Errorf("= %s %s, want 2026-08-12 16:30 in UTC", got.At.Format("2006-01-02"), got.Name)
+		if got.Name != "17:30" || got.At.Format("2006-01-02") != "2026-08-12" {
+			t.Errorf("= %s %s, want 2026-08-12 17:30 in UTC", got.At.Format("2006-01-02"), got.Name)
 		}
 	})
 }

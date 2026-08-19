@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,199 @@ func TestDefaultSafetySwitches(t *testing.T) {
 // scope on Read). Reproduced against claude 2.1.222 with the shipped flags: the
 // write succeeded with `permission_denials: []`. And unscoped `Read`/`Grep`/
 // `Glob` made the worktree a working directory rather than a boundary.
+// The digest schedule is a product decision, and this is now the only place in
+// the tree it is written down: the scheduler takes whatever config hands it, so a
+// silent edit to the default tag would change what every team is promised with
+// nothing else failing. Pinned as literals for that reason, not derived.
+func TestDefaultDigestSchedule(t *testing.T) {
+	t.Parallel()
+	c := defaultConfig(t)
+	if got := c.Digest.Slots; !slices.Equal(got, []string{"09:00", "14:00", "17:30"}) {
+		t.Errorf("digest.slots default = %v, want [09:00 14:00 17:30]", got)
+	}
+	if got := c.Digest.Timezone; got != "Europe/Moscow" {
+		t.Errorf("digest.timezone default = %q, want Europe/Moscow", got)
+	}
+	// The per-team block must NOT be defaulted: a default there fills every team
+	// and makes "inherit" indistinguishable from "set to the same value", which is
+	// the distinction the whole override rests on.
+	c.Teams = []TeamConfig{{Name: "payments"}}
+	if len(c.Teams[0].Digest.Slots) != 0 || c.Teams[0].Digest.Timezone != "" {
+		t.Errorf("teams[].digest was defaulted (%+v); inheritance can no longer be expressed", c.Teams[0].Digest)
+	}
+}
+
+// The two halves inherit independently, because the two reasons to override are
+// independent: a team in another country keeps the company's slot times, and a
+// team with an unusual rhythm keeps the company's zone.
+func TestDigestScheduleInheritance(t *testing.T) {
+	t.Parallel()
+	c := defaultConfig(t)
+	c.Digest.Timezone = "Europe/Moscow"
+	c.Digest.Slots = []string{"09:00", "17:30"}
+
+	for _, tc := range []struct {
+		name     string
+		team     TeamDigestConfig
+		wantSlot []string
+		wantTZ   string
+	}{
+		{name: "inherits both", wantSlot: []string{"09:00", "17:30"}, wantTZ: "Europe/Moscow"},
+		{
+			name:     "own slots, inherited zone",
+			team:     TeamDigestConfig{Slots: []string{"11:00"}},
+			wantSlot: []string{"11:00"}, wantTZ: "Europe/Moscow",
+		},
+		{
+			name:     "own zone, inherited slots",
+			team:     TeamDigestConfig{Timezone: "Asia/Tbilisi"},
+			wantSlot: []string{"09:00", "17:30"}, wantTZ: "Asia/Tbilisi",
+		},
+		{
+			name:     "own both",
+			team:     TeamDigestConfig{Timezone: "Europe/Lisbon", Slots: []string{"10:00", "18:00"}},
+			wantSlot: []string{"10:00", "18:00"}, wantTZ: "Europe/Lisbon",
+		},
+		{
+			name:     "blank zone inherits rather than becoming UTC",
+			team:     TeamDigestConfig{Timezone: "   "},
+			wantSlot: []string{"09:00", "17:30"}, wantTZ: "Europe/Moscow",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			slots, tz := c.DigestScheduleFor(TeamConfig{Name: "payments", Digest: tc.team})
+			if !slices.Equal(slots, tc.wantSlot) || tz != tc.wantTZ {
+				t.Errorf("= (%v, %q), want (%v, %q)", slots, tz, tc.wantSlot, tc.wantTZ)
+			}
+		})
+	}
+}
+
+// A schedule the service cannot name has to be refused at load time. Left to the
+// first firing it is invisible: the service starts clean, every check passes and
+// no digest is ever sent.
+func TestValidateDigestSlots(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		slots []string
+		want  string
+	}{
+		{name: "empty", slots: []string{}, want: "at least one digest slot"},
+		{name: "not a time", slots: []string{"morning"}, want: "must be HH:MM"},
+		// time.Parse accepts "9:00"; accepting it would file the same slot under two
+		// spellings, because Clock.String only ever writes the padded form.
+		{name: "unpadded", slots: []string{"9:00"}, want: "zero-padded"},
+		{name: "out of range", slots: []string{"24:00"}, want: "must be HH:MM"},
+		{name: "duplicate", slots: []string{"09:00", "09:00"}, want: "listed twice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := digestBase(t)
+			c.Digest.Slots = tc.slots
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted digest.slots = %v", tc.slots)
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "digest.slots") {
+				t.Errorf("error = %v, want it to name digest.slots and %q", err, tc.want)
+			}
+		})
+	}
+
+	// And the ordinary case still passes, in any order.
+	c := digestBase(t)
+	c.Digest.Slots = []string{"17:30", "09:00"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate rejected a valid unsorted schedule: %v", err)
+	}
+}
+
+// A per-team override is validated too, and the failure names the team: an
+// operator reading it has to know whose digest is broken, not merely that some
+// slot list is.
+func TestValidateTeamDigestOverride(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		team TeamDigestConfig
+		want string
+	}{
+		{name: "bad slot", team: TeamDigestConfig{Slots: []string{"9:00"}}, want: "teams[payments].digest.slots"},
+		{name: "duplicate slot", team: TeamDigestConfig{Slots: []string{"09:00", "09:00"}}, want: "teams[payments].digest.slots"},
+		{name: "unknown zone", team: TeamDigestConfig{Timezone: "Mars/Olympus"}, want: "teams[payments].digest.timezone"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := digestBase(t)
+			c.Teams[0].Digest = tc.team
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted teams[].digest = %+v", tc.team)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %v, want it to name %s", err, tc.want)
+			}
+		})
+	}
+
+	t.Run("valid override passes", func(t *testing.T) {
+		t.Parallel()
+		c := digestBase(t)
+		c.Teams[0].Digest = TeamDigestConfig{Timezone: "Europe/Lisbon", Slots: []string{"10:00", "18:00"}}
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate rejected a valid override: %v", err)
+		}
+	})
+
+	// The global block is checked even when every team overrides it: an unusable
+	// default is a trap for the next team added, not dead config.
+	t.Run("unused global default is still validated", func(t *testing.T) {
+		t.Parallel()
+		c := digestBase(t)
+		c.Digest.Timezone = "Mars/Olympus"
+		c.Teams[0].Digest = TeamDigestConfig{Timezone: "Europe/Lisbon", Slots: []string{"10:00"}}
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "digest.timezone") {
+			t.Errorf("error = %v, want the unused global timezone reported", err)
+		}
+	})
+}
+
+func TestValidateDigestTimezone(t *testing.T) {
+	t.Parallel()
+	for _, tz := range []string{"", "   ", "Mars/Olympus", "MSK+3"} {
+		c := digestBase(t)
+		c.Digest.Timezone = tz
+		if err := c.Validate(); err == nil {
+			t.Errorf("Validate accepted digest.timezone = %q", tz)
+		}
+	}
+	// A zone the embedded tzdata really carries, in a different offset from the
+	// default, so the test proves loading rather than string comparison.
+	c := digestBase(t)
+	c.Digest.Timezone = "America/Sao_Paulo"
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate rejected a real IANA zone: %v", err)
+	}
+}
+
+// digestBase is a config that passes Validate, so a slot test's only failure is
+// the slot list.
+func digestBase(t *testing.T) *Config {
+	t.Helper()
+	c := defaultConfig(t)
+	c.GitLab.BaseURL = "https://gitlab.example.com"
+	c.GitLab.Token = "glpat-x"
+	c.Slack.Token = "xoxb-x"
+	c.Postgres.Username = "ai_reviewer"
+	c.Teams = []TeamConfig{{
+		Name: "payments", SlackChannel: "C012345678", Repositories: []string{"a/b"},
+	}}
+	return c
+}
+
 func TestDefaultAllowedToolsAreReadOnlyAndWorktreeScoped(t *testing.T) {
 	tools := defaultConfig(t).LLM.Claude.AllowedTools
 	if len(tools) == 0 {

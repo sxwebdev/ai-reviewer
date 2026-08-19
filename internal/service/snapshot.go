@@ -40,12 +40,13 @@ type loadedMR struct {
 type snapshotDepth int
 
 const (
-	// depthReview loads the MR detail and its discussions. LastPushAt and
-	// ApprovedBy stay zero, which every consumer already reads as "unknown".
+	// depthReview loads the MR detail and its discussions. LastPushAt stays zero
+	// and ApprovedBy stays empty with ApprovalsKnown false, which every consumer
+	// reads as "unknown".
 	depthReview snapshotDepth = iota
 	// depthDigest additionally loads /versions (the "waiting 18h" clock and the
-	// REQUESTED_CHANGES freshness rule) and /approvals (which sharpens the REST
-	// reviewer fallback).
+	// REQUESTED_CHANGES freshness rule) and /approvals, which is the sole input to
+	// both Linear completion rules and also sharpens the REST reviewer fallback.
 	depthDigest
 )
 
@@ -155,8 +156,17 @@ func (l *snapshotLoader) load(ctx context.Context, team string, proj *gitlab.Pro
 			return err
 		})
 		g.Go(func() error {
-			// Errors are captured, not returned: approvals only sharpen the REST
-			// fallback, and losing them must not cost the whole snapshot.
+			// Errors are captured, not returned: losing approvals must not cost the
+			// whole snapshot, and the digest is still worth building without them.
+			//
+			// What it may *not* do is look like "nobody approved". The comment here
+			// used to say approvals "only sharpen the REST fallback", which was true
+			// until the Linear rules made ApprovedBy the sole input to "is this
+			// review finished" — after which a 403 from an under-privileged service
+			// account disabled the completion gate on every merge request, silently
+			// and for as long as the permission was missing. ApprovalsKnown is how
+			// the failure stays visible to the classifiers; see
+			// domain.MergeRequestSnapshot.ApprovalsKnown.
 			approvals, approvalErr = l.svc.gl.GetMRApprovals(gctx, pk, iid)
 			return nil
 		})
@@ -167,7 +177,12 @@ func (l *snapshotLoader) load(ctx context.Context, team string, proj *gitlab.Pro
 	if approvalErr != nil {
 		if !l.approvalsWarned {
 			l.approvalsWarned = true
-			l.svc.log.Warnw("merge request approvals unavailable; reviewers may be nudged after approving",
+			// Once per run, since where the endpoint is refused this fires for every
+			// merge request.
+			// Both consequences are named — the first alone reads like cosmetic noise —
+			// and the Linear half is worded as a conditional, because a deployment
+			// without linear_team_ids cannot reach it at all.
+			l.svc.log.Warnw("merge request approvals unavailable; reviewers keep being nudged after approving, and where Linear is configured no author is asked to advance their card",
 				"project", proj.PathWithNamespace, "err", approvalErr)
 		}
 	}
@@ -185,6 +200,10 @@ func (l *snapshotLoader) load(ctx context.Context, team string, proj *gitlab.Pro
 		Pipeline:     mapPipeline(detail.HeadPipeline),
 		LastPushAt:   lastPushAt(versions),
 	}
+	// depthReview never asks for approvals, so "unknown" is also its honest
+	// answer — the field is not a claim that the request failed, it is a claim
+	// that ApprovedBy may be trusted as complete.
+	snap.ApprovalsKnown = l.depth == depthDigest && approvalErr == nil
 	for _, u := range approvals.Approvers() {
 		snap.ApprovedBy = append(snap.ApprovedBy, mapUser(u))
 	}

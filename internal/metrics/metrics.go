@@ -186,6 +186,35 @@ var (
 		Help: "Open merge requests with known merge conflicts.",
 	}, []string{"team"})
 
+	// MergeRequestsLinearNotReady is the answer to "why is nobody reviewing my
+	// merge request": its Linear card is still parked before In Review, so the
+	// digest asked its author to move it instead of asking reviewers to look. It
+	// is a gauge on purpose — the interesting shape is a number that stays up,
+	// meaning a team is routinely opening merge requests without moving the board.
+	MergeRequestsLinearNotReady = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "merge_requests_linear_not_ready_total",
+		Help: "Open merge requests whose linked Linear issue has not reached In Review.",
+	}, []string{"team"})
+
+	// LinearGateAmbiguousTotal counts merge requests whose readiness gate was
+	// switched off by an ambiguous Linear match. See LinearGateAmbiguous.
+	LinearGateAmbiguousTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "linear_gate_ambiguous_total",
+		Help: "Merge requests whose Linear readiness gate was skipped because they named issues at different statuses.",
+	}, []string{"team"})
+
+	// MergeRequestsWithUnknownApprovals counts merge requests whose approvals
+	// GitLab refused to report. Any non-zero value means both Linear completion
+	// rules were inert for those merge requests — reviewers keep being nudged after
+	// approving and no author is asked to advance their card — and a value that
+	// stays non-zero across slots means the endpoint is refused rather than flaky
+	// (the usual cause is a service account below Reporter). Nothing else made that
+	// visible, which is why this gauge exists rather than a log line.
+	MergeRequestsWithUnknownApprovals = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "merge_requests_with_unknown_approvals_total",
+		Help: "Open merge requests whose approval list could not be read from GitLab.",
+	}, []string{"team"})
+
 	MergeRequestsWithFailedPipeline = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "merge_requests_with_failed_pipeline_total",
 		Help: "Open merge requests whose head pipeline failed.",
@@ -325,6 +354,17 @@ func ClearLinearIssuesInReview(team string) {
 	LinearIssuesInReview.DeleteLabelValues(team)
 }
 
+// LinearGateAmbiguous records one merge request whose readiness gate was switched
+// off because it named Linear issues at different statuses.
+//
+// A counter rather than a gauge, because this is meant to be rare: the identifier
+// match is permissive on purpose (it yields candidates, not identifiers), so an
+// ordinary branch name can contribute a second "valid" issue when the workspace
+// happens to own a team with that key. Rare-but-real needs a number that only goes
+// up, not a level to watch — and without it the only trace is a log line, while
+// every other degradation here is on a dashboard.
+func LinearGateAmbiguous(team string) { LinearGateAmbiguousTotal.WithLabelValues(team).Inc() }
+
 // DigestSourceError records a source failure that degraded a digest: one
 // increment per source per build, so linear and gitlab stay comparable even
 // though one counts repositories and the other does not.
@@ -352,6 +392,18 @@ type TeamState struct {
 	UnresolvedThreads int
 	Conflicts         int
 	FailedPipeline    int
+	// LinearNotReady is merge requests the Linear readiness gate parked with their
+	// author because the card has not reached In Review. It is the counterpart of
+	// WaitingHumanReview and the two are mutually exclusive per merge request, so
+	// a queue that looks empty can be read against this one.
+	//
+	// Computed here but **published by SetLinearNotReady, not by SetTeamState**,
+	// because unlike every other field it can be unknown rather than zero.
+	LinearNotReady int
+	// ApprovalsUnknown is merge requests whose approvals could not be read. See
+	// MergeRequestsWithUnknownApprovals: this is a degradation counter, and zero is
+	// the only healthy value.
+	ApprovalsUnknown int
 }
 
 // SetTeamState publishes a team's MR classification. Call it once per digest
@@ -360,15 +412,35 @@ type TeamState struct {
 //
 // Per digest, not per scan, and the distinction matters when reading a dashboard:
 // the classification needs a whole team at once, which is what BuildDigest sees
-// and a per-repository scan pass does not, so these five gauges step twice a day
-// (09:00 and 16:30 Europe/Moscow) rather than every five minutes. A flat line
-// between the slots is the metric working as intended.
+// and a per-repository scan pass does not, so these gauges step once per
+// digest slot rather than every five minutes. A flat line
+// between two slots is the metric working as intended.
 func SetTeamState(team string, s TeamState) {
 	MergeRequestsWaitingHumanReview.WithLabelValues(team).Set(float64(s.WaitingHumanReview))
 	MergeRequestsWithChangesRequested.WithLabelValues(team).Set(float64(s.ChangesRequested))
 	MergeRequestsWithUnresolvedThreads.WithLabelValues(team).Set(float64(s.UnresolvedThreads))
 	MergeRequestsWithConflicts.WithLabelValues(team).Set(float64(s.Conflicts))
 	MergeRequestsWithFailedPipeline.WithLabelValues(team).Set(float64(s.FailedPipeline))
+	MergeRequestsWithUnknownApprovals.WithLabelValues(team).Set(float64(s.ApprovalsUnknown))
+}
+
+// SetLinearNotReady publishes the board-gated count. Separate from SetTeamState
+// because it is the one per-team classification that can be *unknown*: it is only
+// meaningful where the team's column order resolved.
+func SetLinearNotReady(team string, n int) {
+	MergeRequestsLinearNotReady.WithLabelValues(team).Set(float64(n))
+}
+
+// ClearLinearNotReady removes the team's series — the same "absent, not zero"
+// rule as ClearLinearIssuesInReview, and for a sharper reason. With the column
+// order unreadable every card grades as unknown, so the count computes to zero
+// while the merge requests are still parked exactly where they were. A zero here
+// reads as "nothing is stuck before In Review" on the one panel built to show that,
+// at the moment the service lost the ability to answer, and the reviewers those
+// merge requests fell back to appear as a jump in waiting_human_review — an
+// operator would read the pair as work moving forward.
+func ClearLinearNotReady(team string) {
+	MergeRequestsLinearNotReady.DeleteLabelValues(team)
 }
 
 // DigestRun records the terminal result of one digest run.

@@ -117,12 +117,25 @@ teams:
 ```
 
 The service matches an identifier such as `CHAIN-184` in the MR title, then the
-source branch, without regard to case. One GitLab approval completes review for
-a linked issue unless any reviewer has `REQUESTED_CHANGES`; an approved issue
-still in `In Review` becomes an action for the MR author to move it forward.
-With zero approvals or no matching issue, the ordinary GitLab reviewer flow is
-kept. Run `ai-reviewer doctor`: it authenticates the key, resolves every UUID
-and verifies that each Linear team has exactly one matching workflow status. If
+source branch, without regard to case. The linked issue's status then gates the
+merge request at both ends:
+
+- **Before `In Review`** — the work was never offered, so **no reviewer is asked**.
+  The MR author gets `move CHAIN-184 to In Review (now In Progress)` instead. This
+  outranks approvals and `REQUESTED_CHANGES`, so a card forgotten in the wrong
+  column costs the team a review; the author row is what keeps the merge request in
+  the digest.
+- **At `In Review` or later** — one GitLab approval completes review unless any
+  reviewer has `REQUESTED_CHANGES`; an approved issue still in `In Review` becomes
+  an action for the MR author to move it forward.
+
+Which columns count as "before" comes from the team's own board, not from a list of
+names in the service. With no matching issue, an unreadable board, or Linear
+unavailable, the ordinary GitLab reviewer flow is kept.
+
+Run `ai-reviewer doctor`: it authenticates the key, resolves every UUID,
+verifies that each Linear team has exactly one matching workflow status, and prints
+each team's resolved column split. If
 `linear_team_ids` is absent everywhere, Linear is skipped and no key is required.
 
 ## Slack setup
@@ -134,6 +147,12 @@ Create a Slack app with a bot token and these **scopes**:
 | `users:read`       | load the workspace directory for user matching             |
 | `users:read.email` | without it `users.list` omits email — the strongest match  |
 | `chat:write`       | post the digest                                            |
+| `channels:read`    | let `doctor` check channel membership (`conversations.info`) |
+
+Add `groups:read` too if any `teams[].slack_channel` is a **private** channel.
+Neither scope affects delivery — posting needs only `chat:write` plus membership
+— but without the right one of the two, `doctor`'s per-channel check fails with
+`missing_scope` and its non-zero exit blocks every deploy gate reading it.
 
 **Invite the bot to every channel** listed in `teams[].slack_channel`. The most
 common failure is a perfectly valid token whose `auth.test` passes while every

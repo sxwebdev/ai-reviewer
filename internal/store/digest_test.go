@@ -254,7 +254,7 @@ func TestDigestRunSlotUniqueness(t *testing.T) {
 	fresh, err := st.DigestRun().NextAttempt(t.Context(), repo_digestrun.NextAttemptParams{
 		Team:    "core",
 		RunDate: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC),
-		Slot:    "16:30",
+		Slot:    "17:30",
 	})
 	if err != nil {
 		t.Fatalf("NextAttempt for an unused slot: %v", err)
@@ -303,7 +303,7 @@ func TestDigestRunGetBySlotAttempt(t *testing.T) {
 
 	// A different slot on the same day is a different run.
 	other := scheduled
-	other.Slot = "16:30"
+	other.Slot = "17:30"
 	if _, err := st.DigestRun().GetBySlotAttempt(t.Context(), other); !errors.Is(err, pgx.ErrNoRows) {
 		t.Errorf("another slot: got err %v, want pgx.ErrNoRows", err)
 	}
@@ -318,7 +318,7 @@ func TestDigestRunAndMessagesCommitTogether(t *testing.T) {
 	err := st.RunInTx(t.Context(), func(tx pgx.Tx) error {
 		run, err := st.DigestRun(store.WithTx(tx)).Create(t.Context(), repo_digestrun.CreateParams{
 			Team:    "core",
-			Slot:    "16:30",
+			Slot:    "17:30",
 			RunDate: time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC),
 			Status:  "built",
 			Parts:   2,

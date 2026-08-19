@@ -244,21 +244,166 @@ func TestEveryIssueFieldIsSelectedByEveryQuery(t *testing.T) {
 		t.Fatalf("captured %d queries, want both", len(queries))
 	}
 
-	issue := reflect.TypeFor[linear.Issue]()
 	for name, query := range queries {
 		// Only the node selection matters; the filter mentions field names too.
 		nodes := query[strings.Index(query, "nodes {"):]
-		for i := range issue.NumField() {
-			field := issue.Field(i).Tag.Get("json")
-			if field == "" {
-				t.Errorf("%s has no json tag", issue.Field(i).Name)
-				continue
-			}
-			if !strings.Contains(nodes, field) {
-				t.Errorf("query %s never selects Issue.%s (json %q), so it always decodes to the zero value",
-					name, issue.Field(i).Name, field)
+		assertSelected(t, name, nodes, reflect.TypeFor[linear.Issue](), "Issue")
+	}
+}
+
+// assertSelected walks a decoded type and requires every json-tagged field to
+// appear in the selection, nested types included, **inside the nested type's own
+// block**.
+//
+// The recursion is the point. A flat check passed while `state { id name }`
+// silently zeroed WorkflowState.Type and Position — which is not a cosmetic gap:
+// the readiness gate is built from exactly those two, so it would have gone
+// dormant with nothing anywhere reporting it. The block scoping is the second half:
+// a substring search over the whole selection is satisfied by a sibling block that
+// happens to mention the same word, so moving `type position` from `state { … }`
+// into `team { … }` passed while both fields still decoded to zero.
+//
+// `json:"-"` fields are skipped; they are populated by a different query on
+// purpose.
+func assertSelected(t *testing.T, query, selection string, typ reflect.Type, path string) {
+	t.Helper()
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		tag := field.Tag.Get("json")
+		switch tag {
+		case "":
+			t.Errorf("%s.%s has no json tag", path, field.Name)
+			continue
+		case "-":
+			continue
+		}
+		if !selectsField(selection, tag) {
+			t.Errorf("query %s never selects %s.%s (json %q), so it always decodes to the zero value",
+				query, path, field.Name, tag)
+			continue
+		}
+		if field.Type.Kind() != reflect.Struct {
+			continue
+		}
+		block, ok := selectionBlock(selection, tag)
+		if !ok {
+			t.Errorf("query %s mentions %s.%s (json %q) but opens no selection block for it",
+				query, path, field.Name, tag)
+			continue
+		}
+		assertSelected(t, query, block, field.Type, path+"."+field.Name)
+	}
+}
+
+// selectsField reports whether selection names field as a whole word. A plain
+// substring search is satisfied by a longer field with the same prefix — `id` by
+// `identifier` — so a query that dropped `id` and kept `identifier` passed.
+func selectsField(selection, field string) bool {
+	for i := 0; i+len(field) <= len(selection); i++ {
+		if selection[i:i+len(field)] != field {
+			continue
+		}
+		if i > 0 && isFieldRune(selection[i-1]) {
+			continue
+		}
+		if j := i + len(field); j < len(selection) && isFieldRune(selection[j]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isFieldRune(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
+}
+
+// selectionBlock returns the balanced `{ … }` that follows field in selection.
+func selectionBlock(selection, field string) (string, bool) {
+	rest := selection
+	for {
+		i := strings.Index(rest, field)
+		if i < 0 {
+			return "", false
+		}
+		after := strings.TrimLeft(rest[i+len(field):], " \t\n")
+		if !strings.HasPrefix(after, "{") {
+			// A bare mention (the filter, or a field with the same prefix). Keep looking.
+			rest = rest[i+len(field):]
+			continue
+		}
+		depth := 0
+		for j, r := range after {
+			switch r {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					return after[1:j], true
+				}
 			}
 		}
+		return "", false
+	}
+}
+
+// The team query is the sole source of the column order the readiness gate is
+// built from — an issue contributes only its state id — so what it selects is
+// pinned here. Nothing else could: assertSelected walks the two *issue* queries,
+// and linear.Team.States carries `json:"-"` so the recursion deliberately never
+// reaches it. Dropping `type position` here leaves every board unorderable, the
+// gate permanently dormant and every digest carrying a "Partial data" warning.
+func TestTeamQuerySelectsTheWholeWorkflowOrder(t *testing.T) {
+	t.Parallel()
+	var sent string
+	client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		sent = decodeRequest(t, r).Query
+		writeResponse(t, w, `{"data":{"team":{"id":"t1","key":"PAY","name":"Payments","states":{"nodes":[]}}}}`)
+	})
+	if _, err := client.GetTeam(t.Context(), "t1"); err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	block, ok := selectionBlock(sent, "nodes")
+	if !ok {
+		t.Fatalf("team query has no states selection:\n%s", sent)
+	}
+	assertSelected(t, "team", block, reflect.TypeFor[linear.WorkflowState](), "WorkflowState")
+	// And the page size, because NewWorkflow reports possible truncation against a
+	// constant that has to agree with the query asking for it.
+	if !strings.Contains(sent, "states(first: 250)") {
+		t.Errorf("team query page size does not match linear.NewWorkflow's truncation notice:\n%s", sent)
+	}
+}
+
+// The team query is the only source of the workflow order the readiness gate
+// compares against, so it has to bring back more than names.
+func TestGetTeamDecodesTheWorkflowOrder(t *testing.T) {
+	t.Parallel()
+	client, _ := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeResponse(t, w, `{"data":{"team":{"id":"t1","key":"PAY","name":"Payments","states":{"nodes":[
+			{"id":"s1","name":"In Progress","type":"started","position":1024.5},
+			{"id":"s2","name":"In Review","type":"started","position":2048}
+		]}}}}`)
+	})
+	team, err := client.GetTeam(t.Context(), "t1")
+	if err != nil {
+		t.Fatalf("GetTeam: %v", err)
+	}
+	if len(team.States) != 2 {
+		t.Fatalf("states = %+v", team.States)
+	}
+	if team.States[0].Type != "started" || team.States[0].Position != 1024.5 {
+		t.Errorf("state[0] = %+v, want type and position decoded", team.States[0])
+	}
+	// And the values are usable as an order, which is the only reason they are
+	// fetched at all.
+	wf, err := linear.NewWorkflow(team.States)
+	if err != nil {
+		t.Fatalf("NewWorkflow: %v", err)
+	}
+	if got := wf.Stage(team.States[0]); got != linear.StageBeforeReview {
+		t.Errorf("Stage(In Progress) = %v, want before review", got)
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/sxwebdev/xconfig"
@@ -52,6 +53,7 @@ type Config struct {
 	Log      logger.Config  `yaml:"log"`
 	Ops      ops.Config     `yaml:"ops"`
 	Service  ServiceConfig  `yaml:"service"`
+	Digest   DigestConfig   `yaml:"digest"`
 	Postgres PostgresConfig `yaml:"postgres"`
 	Jobs     JobsConfig     `yaml:"jobs"`
 	GitLab   GitLabConfig   `yaml:"gitlab"`
@@ -68,6 +70,64 @@ type Config struct {
 type ServiceConfig struct {
 	SlackSendEnabled       bool `yaml:"slack_send_enabled" usage:"Actually deliver digests to Slack (off = dry-run, messages are only persisted)"`
 	AIReviewPublishEnabled bool `yaml:"ai_review_publish_enabled" usage:"Actually publish review findings to GitLab (off = dry-run)"`
+}
+
+// DigestConfig is the default digest schedule, used by every team that does not
+// override it in `teams[].digest`.
+//
+// Both halves used to be Go constants, on the reasoning that they are a product
+// requirement. They are — but they are a product requirement that *changes*, and
+// every change was a rebuild plus an edit to whatever comments had restated the
+// values. This block and the per-team override are now the only places either is
+// written down.
+type DigestConfig struct {
+	// Timezone is the IANA zone the slots are wall-clock times in. Distributed
+	// teams are the reason it is not one global constant: a slot means "09:00
+	// where the team is", and expressing one team's morning in another's zone is
+	// the mistake that is hardest to notice, because the digest still arrives.
+	Timezone string `yaml:"timezone" default:"Europe/Moscow" usage:"IANA timezone the digest slots are expressed in"`
+
+	// Slots are the daily digest times, "HH:MM" in Timezone.
+	//
+	// They are also the values written to digest_runs.slot, which is what makes
+	// editing this list a schema-ish change rather than a cosmetic one: rows filed
+	// under a slot that is no longer listed keep their old name — correct history,
+	// no migration — but on the day of the change a replica that starts after a
+	// newly added slot has passed will build that slot too, so a team can see one
+	// extra digest. Once.
+	//
+	// Changing the *zone* has the same effect for the same reason: the slot names
+	// stay, the instants they mean move.
+	Slots []string `yaml:"slots" default:"09:00,14:00,17:30" usage:"Daily digest times, HH:MM in the digest timezone"`
+}
+
+// TeamDigestConfig overrides the global schedule for one team. Both fields are
+// optional and inherit independently — a team in another zone usually keeps the
+// company's slot times, and a team with an unusual rhythm usually keeps the zone.
+//
+// Deliberately no `default:` tags: a default here would fill every team and make
+// "not set" indistinguishable from "set to the same value as the global", which
+// is exactly the distinction inheritance needs.
+type TeamDigestConfig struct {
+	Timezone string   `yaml:"timezone" usage:"Override the digest timezone for this team"`
+	Slots    []string `yaml:"slots" usage:"Override the digest times for this team"`
+}
+
+// DigestScheduleFor resolves one team's effective schedule: its own values where
+// set, the global block otherwise.
+//
+// It is a method on Config rather than a helper in app because both Validate and
+// the config→domain mapping need the answer, and two copies of an inheritance
+// rule is how a service comes to validate one schedule and run another.
+func (c *Config) DigestScheduleFor(t TeamConfig) (slots []string, timezone string) {
+	slots, timezone = t.Digest.Slots, strings.TrimSpace(t.Digest.Timezone)
+	if len(slots) == 0 {
+		slots = c.Digest.Slots
+	}
+	if timezone == "" {
+		timezone = strings.TrimSpace(c.Digest.Timezone)
+	}
+	return slots, timezone
 }
 
 // PostgresConfig is the operational store. Username/password are Vault-backed:
@@ -166,7 +226,7 @@ type LinearConfig struct {
 
 // SlackConfig holds the digest delivery settings.
 type SlackConfig struct {
-	Token        Secret        `yaml:"token" secret:"true" vault:"true" usage:"Slack bot token (users:read, users:read.email, chat:write)"`
+	Token        Secret        `yaml:"token" secret:"true" vault:"true" usage:"Slack bot token (users:read, users:read.email, chat:write, channels:read; groups:read for private channels)"`
 	DirectoryTTL time.Duration `yaml:"directory_ttl" default:"15m" usage:"In-process TTL of the users.list directory cache"`
 	// UserMap is an optional gitlab_username → Slack identity override, in any of
 	// three forms: a user id (U…/W…), an @handle or bare handle, or an email.
@@ -322,6 +382,7 @@ type TeamConfig struct {
 	AIReview      TeamAIReviewConfig `yaml:"ai_review"`
 	LinearTeamIDs []string           `yaml:"linear_team_ids" usage:"Linear team UUIDs whose In Review issues are included in the digest"`
 	Repositories  []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
+	Digest        TeamDigestConfig   `yaml:"digest"`
 }
 
 // TeamAIReviewConfig toggles automated review for one team; the digest is

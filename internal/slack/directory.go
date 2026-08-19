@@ -43,13 +43,13 @@ type DirectoryConfig struct {
 //
 // Nothing here is persisted, and that is deliberate (plan §5.2): a
 // gitlab-user → slack-user table would be derived data, fully rebuildable from
-// users.list in seconds and needed twice a day, bought at the price of
+// users.list in seconds and needed once per digest slot, bought at the price of
 // staleness (someone renames themselves or is deactivated and the row keeps
 // tagging the wrong person), invalidation and a migration. After a restart the
 // cache is simply empty. It looks like a missing feature; it is not.
 //
 // Loads are collapsed through singleflight so the digest jobs of several teams
-// firing at 09:00 share one users.list call instead of one each — users.list is
+// firing in the same slot share one users.list call instead of one each — users.list is
 // a Tier 2 method (~20 requests/minute).
 type Directory struct {
 	lister      UserLister
@@ -83,7 +83,7 @@ func NewDirectory(lister UserLister, cfg DirectoryConfig) *Directory {
 // The shared load deliberately does not run under the caller's context. A
 // singleflight worker belongs to whichever goroutine won the race, so a load
 // started on that caller's context carries its deadline and its cancellation to
-// every goroutine that joins the flight: both teams' digests fire at 09:00 on
+// every goroutine that joins the flight: both teams' digests fire in the same slot on
 // one replica, and team A being nine minutes into its ten-minute budget would
 // hand team B a DeadlineExceeded that was never B's — degrading everyone in B's
 // digest to a plain name for it. So the load gets a deadline of its own, and

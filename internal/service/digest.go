@@ -85,7 +85,25 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 	// can set the per-team gauges honestly — overwritten every pass, including
 	// when every count is zero, because a team that drops to zero must report
 	// zero rather than keep its last non-zero value forever.
-	metrics.SetTeamState(team.Name, teamState(snapshots, linearState))
+	st := teamState(snapshots, linearState)
+	metrics.SetTeamState(team.Name, st)
+	// Same rule as the count below, for the same reason: the count is a hard zero
+	// whenever the gate could not run, which is the claim "nothing is stuck before
+	// In Review" at exactly the moment the service stopped being able to tell — and
+	// the same build pushes those merge requests back onto reviewers, so
+	// waiting_human_review jumps in the same scrape and the pair reads as work
+	// moving forward.
+	//
+	// **Both** halves have to be known, and gateKnown alone is not enough: it is
+	// decided before the batch lookup, so a failed ListIssuesByNumbers leaves it
+	// true with an empty linksByMR — nothing is linked, nothing grades "not ready",
+	// and the gauge publishes the same false zero by the other door. A team that
+	// dropped Linear must also stop publishing it.
+	if linearConfigured && linearState.gateKnown && linearState.linksKnown {
+		metrics.SetLinearNotReady(team.Name, st.LinearNotReady)
+	} else {
+		metrics.ClearLinearNotReady(team.Name)
+	}
 	if linearState.enabled {
 		metrics.SetLinearIssuesInReview(team.Name, linearState.inReviewCount)
 	} else {
@@ -115,13 +133,38 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 		// The two warnings are not interchangeable. "could not be inspected"
 		// explains an absent count; with the count present it would read as a
 		// contradiction of the line right above it, and hide which half is stale.
-		warning := "Partial data: Linear could not be inspected."
-		if linearState.enabled {
+		// Selected on the specific fact that degraded rather than by elimination: a
+		// fifth failure mode added later must not silently inherit the fourth one's
+		// words. Each string may only claim what actually happened — the version that
+		// announced "every linked merge request was treated as ready for review"
+		// printed that above a row proving the opposite.
+		//
+		// The four arms are exhaustive over the errors gatherLinear can return today,
+		// so the `default` is unreachable. It stays as the landing place for that
+		// fifth mode, because the alternative is an empty warning string appended to
+		// a digest.
+		var warning string
+		switch {
+		case !linearState.enabled:
+			warning = "Partial data: Linear could not be inspected."
+		case !linearState.linksKnown:
 			warning = "Partial data: Linear issue links could not be resolved; the In Review count is current."
+		case linearState.gateDegradedLinks:
+			// "kept notifying reviewers" would be false for an already-approved merge
+			// request on that board: the completion rule reads the status *name*, which
+			// needs no ordering, so it can still silence everyone. "Not graded" is what
+			// actually happened in every case.
+			warning = "Partial data: a Linear board could not be ordered; merge requests linked to it were not graded against it."
+		case !linearState.gateKnown:
+			warning = "Partial data: a Linear board could not be ordered; no merge request in this digest was linked to it."
+		default:
+			warning = "Partial data: Linear could not be fully inspected."
 		}
 		data.Warnings = append(data.Warnings, warning)
 		s.log.Warnw("Linear could not be fully inspected for the digest",
-			"team", team.Name, "count_known", linearState.enabled, "err", linearErr)
+			"team", team.Name, "count_known", linearState.enabled,
+			"links_known", linearState.linksKnown, "gate_known", linearState.gateKnown,
+			"gate_affected_links", linearState.gateDegradedLinks, "err", linearErr)
 	}
 	messages := slack.BuildDigest(data)
 
@@ -188,7 +231,7 @@ func digestStatuses(sendEnabled bool, failedRepos int) (run, message string) {
 //
 // It addresses the attempt explicitly rather than asking for the slot's latest
 // one: a `digest --force` earlier in the day owns attempt 1, and answering "yes,
-// the 09:00 slot already ran" would make the scheduled attempt 0 collide with
+// that slot already ran" would make the scheduled attempt 0 collide with
 // digest_runs_slot_uniq instead of being recognised as a run that has not
 // happened yet.
 func (s *Service) digestRunForSlot(ctx context.Context, team, slot string, day time.Time, attempt int) (*models.DigestRun, error) {
@@ -247,6 +290,21 @@ func (s *Service) gatherTeam(ctx context.Context, team domain.Team) ([]domain.Me
 	return snapshots, failed
 }
 
+// linearGatherTimeout bounds everything one digest build spends on Linear.
+//
+// Without it the Linear phase can consume the whole job. Each request carries its
+// own retry budget (4 attempts, a 15s per-request timeout and an honoured
+// Retry-After of up to 60s), so one call's worst case is minutes, and the phase
+// makes 2 + one-per-configured-Linear-team of them serially. Against
+// jobs.digestTimeout that arithmetic already overruns with a single Linear team
+// once Linear starts answering 429 — which is the *expected* failure, since every
+// team's digest fires in the same slot on one API key. Overrunning loses the whole
+// digest including complete GitLab data, and then re-pays for it on retry, which
+// inverts the contract that a Linear failure is non-fatal. Bounded, the same
+// outage degrades to `partial`. doctor bounds its own Linear fan-out for the same
+// reason.
+const linearGatherTimeout = 2 * time.Minute
+
 func (s *Service) gatherLinear(
 	ctx context.Context,
 	team domain.Team,
@@ -258,6 +316,8 @@ func (s *Service) gatherLinear(
 	if s.linear == nil {
 		return linearDigestState{}, errors.New("linear client is not configured")
 	}
+	ctx, cancel := context.WithTimeout(ctx, linearGatherTimeout)
+	defer cancel()
 	inReview, err := s.linear.ListIssuesInReview(ctx, team.LinearTeamIDs)
 	if err != nil {
 		return linearDigestState{}, err
@@ -273,38 +333,148 @@ func (s *Service) gatherLinear(
 	state := linearDigestState{
 		enabled:       true,
 		inReviewCount: len(inReview),
-		issuesByMR:    make(map[string]linear.Issue),
+		linksByMR:     make(map[string]linearLink),
 	}
+
+	// The workflows are gathered before the links but their failure is not fatal,
+	// and that asymmetry is the whole degradation contract of the readiness gate:
+	// a team whose columns could not be read leaves every one of its issues at
+	// linear.StageUnknown, which every rule reads as "ask the reviewers, as
+	// before". A board that cannot be ordered must not silence anybody, so this
+	// records the problem and carries on rather than returning.
+	workflows, unordered, workflowErr := s.gatherLinearWorkflows(ctx, team)
+	state.gateKnown = workflowErr == nil
 
 	issues := make(map[string]linear.Issue, len(inReview))
 	for _, issue := range inReview {
 		issues[strings.ToUpper(issue.Identifier)] = issue
 	}
 	numbers := linearIssueNumbers(snapshots)
+	// Nothing to look up is not a failure: with no candidate numbers the link set
+	// is complete and known, it is simply empty. Saying otherwise made a team whose
+	// merge requests mention no Linear id report "issue links could not be
+	// resolved" whenever its board was unreadable — naming the half that worked.
+	state.linksKnown = true
 	if len(numbers) > 0 {
 		linked, err := s.linear.ListIssuesByNumbers(ctx, team.LinearTeamIDs, numbers)
 		if err != nil {
-			return state, err
+			state.linksKnown = false
+			// Joined, not replaced: with both halves broken the workflow error is the
+			// one that names a configuration fault ("expected exactly one \"In Review\"
+			// workflow state, found 0"), and dropping it left `gate_known=false` in the
+			// log with no reason attached anywhere.
+			return state, errors.Join(workflowErr, err)
 		}
 		for _, issue := range linked {
 			issues[strings.ToUpper(issue.Identifier)] = issue
 		}
 	}
 
+	// gateDegraded is the difference between "a board could not be ordered" and
+	// "a merge request was affected by that", and the digest warning may only claim
+	// the second when it happened. One boolean over N teams reported the digest-wide
+	// sentence "every linked merge request was treated as ready for review" even
+	// when the unreadable board carried no merge requests at all — printed directly
+	// above a row proving the opposite.
+	gateDegraded := false
 	for _, snapshot := range snapshots {
 		match := matchLinearIssue(snapshot.MR, issues)
 		if !match.found {
 			continue
 		}
-		state.issuesByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)] = match.issue
+		// Keyed by the issue's own team, never by the first configured one: a service
+		// team may map several Linear teams and each orders its columns
+		// independently, so grading an issue against another team's board is how a
+		// ready card gets read as unready.
+		stageOf := func(issue linear.Issue) linear.Stage {
+			teamID := strings.TrimSpace(issue.Team.ID)
+			if unordered[teamID] {
+				gateDegraded = true
+			}
+			return workflows[teamID].Stage(issue.State)
+		}
+		state.linksByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)] = linearLink{
+			issue: match.issue,
+			stage: linearStage(match, stageOf),
+		}
 		if len(match.conflicts) > 0 {
-			s.log.Warnw("merge request references multiple Linear issues; using the first valid match",
-				"project", snapshot.Project.FullPath, "iid", snapshot.MR.IID,
-				"selected", match.issue.Identifier, "selected_from", match.matchField,
-				"ignored", match.conflicts)
+			// "ignored" is true of the *rendered* identifier only. Since linearStage the
+			// extra candidates decide whether the readiness gate applies at all, so the
+			// two outcomes are logged apart: an operator asking "our card is in Backlog,
+			// why were three reviewers still pinged?" has no other signal, and the
+			// identifier regex produces incidental candidates from ordinary branch names
+			// (`feature/CHAIN-184-retry-fix-2` yields FIX-2), so this is reachable
+			// without anybody deliberately naming two tickets.
+			gated := state.linksByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)].stage
+			if gated == linear.StageUnknown {
+				metrics.LinearGateAmbiguous(team.Name)
+				s.log.Warnw("merge request references Linear issues at different statuses; the readiness gate is off for it",
+					"project", snapshot.Project.FullPath, "iid", snapshot.MR.IID,
+					"selected", match.issue.Identifier, "selected_from", match.matchField,
+					"also_matched", match.conflicts)
+			} else {
+				s.log.Warnw("merge request references multiple Linear issues at the same status; using the first valid match",
+					"project", snapshot.Project.FullPath, "iid", snapshot.MR.IID,
+					"selected", match.issue.Identifier, "selected_from", match.matchField,
+					"also_matched", match.conflicts)
+			}
 		}
 	}
-	return state, nil
+	state.gateDegradedLinks = gateDegraded
+	return state, workflowErr
+}
+
+// gatherLinearWorkflows resolves each configured Linear team's column order.
+//
+// Errors are returned alongside whatever did resolve, per team: one team with a
+// duplicated "In Review" state must not cost the others their readiness gate. A
+// team missing from the result is not an error at the call site — the zero
+// linear.Workflow answers StageUnknown for every state, which is exactly the
+// fail-open behaviour, so the caller indexes the map without checking.
+// It also returns the set of Linear team ids whose order is missing, so the caller
+// can tell whether any merge request actually landed on one of them.
+func (s *Service) gatherLinearWorkflows(
+	ctx context.Context, team domain.Team,
+) (map[string]linear.Workflow, map[string]bool, error) {
+	workflows := make(map[string]linear.Workflow, len(team.LinearTeamIDs))
+	unordered := make(map[string]bool)
+	// The requested id is recorded alongside the resolved one, because a team that
+	// answered under a different id would otherwise be unreportable.
+	markUnordered := func(ids ...string) {
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id != "" {
+				unordered[id] = true
+			}
+		}
+	}
+	var errs []error
+	for _, id := range team.LinearTeamIDs {
+		lt, err := s.linear.GetTeam(ctx, id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("linear team %s: %w", id, err))
+			markUnordered(id)
+			continue
+		}
+		wf, err := linear.NewWorkflow(lt.States)
+		if err != nil {
+			// A configuration problem rather than an outage, and doctor reports the
+			// same one — but doctor runs when somebody asks, and this is what makes
+			// the digest say so on the day the column was renamed.
+			errs = append(errs, fmt.Errorf("linear team %s: %w", teamLabel(lt, id), err))
+			markUnordered(id, lt.ID)
+			continue
+		}
+		// Keyed by the response's own id, which is the form an issue carries.
+		workflows[strings.TrimSpace(lt.ID)] = wf
+	}
+	return workflows, unordered, errors.Join(errs...)
+}
+
+// teamLabel names a Linear team for an error message. linear.Team.Label owns the
+// "no key means no parentheses" rule so doctor and the digest cannot disagree; the
+// requested id is appended because that is what the operator has in their config.
+func teamLabel(t *linear.Team, requested string) string {
+	return fmt.Sprintf("%s [%s]", t.Label(), strings.TrimSpace(requested))
 }
 
 // inspectRepository loads every open MR of one repository through the shared
@@ -340,16 +510,26 @@ func (s *Service) inspectRepository(ctx context.Context, loader *snapshotLoader,
 	return out, nil
 }
 
-// teamState counts the four per-team gauges from a pass's snapshots.
+// teamState counts the per-team gauges from a pass's snapshots.
 func teamState(snapshots []domain.MergeRequestSnapshot, linearState linearDigestState) metrics.TeamState {
 	var st metrics.TeamState
 	for _, snap := range snapshots {
-		_, linked := linearState.issueFor(snap)
+		link, linked := linearState.linkFor(snap)
 		for _, r := range snap.Reviewers {
-			if needsReviewerAction(snap, r, linked) {
+			if needsReviewerAction(snap, r, link, linked) {
 				st.WaitingHumanReview++
 				break
 			}
+		}
+		if needsLinearStart(snap, link, linked) {
+			st.LinearNotReady++
+		}
+		// Counted per merge request, and only where the answer was actually
+		// wanted: a snapshot loaded at depthReview never asked for approvals, so
+		// counting it here would report an outage on every scan. The digest path is
+		// the only one that reaches this function.
+		if !snap.ApprovalsKnown {
+			st.ApprovalsUnknown++
 		}
 		actions := domain.ClassifyAuthorActions(snap)
 		if len(actions.ChangesRequestedBy) > 0 {
@@ -426,10 +606,10 @@ func (s *Service) digestData(
 
 	for _, snap := range ordered {
 		key := snapshotKey(snap.Project.ID, snap.MR.IID)
-		issue, linked := linearState.issueFor(snap)
+		link, linked := linearState.linkFor(snap)
 
 		for _, r := range snap.Reviewers {
-			if !needsReviewerAction(snap, r, linked) {
+			if !needsReviewerAction(snap, r, link, linked) {
 				continue
 			}
 			p := at(r.User)
@@ -445,8 +625,9 @@ func (s *Service) digestData(
 		}
 
 		actions := domain.ClassifyAuthorActions(snap)
-		moveLinear := needsLinearMove(snap, issue, linked)
-		if !actions.Any() && !moveLinear {
+		moveLinear := needsLinearMove(snap, link, linked)
+		startLinear := needsLinearStart(snap, link, linked)
+		if !actions.Any() && !moveLinear && !startLinear {
 			continue
 		}
 		// The reviewers who asked for changes are named, so the author knows who to
@@ -468,8 +649,10 @@ func (s *Service) digestData(
 			PipelineFailed:     actions.PipelineFailed,
 			PipelineWebURL:     actions.Pipeline.WebURL,
 			MoveLinear:         moveLinear,
-			LinearIdentifier:   issue.Identifier,
-			LinearWebURL:       issue.URL,
+			StartLinear:        startLinear,
+			LinearIdentifier:   link.issue.Identifier,
+			LinearWebURL:       link.issue.URL,
+			LinearState:        link.issue.State.Name,
 		})
 		counted[key] = true
 		noteProject(snap.Project.FullPath)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/config"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/sxwebdev/ai-reviewer/internal/scheduler"
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 )
 
@@ -143,15 +144,56 @@ func Doctor(ctx context.Context, in DoctorInput) []DoctorCheck {
 		fromConfig("claude auth", status, detail)
 	}
 
-	// timezone — the digest schedule is expressed in it, so a stripped image
-	// (no tzdata) must fail here and not at 09:00.
-	if _, err := time.LoadLocation(config.DigestLocation); err != nil {
-		add("timezone", StatusFail, fmt.Sprintf("%s: %s", config.DigestLocation, err))
-	} else {
-		add("timezone", StatusOK, config.DigestLocation)
-	}
+	// digest schedule — every team's, resolved against the global default. Both
+	// halves are checked the way the scheduler will read them, so a stripped image
+	// (no tzdata) or a typo'd slot fails here and not at the first firing. Printed
+	// in full because "when does my digest arrive" has no other answer once the
+	// schedule is per team.
+	// fromConfig, not add: this check reads cfg.Digest and cfg.Teams, so with the
+	// configuration unloadable it prints the *built-in* schedule. Unmarked, that
+	// presents a default as the operator's own times — which is exactly what
+	// defaultsPrefix exists to prevent. Its predecessor checked a Go constant and
+	// was correctly unmarked; moving the schedule into configuration moved this
+	// check across that line too.
+	addDigestSchedule(cfg, fromConfig)
 
 	return checks
+}
+
+// addDigestSchedule reports each team's effective digest schedule, or the first
+// thing wrong with it.
+//
+// One line per team rather than one aggregate: the schedule is the answer to a
+// question an operator asks per team ("when does ours arrive"), and an inherited
+// value is indistinguishable from an overridden one in the config file alone.
+func addDigestSchedule(cfg *config.Config, add func(string, CheckStatus, string)) {
+	if len(cfg.Teams) == 0 {
+		// The global block still has to be loadable: it is what the first team
+		// added will inherit.
+		if err := checkDigestSchedule(cfg.Digest.Slots, cfg.Digest.Timezone); err != nil {
+			add("digest schedule", StatusFail, err.Error())
+			return
+		}
+		add("digest schedule", StatusOK,
+			fmt.Sprintf("%s %s (no teams configured)", cfg.Digest.Timezone, strings.Join(cfg.Digest.Slots, ", ")))
+		return
+	}
+	for _, t := range cfg.Teams {
+		slots, tz := cfg.DigestScheduleFor(t)
+		if err := checkDigestSchedule(slots, tz); err != nil {
+			add("digest schedule", StatusFail, fmt.Sprintf("%s: %s", t.Name, err))
+			continue
+		}
+		add("digest schedule", StatusOK, fmt.Sprintf("%s → %s %s", t.Name, tz, strings.Join(slots, ", ")))
+	}
+}
+
+func checkDigestSchedule(slots []string, timezone string) error {
+	if _, err := scheduler.ParseClocks(slots); err != nil {
+		return err
+	}
+	_, err := scheduler.LoadLocation(timezone)
+	return err
 }
 
 // claudeAuthStatus is the subset of `claude auth status --json` the doctor

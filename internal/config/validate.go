@@ -10,13 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sxwebdev/ai-reviewer/internal/llm"
-)
 
-// DigestLocation is the timezone the digest schedule is expressed in. It is
-// validated at load time so a stripped container image (no tzdata) fails at
-// startup instead of at 09:00.
-const DigestLocation = "Europe/Moscow"
+	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/sxwebdev/ai-reviewer/internal/scheduler"
+)
 
 // repoPathRe matches a GitLab project path: two or more slash-separated
 // segments of [A-Za-z0-9_.-]. A bare numeric id is accepted separately.
@@ -134,13 +131,34 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// --- digest ------------------------------------------------------------
+	// The global block is checked on its own even when every team overrides it:
+	// an unused default that cannot be parsed is a trap for the next team added.
+	// Everything goes through the scheduler's own parser and loader, so a schedule
+	// this service accepts is exactly one it can run and name. Rejecting it here
+	// rather than at the first firing is the point — a typo'd time is otherwise a
+	// service that starts clean and simply never sends a digest.
+	if _, err := scheduler.ParseClocks(c.Digest.Slots); err != nil {
+		add("digest.slots: %s", err)
+	}
+	if _, err := scheduler.LoadLocation(c.Digest.Timezone); err != nil {
+		add("digest.timezone: %s", err)
+	}
+	for _, t := range c.Teams {
+		slots, tz := c.DigestScheduleFor(t)
+		// Reported against the team, not against the key that happens to hold the
+		// value: an operator reading "teams[payments].digest" knows which digest
+		// is broken whether the offending value is the team's or the inherited one.
+		if _, err := scheduler.ParseClocks(slots); err != nil {
+			add("teams[%s].digest.slots: %s", t.Name, err)
+		}
+		if _, err := scheduler.LoadLocation(tz); err != nil {
+			add("teams[%s].digest.timezone: %s", t.Name, err)
+		}
+	}
+
 	// --- teams --------------------------------------------------------------
 	errs = append(errs, c.validateTeams()...)
-
-	// --- environment --------------------------------------------------------
-	if _, err := time.LoadLocation(DigestLocation); err != nil {
-		add("timezone %s cannot be loaded (missing tzdata in the image?): %s", DigestLocation, err)
-	}
 
 	return joinConfigErrors(errs)
 }
@@ -200,7 +218,20 @@ func (c *Config) validateTeams() []error {
 			}
 			repoOwner[r] = t.Name
 		}
-		for _, rawID := range t.LinearTeamIDs {
+		// Canonicalised in place, and this is the only place that can do it: the
+		// form is already proven here and nowhere else.
+		//
+		// uuid.Parse accepts uppercase, undashed, braced and `urn:uuid:` spellings,
+		// and Linear answers with exactly one — lowercase dashed. The client filters
+		// returned issues by comparing team ids as strings (its fail-closed team
+		// boundary), so a config written as
+		// `9CFB482A-81E3-4154-B5B9-2C805E70A02D` used to drop *every* issue: the
+		// board read as empty, both gates went inert, and nothing reported it — no
+		// warning, no partial status, `Linear · In Review: 0` in the digest and a
+		// green doctor line printing a healthy column split for a gate that could
+		// never fire. Comparing case-insensitively would fix only one of the four
+		// spellings, so the raw string is replaced with the canonical one instead.
+		for j, rawID := range t.LinearTeamIDs {
 			id, err := uuid.Parse(strings.TrimSpace(rawID))
 			if err != nil {
 				add("%s: linear_team_id %q is not a UUID", label, rawID)
@@ -211,6 +242,7 @@ func (c *Config) validateTeams() []error {
 				continue
 			}
 			linearOwner[id] = t.Name
+			c.Teams[i].LinearTeamIDs[j] = id.String()
 		}
 	}
 	return errs

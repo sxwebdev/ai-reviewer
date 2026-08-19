@@ -17,7 +17,7 @@ import (
 // derive the same (slot, run_date) from the same instant.
 func TestNewDigestArgsNamesTheSlot(t *testing.T) {
 	t.Parallel()
-	sched, err := scheduler.NewDigest()
+	sched, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,18 +33,21 @@ func TestNewDigestArgsNamesTheSlot(t *testing.T) {
 	}{
 		// The scheduled firings themselves.
 		{"exactly 09:00", at(9, 0), "09:00", "2026-08-13"},
-		{"exactly 16:30", at(16, 30), "16:30", "2026-08-13"},
+		{"exactly 14:00", at(14, 0), "14:00", "2026-08-13"},
+		{"exactly 17:30", at(17, 30), "17:30", "2026-08-13"},
 		// River's enqueuer fires near the instant, not on it. A job constructed
 		// half a minute late must still name its own slot, or it would file
 		// itself under a slot that does not exist and the digest_runs unique
 		// index would stop protecting the real one.
 		{"a few seconds late", at(9, 0).Add(31 * time.Second), "09:00", "2026-08-13"},
-		// A manual run in the afternoon belongs to the 16:30 digest.
-		{"manual run at 18:33", at(18, 33), "16:30", "2026-08-13"},
+		// A manual run after the last slot belongs to that slot.
+		{"manual run at 18:33", at(18, 33), "17:30", "2026-08-13"},
 		{"manual run at 11:00", at(11, 0), "09:00", "2026-08-13"},
+		// Between the middle and last slots — the window the middle slot added.
+		{"manual run at 16:00", at(16, 0), "14:00", "2026-08-13"},
 		// Before the first slot of the day the run belongs to yesterday's last.
-		{"manual run at 03:00", at(3, 0), "16:30", "2026-08-12"},
-		{"one second before 09:00", at(9, 0).Add(-time.Second), "16:30", "2026-08-12"},
+		{"manual run at 03:00", at(3, 0), "17:30", "2026-08-12"},
+		{"one second before 09:00", at(9, 0).Add(-time.Second), "17:30", "2026-08-12"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -57,10 +60,10 @@ func TestNewDigestArgsNamesTheSlot(t *testing.T) {
 	}
 
 	// The zone is the schedule's, not the caller's: 22:00 UTC is already the
-	// 14th in Moscow, and its most recent slot is the 13th's 16:30.
+	// 14th in Moscow, and its most recent slot is the 13th's 17:30.
 	night := time.Date(2026, 8, 13, 22, 0, 0, 0, time.UTC) // 01:00 MSK on the 14th
-	if got := jobs.NewDigestArgs("payments", sched, night, 0); got.RunDate != "2026-08-13" || got.Slot != "16:30" {
-		t.Errorf("night = %s %s, want 2026-08-13 16:30", got.RunDate, got.Slot)
+	if got := jobs.NewDigestArgs("payments", sched, night, 0); got.RunDate != "2026-08-13" || got.Slot != "17:30" {
+		t.Errorf("night = %s %s, want 2026-08-13 17:30", got.RunDate, got.Slot)
 	}
 
 	// --force takes the next attempt and changes nothing else.
@@ -73,7 +76,7 @@ func TestNewDigestArgsNamesTheSlot(t *testing.T) {
 	// A schedule with no location must resolve in UTC, never in container-local
 	// time — the dependency the whole type exists to remove.
 	utcNoon := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
-	if got := jobs.NewDigestArgs("payments", scheduler.Daily{Times: scheduler.DigestTimes}, utcNoon, 0); got.RunDate != "2026-08-13" || got.Slot != "09:00" {
+	if got := jobs.NewDigestArgs("payments", scheduler.Daily{Times: []scheduler.Clock{{Hour: 9}, {Hour: 14}, {Hour: 17, Minute: 30}}}, utcNoon, 0); got.RunDate != "2026-08-13" || got.Slot != "09:00" {
 		t.Errorf("= %s %s, want 2026-08-13 09:00 in UTC", got.RunDate, got.Slot)
 	}
 
@@ -101,8 +104,33 @@ func TestServiceAccessors(t *testing.T) {
 	if got := svc.Teams(); len(got) != len(teams) || got[0].Name != teams[0].Name {
 		t.Errorf("Teams() = %+v", got)
 	}
-	if svc.Schedule().Loc == nil || svc.Schedule().Loc.String() != scheduler.DigestTZ {
-		t.Errorf("Schedule() = %+v, want %s", svc.Schedule(), scheduler.DigestTZ)
+	// One schedule per team, each in that team's own zone — the fixture's two
+	// teams are deliberately in different ones. A single shared schedule would
+	// pass a test that only ever asked about the first team.
+	for _, want := range []struct{ team, tz, first string }{
+		{teams[0].Name, "Europe/Moscow", "09:00"},
+		{teams[1].Name, "Europe/Lisbon", "10:00"},
+	} {
+		sched, ok := svc.ScheduleFor(want.team)
+		if !ok {
+			t.Errorf("ScheduleFor(%q) found nothing", want.team)
+			continue
+		}
+		if sched.Loc == nil || sched.Loc.String() != want.tz {
+			t.Errorf("ScheduleFor(%q).Loc = %v, want %s", want.team, sched.Loc, want.tz)
+		}
+		if got := sched.Times[0].String(); got != want.first {
+			t.Errorf("ScheduleFor(%q) first slot = %s, want %s", want.team, got, want.first)
+		}
+	}
+	// Team names are matched the way config validates them: unique
+	// case-insensitively, so the lookup must be too or a manual `digest --team`
+	// typed in another case would name a slot nobody scheduled.
+	if _, ok := svc.ScheduleFor(strings.ToUpper(teams[0].Name)); !ok {
+		t.Error("ScheduleFor is case-sensitive; --team is not")
+	}
+	if _, ok := svc.ScheduleFor("no-such-team"); ok {
+		t.Error("ScheduleFor invented a schedule for an unconfigured team")
 	}
 }
 

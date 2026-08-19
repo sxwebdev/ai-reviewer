@@ -16,7 +16,7 @@ How the pieces fit, what one review actually does, and where state lives.
    │                                                                   │
    │   River periodic jobs        River workers                        │
    │   ├─ scan     (5m)  ──► scan_repo ──► review ──► publish_review   │
-   │   ├─ digest   (09:00/16:30) ──► slack_send                        │
+   │   ├─ digest   (per-team slots) ──► slack_send                     │
    │   └─ cleanup  (1h)                                                │
    │                                                                   │
    │   review engine: multi-pass Claude Code → skeptic → Go validator  │
@@ -45,7 +45,7 @@ Package layering, strictly downward
 | `internal/review`                    | the review engine: passes, skeptic, **validator**, line mapper, verifiers, risk, completeness   |
 | `internal/llm`                       | `Client` interface + the Claude Code CLI provider + deterministic auth env                     |
 | `internal/git`                       | ephemeral mirror clone + detached worktree at the head SHA                                     |
-| `internal/scheduler`                 | the daily 09:00/16:30 Europe/Moscow schedule (embeds tzdata)                                   |
+| `internal/scheduler`                 | one daily schedule per team, from its `digest.slots`/`digest.timezone` (embeds tzdata)         |
 | `internal/metrics`, `internal/security` | Prometheus collectors; secret redaction for logs and errors                                 |
 
 ### How one review runs
@@ -124,10 +124,19 @@ every team needs at least one repository and a Slack channel, and **one
 repository may not belong to two teams** — the error names both.
 
 `linear_team_ids` is optional. Each UUID may belong to only one application
-team. Linear provides an `In Review` aggregate and a completion gate for linked
-GitLab MRs: title identifier first, source branch fallback. One approval is
-enough to stop notifying remaining reviewers unless `REQUESTED_CHANGES` exists;
-an approved card still in `In Review` becomes an author action.
+team. Linear provides an `In Review` aggregate and two gates on linked GitLab MRs:
+title identifier first, source branch fallback.
+
+- **Readiness.** A card that has not reached `In Review` — graded against that
+  Linear team's own column order, not a list of names — asks nobody to review and
+  becomes an author action instead. It outranks approvals and `REQUESTED_CHANGES`.
+- **Completion.** At `In Review` or later, one readable approval stops notifying
+  remaining reviewers unless `REQUESTED_CHANGES` exists; an approved card still in
+  `In Review` becomes an author action.
+
+Both fail open into the ordinary GitLab classification, and every suppression on
+the readiness side produces an author row, so no merge request can leave the
+digest because of board state.
 
 `ai_review.enabled: false` turns off automated review for that team while
 keeping it in the digest. Digest scheduling is per team, so one team's failure

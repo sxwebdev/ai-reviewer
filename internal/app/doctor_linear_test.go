@@ -88,7 +88,12 @@ func TestCheckLinearAPISuccess(t *testing.T) {
 		teams: map[string]*linear.Team{
 			"linear-team-1": {
 				ID: "linear-team-1", Key: "PAY", Name: "Payments",
-				States: []linear.WorkflowState{{ID: "s1", Name: " in review "}},
+				States: []linear.WorkflowState{
+					{ID: "s-progress", Name: "In Progress", Type: "started", Position: 1},
+					// Padded and lower-cased on purpose: the In Review match is
+					// case- and space-insensitive everywhere.
+					{ID: "s-review", Name: " in review ", Type: "started", Position: 2},
+				},
 			},
 		},
 	}
@@ -102,11 +107,69 @@ func TestCheckLinearAPISuccess(t *testing.T) {
 	}
 }
 
+// With a per-team readiness gate, "when is my merge request going to reach a
+// reviewer" has no other answer available: the configuration names only In Review
+// and the team's own board decides what counts as before it. So doctor prints the
+// split rather than a bare OK.
+func TestCheckLinearAPIPrintsTheReviewGateSplit(t *testing.T) {
+	t.Parallel()
+	cfg := linearDoctorConfig(t)
+	api := fakeLinearDoctor{
+		viewer: &linear.User{ID: "u1", Name: "Bot"},
+		teams: map[string]*linear.Team{
+			"linear-team-1": {ID: "linear-team-1", Key: "PAY", Name: "Payments", States: linearBoard()},
+		},
+	}
+	col := &checkCollector{}
+	checkLinearAPI(t.Context(), col, api, cfg)
+
+	check := findLinearCheck(t, col.checks, "linear review gate")
+	if check.Status != StatusOK {
+		t.Fatalf("check = %+v, want ok", check)
+	}
+	// Board order, both sides named, so an operator can see where the line falls.
+	if !strings.Contains(check.Detail, "reviewed from [In Review, Done]") ||
+		!strings.Contains(check.Detail, "before [Backlog, In Progress]") {
+		t.Errorf("detail does not print the split: %s", check.Detail)
+	}
+}
+
+// A column whose type this build cannot order fails open — reviewers keep being
+// notified — which is safe but invisible. Doctor is what makes it visible.
+func TestCheckLinearAPIWarnsAboutUnorderableStates(t *testing.T) {
+	t.Parallel()
+	cfg := linearDoctorConfig(t)
+	states := append(linearBoard(), linear.WorkflowState{
+		ID: "s-paused", Name: "Paused", Type: "hibernating", Position: 3000,
+	})
+	api := fakeLinearDoctor{
+		viewer: &linear.User{ID: "u1", Name: "Bot"},
+		teams: map[string]*linear.Team{
+			"linear-team-1": {ID: "linear-team-1", Key: "PAY", Name: "Payments", States: states},
+		},
+	}
+	col := &checkCollector{}
+	checkLinearAPI(t.Context(), col, api, cfg)
+
+	check := findLinearCheck(t, col.checks, "linear review gate")
+	if check.Status != StatusWarn || !strings.Contains(check.Detail, "Paused") {
+		t.Errorf("check = %+v, want a warning naming the unorderable column", check)
+	}
+	// The team mapping itself is still fine: one bad column is not a broken team.
+	if mapping := findLinearCheck(t, col.checks, "linear teams"); mapping.Status != StatusOK {
+		t.Errorf("linear teams = %+v, want ok", mapping)
+	}
+}
+
 func TestCheckLinearAPIRejectsMissingOrAmbiguousState(t *testing.T) {
 	t.Parallel()
 	for _, states := range [][]linear.WorkflowState{
-		{{ID: "s1", Name: "Started"}},
-		{{ID: "s1", Name: "In Review"}, {ID: "s2", Name: "IN REVIEW"}},
+		{{ID: "s1", Name: "Started", Type: "started"}},
+		{{ID: "s1", Name: "In Review", Type: "started"}, {ID: "s2", Name: "IN REVIEW", Type: "started"}},
+		// A resolvable name whose *type* Linear does not report leaves the whole
+		// board unorderable, so it is a configuration failure like the other two
+		// rather than a silently dormant gate.
+		{{ID: "s1", Name: "In Review", Type: ""}},
 	} {
 		states := states
 		t.Run(states[0].Name, func(t *testing.T) {
@@ -127,7 +190,67 @@ func TestCheckLinearAPIRejectsMissingOrAmbiguousState(t *testing.T) {
 	}
 }
 
-// Every mapping is probed. Returning on the first bad UUID showed one problem
+// The split must survive another team being broken. Suppressing it whenever
+// anything else failed made the line absent in exactly the situation an operator
+// opens doctor for, and there is nowhere else that answers "which columns count as
+// before In Review for us".
+func TestCheckLinearAPIPrintsTheGateSplitEvenWhenAnotherTeamIsBroken(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	cfg.Teams[0].LinearTeamIDs = []string{"missing-team", "linear-team-ok"}
+	api := fakeLinearDoctor{
+		viewer: &linear.User{ID: "u1", Name: "Bot"},
+		teams: map[string]*linear.Team{
+			"linear-team-ok": {ID: "linear-team-ok", Key: "PAY", Name: "Payments", States: linearBoard()},
+		},
+	}
+	col := &checkCollector{}
+	checkLinearAPI(t.Context(), col, api, cfg)
+
+	if teams := findLinearCheck(t, col.checks, "linear teams"); teams.Status != StatusFail {
+		t.Fatalf("linear teams = %+v, want failure", teams)
+	}
+	gate := findLinearCheck(t, col.checks, "linear review gate")
+	if gate.Status != StatusOK || !strings.Contains(gate.Detail, "before [Backlog, In Progress]") {
+		t.Errorf("gate line = %+v, want the resolvable team's split", gate)
+	}
+}
+
+// Board order is type first, then position: a board whose positions disagree with
+// its types must still print in the team's own order.
+func TestCheckLinearAPIPrintsTheBoardInTypeThenPositionOrder(t *testing.T) {
+	t.Parallel()
+	cfg := linearDoctorConfig(t)
+	api := fakeLinearDoctor{
+		viewer: &linear.User{ID: "u1", Name: "Bot"},
+		teams: map[string]*linear.Team{
+			"linear-team-1": {ID: "linear-team-1", Key: "PAY", Name: "Payments", States: []linear.WorkflowState{
+				// Positions run backwards against the types on purpose.
+				{ID: "s-done", Name: "Done", Type: "completed", Position: 1},
+				{ID: "s-review", Name: linear.InReviewState, Type: "started", Position: 2},
+				{ID: "s-progress", Name: "In Progress", Type: "started", Position: 3},
+				{ID: "s-backlog", Name: "Backlog", Type: "backlog", Position: 4},
+			}},
+		},
+	}
+	col := &checkCollector{}
+	checkLinearAPI(t.Context(), col, api, cfg)
+
+	gate := findLinearCheck(t, col.checks, "linear review gate")
+	// Backlog sorts first despite carrying the largest position, and Done last
+	// despite the smallest, because type outranks position. A Position-only sort
+	// prints "[Done, In Review, In Progress]" instead.
+	if !strings.Contains(gate.Detail, "reviewed from [In Review, In Progress, Done]") {
+		t.Errorf("detail is not in board order: %s", gate.Detail)
+	}
+	// In Progress sits *after* In Review on this board, so it is not "before" —
+	// nothing here assumes a conventional column layout.
+	if !strings.Contains(gate.Detail, "before [Backlog]") {
+		t.Errorf("detail misgrades a column the team put after In Review: %s", gate.Detail)
+	}
+}
+
+// Every mapping is probed. Returning on the first bad UUID showed one problem// Every mapping is probed. Returning on the first bad UUID showed one problem
 // per run, so a config with several broken teams took several runs to fix.
 func TestCheckLinearAPIReportsEveryBadTeam(t *testing.T) {
 	t.Parallel()
@@ -138,11 +261,11 @@ func TestCheckLinearAPIReportsEveryBadTeam(t *testing.T) {
 		teams: map[string]*linear.Team{
 			"no-in-review": {
 				ID: "no-in-review", Key: "OPS", Name: "Operations",
-				States: []linear.WorkflowState{{ID: "s1", Name: "Started"}},
+				States: []linear.WorkflowState{{ID: "s1", Name: "Started", Type: "started"}},
 			},
 			"linear-team-ok": {
 				ID: "linear-team-ok", Key: "PAY", Name: "Payments",
-				States: []linear.WorkflowState{{ID: "s1", Name: "In Review"}},
+				States: linearBoard(),
 			},
 		},
 	}
@@ -248,7 +371,19 @@ func TestCheckLinearAPIBoundsItsOwnProbeBudget(t *testing.T) {
 func linearTeam(id string) *linear.Team {
 	return &linear.Team{
 		ID: id, Key: strings.ToUpper(id), Name: "Team " + id,
-		States: []linear.WorkflowState{{ID: "s1", Name: linear.InReviewState}},
+		States: linearBoard(),
+	}
+}
+
+// linearBoard is an ordinary Linear board. The types and positions are what the
+// readiness gate reads, so a fixture without them is a fixture whose gate never
+// resolves — which is exactly the state a real board must not be left in.
+func linearBoard() []linear.WorkflowState {
+	return []linear.WorkflowState{
+		{ID: "s-backlog", Name: "Backlog", Type: "backlog", Position: 0},
+		{ID: "s-progress", Name: "In Progress", Type: "started", Position: 1024},
+		{ID: "s-review", Name: linear.InReviewState, Type: "started", Position: 2048},
+		{ID: "s-done", Name: "Done", Type: "completed", Position: 4096},
 	}
 }
 

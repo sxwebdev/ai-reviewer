@@ -109,11 +109,16 @@ func (d Deps) validate() error {
 type Service struct {
 	*Queue
 
-	log      logger.Logger
-	cfg      Config
-	pool     *pgxpool.Pool
-	deps     Deps
-	schedule scheduler.Daily
+	log  logger.Logger
+	cfg  Config
+	pool *pgxpool.Pool
+	deps Deps
+
+	// schedules is one Daily per team, keyed by lower-cased name. Team names are
+	// validated unique case-insensitively, and the CLI resolves --team the same
+	// way, so the key is what makes "the schedule for this team" answerable from a
+	// job's args alone.
+	schedules map[string]scheduler.Daily
 
 	// stopping is closed at the top of Stop. It is what withShutdown watches:
 	// River's soft stop deliberately leaves in-flight jobs running, and one of the
@@ -130,17 +135,17 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 	}
 	cfg = cfg.normalized()
 
-	// Built here rather than at first use so a stripped image with no tzdata
-	// fails at startup instead of at 09:00. (internal/scheduler embeds tzdata,
-	// so this should not fail; the check costs nothing and the failure mode it
-	// guards is invisible until the first missed digest.)
-	digestSchedule, err := scheduler.NewDigest()
+	// Built here rather than at first use so a malformed slot or an unknown zone
+	// fails at startup instead of at the first digest slot. Every team is built,
+	// not just the first, because a schedule nobody validated until its first slot
+	// fires is the failure this is placed here to prevent.
+	schedules, err := teamSchedules(cfg.Teams)
 	if err != nil {
 		return nil, err
 	}
 
 	s := &Service{
-		log: log, cfg: cfg, pool: pool, deps: deps, schedule: digestSchedule,
+		log: log, cfg: cfg, pool: pool, deps: deps, schedules: schedules,
 		stopping: make(chan struct{}),
 	}
 
@@ -149,7 +154,7 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 	river.AddWorker(workers, &ScanRepoWorker{log: log, svc: s, scanner: deps.Scanner})
 	river.AddWorker(workers, &ReviewWorker{log: log, svc: s, reviewer: deps.Reviewer})
 	river.AddWorker(workers, &PublishReviewWorker{log: log, reviewer: deps.Reviewer})
-	river.AddWorker(workers, &DigestWorker{log: log, svc: s, digester: deps.Digester, schedule: digestSchedule})
+	river.AddWorker(workers, &DigestWorker{log: log, svc: s, digester: deps.Digester})
 	river.AddWorker(workers, &SlackSendWorker{log: log, digester: deps.Digester})
 	river.AddWorker(workers, &CleanupWorker{log: log, workdir: cfg.WorkDir})
 
@@ -161,7 +166,7 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 			QueueSlack:   {MaxWorkers: cfg.SlackWorkers},
 		},
 		Workers:      workers,
-		PeriodicJobs: periodicJobs(cfg, digestSchedule),
+		PeriodicJobs: periodicJobs(cfg, schedules),
 		// Without this, Stop hard-cancels every in-flight job immediately. The
 		// cancelled ones are durable and would be re-run, but a review cancelled
 		// at minute 25 of 30 has burned its tokens for nothing.
@@ -174,9 +179,26 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 	return s, nil
 }
 
+// teamSchedules resolves every configured team's digest schedule.
+//
+// A team whose slots or zone cannot be parsed is a startup failure naming the
+// team: the alternative is a service that runs for every other team and silently
+// never sends this one's digest.
+func teamSchedules(teams []domain.Team) (map[string]scheduler.Daily, error) {
+	out := make(map[string]scheduler.Daily, len(teams))
+	for _, t := range teams {
+		sched, err := scheduler.NewDigest(t.DigestSlots, t.DigestTimezone)
+		if err != nil {
+			return nil, fmt.Errorf("digest schedule for team %q: %w", t.Name, err)
+		}
+		out[strings.ToLower(t.Name)] = sched
+	}
+	return out, nil
+}
+
 // periodicJobs builds the leader-only schedule (§6.6). River elects one leader
 // across replicas, so these insert exactly once however many pods are running.
-func periodicJobs(cfg Config, schedule scheduler.Daily) []*river.PeriodicJob {
+func periodicJobs(cfg Config, schedules map[string]scheduler.Daily) []*river.PeriodicJob {
 	jobs := []*river.PeriodicJob{
 		river.NewPeriodicJob(
 			river.PeriodicInterval(cfg.ScanInterval),
@@ -198,7 +220,19 @@ func periodicJobs(cfg Config, schedule scheduler.Daily) []*river.PeriodicJob {
 	// returns a single JobArgs, and a fan-out kind would be an eighth job kind
 	// that exists only to work around that. Each team's DigestArgs hash to a
 	// different unique key, so the slot cannot be double-sent either way.
+	//
+	// Per-team schedules make this the only shape that works at all: one River
+	// periodic job carries one PeriodicSchedule, so two teams on different slots
+	// need two jobs regardless.
 	for _, team := range cfg.Teams {
+		schedule, ok := schedules[strings.ToLower(team.Name)]
+		if !ok {
+			// Unreachable: teamSchedules is built from the same slice. Skipping is
+			// the honest response to a map that has drifted from cfg.Teams —
+			// scheduling a team in the wrong zone would be worse than not
+			// scheduling it, and NewService already refused every real failure.
+			continue
+		}
 		jobs = append(jobs, river.NewPeriodicJob(
 			schedule,
 			func() (river.JobArgs, *river.InsertOpts) {
@@ -222,8 +256,8 @@ func periodicJobs(cfg Config, schedule scheduler.Daily) []*river.PeriodicJob {
 			// inserted — no digest_runs row, no job, nothing looking for it.
 			// RunOnStart is documented as the hedge for exactly that.
 			//
-			// The reason it was off — "a restart at 11:00 must not fire the
-			// 09:00 digest" — is handled twice over: the constructor refuses a
+			// The reason it was off — "a restart between slots must not re-fire
+			// the earlier one" — is handled twice over: the constructor refuses a
 			// slot from an earlier day, and BuildDigest is idempotent per
 			// (team, run_date, slot, attempt), so a slot that WAS delivered is
 			// recognised and reused rather than sent again. What is left is the
@@ -242,8 +276,8 @@ func periodicJobs(cfg Config, schedule scheduler.Daily) []*river.PeriodicJob {
 // elapsed, so the slot it snaps to is that same slot, today. The check bites
 // only on the RunOnStart path, where `at` can be any time a replica happened to
 // win the leader election — 03:00, when the slot the instant belongs to is
-// yesterday's 16:30. Yesterday's digest is not worth sending; today's, missing,
-// is.
+// yesterday's last one. Yesterday's digest is not worth sending; today's,
+// missing, is.
 func digestSlotForNow(team string, schedule scheduler.Daily, at time.Time) (DigestArgs, bool) {
 	slot, ok := schedule.SlotAt(at)
 	if !ok {
@@ -265,9 +299,14 @@ const runDateLayout = "2006-01-02"
 // Teams returns the configured teams.
 func (s *Service) Teams() []domain.Team { return s.cfg.Teams }
 
-// Schedule is the digest schedule. The CLI needs it to name the slot and run
-// date of a manual digest exactly as the scheduled run would have.
-func (s *Service) Schedule() scheduler.Daily { return s.schedule }
+// ScheduleFor is one team's digest schedule, and reports whether that team is
+// configured. The CLI needs it to name the slot and run date of a manual digest
+// exactly as the scheduled run would have — which, with per-team schedules, is
+// only true if it asks for the same team's.
+func (s *Service) ScheduleFor(team string) (scheduler.Daily, bool) {
+	sched, ok := s.schedules[strings.ToLower(team)]
+	return sched, ok
+}
 
 // NewDigestArgs names the digest run that the instant `at` belongs to: the most
 // recent scheduled slot at or before it.

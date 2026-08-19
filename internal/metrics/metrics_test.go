@@ -271,17 +271,66 @@ func TestHelpersUpdateEveryCollector(t *testing.T) {
 	})
 
 	t.Run("SetTeamState overwrites, does not accumulate", func(t *testing.T) {
-		SetTeamState(team, TeamState{WaitingHumanReview: 5, UnresolvedThreads: 4, Conflicts: 3, FailedPipeline: 2})
-		SetTeamState(team, TeamState{}) // a later scan found nothing — must read zero
-		for name, g := range map[string]*prometheus.GaugeVec{
+		// Every field SetTeamState owns is set, so a gauge added to TeamState and
+		// forgotten here is a failing test rather than a series that never appears.
+		// LinearNotReady is deliberately absent: it is the one field that can be
+		// *unknown* rather than zero, so it is published by SetLinearNotReady and
+		// covered by the subtest below.
+		SetTeamState(team, TeamState{
+			WaitingHumanReview: 5, ChangesRequested: 6, UnresolvedThreads: 4, Conflicts: 3,
+			FailedPipeline: 2, LinearNotReady: 7, ApprovalsUnknown: 8,
+		})
+		if got := testutil.CollectAndCount(MergeRequestsLinearNotReady); got != 0 {
+			t.Errorf("linear_not_ready published %d series from SetTeamState; it must go through SetLinearNotReady", got)
+		}
+		gauges := map[string]*prometheus.GaugeVec{
 			"waiting_human_review": MergeRequestsWaitingHumanReview,
+			"changes_requested":    MergeRequestsWithChangesRequested,
 			"unresolved_threads":   MergeRequestsWithUnresolvedThreads,
 			"conflicts":            MergeRequestsWithConflicts,
 			"failed_pipeline":      MergeRequestsWithFailedPipeline,
-		} {
+			"unknown_approvals":    MergeRequestsWithUnknownApprovals,
+		}
+		want := map[string]float64{
+			"waiting_human_review": 5, "changes_requested": 6, "unresolved_threads": 4,
+			"conflicts": 3, "failed_pipeline": 2, "unknown_approvals": 8,
+		}
+		for name, g := range gauges {
+			if got := testutil.ToFloat64(g.WithLabelValues(team)); got != want[name] {
+				t.Errorf("%s = %v, want %v", name, got, want[name])
+			}
+		}
+		SetTeamState(team, TeamState{}) // a later scan found nothing — must read zero
+		for name, g := range gauges {
 			if got := testutil.ToFloat64(g.WithLabelValues(team)); got != 0 {
 				t.Errorf("%s = %v, want 0 after a clean scan", name, got)
 			}
+		}
+	})
+
+	// Absent, not zero. With the column order unreadable every card grades unknown,
+	// so the count computes to zero while the merge requests are still parked — a
+	// zero here says "nothing is stuck before In Review" at exactly the moment the
+	// service lost the ability to tell.
+	t.Run("SetLinearNotReady clears rather than zeroes", func(t *testing.T) {
+		gateTeam := uniqueLabel("linear-not-ready-team")
+		SetLinearNotReady(gateTeam, 5)
+		if got := testutil.ToFloat64(MergeRequestsLinearNotReady.WithLabelValues(gateTeam)); got != 5 {
+			t.Errorf("linear_not_ready = %v, want 5", got)
+		}
+		before := testutil.CollectAndCount(MergeRequestsLinearNotReady)
+		ClearLinearNotReady(gateTeam)
+		if got := testutil.CollectAndCount(MergeRequestsLinearNotReady); got != before-1 {
+			t.Errorf("series count = %d, want %d — the team's series must be absent, not zero", got, before-1)
+		}
+	})
+
+	t.Run("LinearGateAmbiguous", func(t *testing.T) {
+		ambiguous := uniqueLabel("ambiguous-team")
+		LinearGateAmbiguous(ambiguous)
+		LinearGateAmbiguous(ambiguous)
+		if got := testutil.ToFloat64(LinearGateAmbiguousTotal.WithLabelValues(ambiguous)); got != 2 {
+			t.Errorf("linear_gate_ambiguous_total = %v, want 2", got)
 		}
 	})
 

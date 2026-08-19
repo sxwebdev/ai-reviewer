@@ -24,6 +24,15 @@ type Team struct {
 	AIReview      bool // team-level switch for automated review
 	LinearTeamIDs []string
 	Repositories  []string
+
+	// DigestSlots and DigestTimezone are this team's digest schedule, already
+	// resolved against the global default — never empty for a configured team.
+	// They are carried here, rather than looked up from config where the schedule
+	// is needed, because a digest belongs to a team: the CLI, the periodic job and
+	// the worker all have to agree on which slots one team has, and passing them
+	// with the team is what makes disagreeing impossible.
+	DigestSlots    []string
+	DigestTimezone string
 }
 
 // User is a GitLab account as the digest needs it. Email is frequently empty —
@@ -251,14 +260,25 @@ type Pipeline struct {
 // assembled once per run (see plan §9.4: one MR is fetched once) and then fed
 // to the classifiers below; nothing in this package mutates it.
 type MergeRequestSnapshot struct {
-	Team         string
-	Project      Project
-	MR           MergeRequest
-	HeadSHA      string
-	Reviewers    []Reviewer
-	ApprovedBy   []User
-	Discussions  []Discussion
-	Mergeability Mergeability
-	Pipeline     Pipeline
-	LastPushAt   time.Time // created_at of the latest diff version
+	Team       string
+	Project    Project
+	MR         MergeRequest
+	HeadSHA    string
+	Reviewers  []Reviewer
+	ApprovedBy []User
+	// ApprovalsKnown separates "nobody approved" from "we could not ask".
+	//
+	// It exists because an empty ApprovedBy used to mean both, and the second
+	// meaning became load-bearing the moment Linear started using approvals to
+	// decide a review was finished: where GET /approvals answers 401/403 — a
+	// service account below Reporter, or a project that restricts merge-request
+	// access — every merge request looks unapproved for as long as that lasts, so
+	// the completion gate can never fire and the digest keeps nudging reviewers who
+	// have already approved, with nothing anywhere saying why.
+	// Consumers must treat false as "unknown" and fail open, never as zero.
+	ApprovalsKnown bool
+	Discussions    []Discussion
+	Mergeability   Mergeability
+	Pipeline       Pipeline
+	LastPushAt     time.Time // created_at of the latest diff version
 }

@@ -121,6 +121,17 @@ func (a *App) checkLinear(ctx context.Context, col *checkCollector) {
 type linearTeamProbe struct {
 	mapping string
 	problem string
+	// gate is the team's column order as the readiness gate reads it. Printed
+	// separately from mapping because with a per-team gate "why did my merge
+	// request not reach a reviewer" has no other answer available anywhere: the
+	// configuration names only In Review, and which columns count as before it is
+	// decided by the team's own board.
+	gate string
+	// gateWarn names states whose order could not be established. Those cards fail
+	// open — reviewers are notified as before — which is safe but silent, and a
+	// column Linear reports with a type this build does not know will stay that way
+	// until somebody is told.
+	gateWarn string
 }
 
 func checkLinearAPI(ctx context.Context, col *checkCollector, api linearDoctorAPI, cfg *config.Config) {
@@ -175,6 +186,34 @@ func checkLinearAPI(ctx context.Context, col *checkCollector, api linearDoctorAP
 		}
 		mappings = append(mappings, p.mapping)
 	}
+	// The gate line is emitted before any early return and carries the splits *and*
+	// the warnings together. Suppressing the splits whenever something else was
+	// broken made the line absent in exactly the situation an operator opens doctor
+	// for — "why did my merge request not reach a reviewer" — and there is no other
+	// place that answers it, because only the team's own board decides which columns
+	// count as before In Review.
+	var gates, gateWarns []string
+	for _, p := range probes {
+		if p.gate != "" {
+			gates = append(gates, p.gate)
+		}
+		if p.gateWarn != "" {
+			gateWarns = append(gateWarns, p.gateWarn)
+		}
+	}
+	if len(gates) > 0 || len(gateWarns) > 0 {
+		status := StatusOK
+		detail := strings.Join(gates, "; ")
+		if len(gateWarns) > 0 {
+			status = StatusWarn
+			if detail != "" {
+				detail += "; "
+			}
+			detail += strings.Join(gateWarns, "; ")
+		}
+		col.add("linear review gate", status, "%s", detail)
+	}
+
 	if len(problems) > 0 {
 		// The working mappings are named alongside, same rule as checkUserMap: a
 		// summary that prints only what is broken leaves an operator unable to tell
@@ -194,18 +233,43 @@ func probeLinearTeam(ctx context.Context, api linearDoctorAPI, appTeam, id strin
 	if err != nil {
 		return linearTeamProbe{problem: fmt.Sprintf("%s → %s: %s", appTeam, id, security.Mask(err.Error()))}
 	}
-	matches := 0
-	for _, state := range team.States {
-		if strings.EqualFold(strings.TrimSpace(state.Name), linear.InReviewState) {
-			matches++
+	// linear.NewWorkflow rather than a local scan for the In Review state: the
+	// digest decides "before review" with this exact constructor, and a doctor that
+	// re-implemented the check would pass on a board the digest cannot order.
+	wf, err := linear.NewWorkflow(team.States)
+	if err != nil {
+		return linearTeamProbe{problem: fmt.Sprintf("%s → %s: %s", appTeam, team.Label(), err)}
+	}
+
+	probe := linearTeamProbe{mapping: fmt.Sprintf("%s → %s", appTeam, team.Label())}
+	states := slices.Clone(team.States)
+	// linear.CompareStates, not a Position sort: Position only ranks columns that
+	// share a type, so sorting on it alone interleaves a backlog column with a
+	// started one and the printed board stops matching the team's own.
+	slices.SortStableFunc(states, linear.CompareStates)
+	var before, atOrAfter, unknown []string
+	for _, st := range states {
+		name := strings.TrimSpace(st.Name)
+		switch wf.Stage(st) {
+		case linear.StageBeforeReview:
+			before = append(before, name)
+		case linear.StageReviewOrLater:
+			atOrAfter = append(atOrAfter, name)
+		case linear.StageUnknown:
+			unknown = append(unknown, name)
 		}
 	}
-	if matches != 1 {
-		return linearTeamProbe{problem: fmt.Sprintf(
-			"%s → %s (%s): expected exactly one %q workflow state, found %d",
-			appTeam, team.Name, team.Key, linear.InReviewState, matches)}
+	// The board is named as well as the service team: a service team may map several
+	// linear_team_ids, and two segments both prefixed "payments" cannot be
+	// attributed to a board — which is the one question this line exists to answer.
+	label := fmt.Sprintf("%s → %s", appTeam, team.Label())
+	probe.gate = fmt.Sprintf("%s: reviewed from [%s], parked with the author before [%s]",
+		label, strings.Join(atOrAfter, ", "), strings.Join(before, ", "))
+	if len(unknown) > 0 {
+		probe.gateWarn = fmt.Sprintf("%s: cannot order [%s] against %q, so merge requests on those statuses keep notifying reviewers",
+			label, strings.Join(unknown, ", "), linear.InReviewState)
 	}
-	return linearTeamProbe{mapping: fmt.Sprintf("%s → %s (%s)", appTeam, team.Name, team.Key)}
+	return probe
 }
 
 // checkPostgres verifies the connection, the application's migration state and
@@ -379,10 +443,17 @@ func firstRepository(a *App) string {
 // into a pre-sized slice, so the summary reports in config order rather than in
 // completion order.
 type repoProbe struct {
-	name     string
-	status   CheckStatus
-	detail   string
-	pipeline pipelineVisibility
+	name      string
+	status    CheckStatus
+	detail    string
+	pipeline  pipelineVisibility
+	approvals approvalsVisibility
+	// unlistable records that the merge-request listing itself was refused, which
+	// is *not* the same as "this repository has no open merge requests" — and both
+	// per-merge-request verdicts collapsed into that claim, so a 403 on the listing
+	// printed "no open merge request to check /approvals against" at a repository
+	// with forty of them.
+	unlistable bool
 }
 
 type pipelineVisibility int
@@ -396,6 +467,33 @@ const (
 	// tells operators of repositories with no CI to go change project
 	// membership to fix something that is not broken.
 	pipelineNone
+)
+
+// approvalsVisibility mirrors pipelineVisibility for GET /approvals, and exists
+// for the same reason: the endpoint failing is invisible in normal operation but
+// disables a whole digest feature. Every merge request then looks unapproved,
+// which makes both Linear completion rules inert — reviewers keep being nudged
+// after approving, and no author is ever asked to advance their card.
+//
+// `GET /projects/:id/merge_requests/:iid/approvals` is available on **every**
+// GitLab tier; only approval *rules* are Premium (internal/gitlab/endpoints.go
+// says so at the call site). So a refusal here is a **permissions** problem with
+// the same remedy as hidden pipelines — at least Reporter — and reporting it as a
+// licensing limit sends the operator to buy a tier they already have while the
+// real fix is one membership change.
+//
+// `approvalsError` is separate from `approvalsUnknown` because collapsing them
+// made a 5xx print "no open merge request to check /approvals against" at a
+// repository with forty of them, and made an inconclusive repository disappear
+// entirely as soon as another one answered — the silent gap this check exists to
+// close.
+type approvalsVisibility int
+
+const (
+	approvalsUnknown approvalsVisibility = iota // nothing to look at: no open MR
+	approvalsVisible
+	approvalsHidden // 401/403: the service account may not read approvals
+	approvalsError  // asked, and the answer settled nothing
 )
 
 // checkRepositories resolves every configured repository in parallel and, for
@@ -437,6 +535,10 @@ func (a *App) checkRepositories(ctx context.Context, col *checkCollector, gl git
 	var hidden []string
 	var noPipeline []string
 	var visible int
+	var approvalsBlind []string
+	var approvalsBroken []string
+	var approvalsOK int
+	var unlistable []string
 	for _, p := range probes {
 		if p.status == StatusFail {
 			unresolved = append(unresolved, p.name+" ("+p.detail+")")
@@ -449,6 +551,19 @@ func (a *App) checkRepositories(ctx context.Context, col *checkCollector, gl git
 		case pipelineNone:
 			noPipeline = append(noPipeline, p.name)
 		case pipelineUnknown:
+			// No open merge request to inspect — nothing can be concluded.
+		}
+		if p.unlistable {
+			unlistable = append(unlistable, p.name)
+		}
+		switch p.approvals {
+		case approvalsVisible:
+			approvalsOK++
+		case approvalsHidden:
+			approvalsBlind = append(approvalsBlind, p.name)
+		case approvalsError:
+			approvalsBroken = append(approvalsBroken, p.name)
+		case approvalsUnknown:
 			// No open merge request to inspect — nothing can be concluded.
 		}
 	}
@@ -478,8 +593,54 @@ func (a *App) checkRepositories(ctx context.Context, col *checkCollector, gl git
 		col.add("pipeline visibility", StatusOK,
 			"no pipeline has run for the merge request checked in %s; nothing is being hidden",
 			strings.Join(noPipeline, ", "))
+	case len(unlistable) > 0:
+		// Said instead of "no open merge request": the listing was refused, so
+		// nothing is known about this repository's merge requests either way.
+		col.add("pipeline visibility", StatusWarn,
+			"the merge request listing was refused in %s, so head_pipeline could not be checked anywhere",
+			strings.Join(unlistable, ", "))
 	default:
 		col.add("pipeline visibility", StatusWarn, "no open merge request to check head_pipeline against")
+	}
+
+	// The consequence clause is conditional on Linear actually being configured:
+	// without it `linked` is always false, so neither completion rule can fire and
+	// promising an operator that "no author is asked to advance their Linear card"
+	// describes a feature they do not run.
+	consequence := "every merge request reads as unapproved, so reviewers keep being nudged after approving"
+	if usesLinear(a.Config) {
+		consequence += " and no author is asked to advance their Linear card"
+	}
+	var approvalProblems []string
+	if len(approvalsBlind) > 0 {
+		approvalProblems = append(approvalProblems, fmt.Sprintf(
+			"refused in %s — the service account needs at least Reporter (approvals are available on every GitLab tier, so this is access, not licensing); while it is refused, %s",
+			strings.Join(approvalsBlind, ", "), consequence))
+	}
+	if len(approvalsBroken) > 0 {
+		approvalProblems = append(approvalProblems, fmt.Sprintf(
+			"could not be checked in %s — the request answered, but settled nothing",
+			strings.Join(approvalsBroken, ", ")))
+	}
+	if len(unlistable) > 0 {
+		approvalProblems = append(approvalProblems, fmt.Sprintf(
+			"not reached in %s — the merge request listing was refused there",
+			strings.Join(unlistable, ", ")))
+	}
+	switch {
+	case len(approvalProblems) > 0:
+		detail := strings.Join(approvalProblems, "; ")
+		if approvalsOK > 0 {
+			// Named alongside, same rule as checkUserMap and the Linear teams check: a
+			// summary that prints only the bad half leaves an operator unable to tell a
+			// repository that passed from one that was never asked.
+			detail += fmt.Sprintf("; readable in %d other repository/-ies", approvalsOK)
+		}
+		col.add("approvals visibility", StatusWarn, "%s", detail)
+	case approvalsOK > 0:
+		col.add("approvals visibility", StatusOK, "approvals are readable in %d repository/-ies", approvalsOK)
+	default:
+		col.add("approvals visibility", StatusWarn, "no open merge request to check /approvals against")
 	}
 }
 
@@ -500,10 +661,26 @@ func probeRepository(ctx context.Context, gl gitlab.API, team, repo string) repo
 	// list, so the probe needs two calls: one to find an open MR and one to
 	// load it.
 	open, err := gl.ListOpenMRs(ctx, key)
-	if err != nil || len(open) == 0 {
+	if err != nil {
+		p.pipeline, p.unlistable = pipelineUnknown, true
+		return p
+	}
+	if len(open) == 0 {
 		p.pipeline = pipelineUnknown
 		return p
 	}
+	// Asked before the pipeline branches below return, so the answer is recorded
+	// for every repository with an open merge request rather than only for the
+	// ones whose pipeline story is inconclusive.
+	switch _, err := gl.GetMRApprovals(ctx, key, open[0].IID); {
+	case err == nil:
+		p.approvals = approvalsVisible
+	case isForbidden(err):
+		p.approvals = approvalsHidden
+	default:
+		p.approvals = approvalsError
+	}
+
 	mr, err := gl.GetMR(ctx, key, open[0].IID)
 	if err != nil {
 		p.pipeline = pipelineUnknown
@@ -602,8 +779,8 @@ func (a *App) checkSlack(ctx context.Context, col *checkCollector) {
 //
 // It exists because `doctor` used to stop at auth.test and channel membership,
 // and passed green while every mention in the digest was broken: the token was
-// missing the users:read scope, so users.list failed at 09:00 and each person was
-// named without a ping. A diagnostic that cannot see the most common Slack
+// missing the users:read scope, so users.list failed at the first digest slot and
+// each person was named without a ping. A diagnostic that cannot see the most common Slack
 // misconfiguration is not doing its job.
 //
 // Split out from checkSlack and taking slack.UserLister (the interface

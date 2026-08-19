@@ -30,6 +30,20 @@ service:
   slack_send_enabled: false
   ai_review_publish_enabled: false
 
+digest:
+  # The default schedule. Any team may override either half in teams[].digest.
+  #
+  # slots are wall-clock times in `timezone`, and they are also the values stored
+  # in digest_runs.slot — so editing either starts a new series: runs already
+  # filed under a slot you remove keep their old name, and on the day of the
+  # change a replica that starts after a newly added slot has passed will build
+  # that slot too. One extra digest, once.
+  timezone: Europe/Moscow
+  slots:
+    - "09:00"
+    - "14:00"
+    - "17:30"
+
 postgres:
   host: localhost
   port: "5432"
@@ -190,3 +204,10 @@ teams:
     ai_review: { enabled: false }
     linear_team_ids: []
     repositories: [platform/auth, platform/gateway]
+    # Either half of the schedule can be overridden on its own, and they inherit
+    # independently: a team in another country usually keeps the company's slot
+    # times, a team with an unusual rhythm usually keeps the zone. Omit the block
+    # entirely — as `payments` does above — to inherit both.
+    digest:
+      timezone: Europe/Lisbon
+      slots: ["10:00", "18:00"]

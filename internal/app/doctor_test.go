@@ -115,7 +115,10 @@ func TestDoctorMarksChecksThatRanAgainstDefaults(t *testing.T) {
 
 	// And marked on every line that read configuration, so a reader skimming
 	// the list cannot mistake one for a fact about their setup.
-	for _, name := range []string{"gitlab tls", "claude cli", "claude auth"} {
+	// "digest schedule" is on this list because the schedule became configuration:
+	// with the config unloadable the line prints the built-in times, and unmarked
+	// that reads as the operator's own schedule.
+	for _, name := range []string{"gitlab tls", "claude cli", "claude auth", "digest schedule"} {
 		c, ok := byName[name]
 		if !ok {
 			continue // claude auth is absent when the binary is not installed
@@ -129,8 +132,15 @@ func TestDoctorMarksChecksThatRanAgainstDefaults(t *testing.T) {
 	if c := byName["git"]; strings.HasPrefix(c.Detail, defaultsPrefix) {
 		t.Errorf("git is not a config-derived check: %s", c.Detail)
 	}
-	if c := byName["timezone"]; strings.HasPrefix(c.Detail, defaultsPrefix) {
-		t.Errorf("timezone is not a config-derived check: %s", c.Detail)
+	// Every name asserted above must actually exist, or the assertion is vacuous:
+	// a map miss yields the zero DoctorCheck and HasPrefix("", …) is false whatever
+	// the code does. This list held "timezone" — a check this tree no longer emits —
+	// so it could not fail, and it was hiding that its successor prints a built-in
+	// schedule unmarked.
+	for _, name := range []string{"config", "config source", "git", "digest schedule"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("no %q check in the report, so the assertions about it are vacuous: %+v", name, checks)
+		}
 	}
 }
 

@@ -479,12 +479,17 @@ func (a *App) jobsConfig() jobs.Config {
 func Teams(cfg *config.Config) []domain.Team {
 	out := make([]domain.Team, 0, len(cfg.Teams))
 	for _, t := range cfg.Teams {
+		slots, tz := cfg.DigestScheduleFor(t)
 		out = append(out, domain.Team{
 			Name:          t.Name,
 			SlackChannel:  t.SlackChannel,
 			AIReview:      t.AIReview.Enabled,
 			LinearTeamIDs: append([]string(nil), t.LinearTeamIDs...),
 			Repositories:  t.Repositories,
+			// Copied: the resolver may hand back the global slice, and a team
+			// mutating it would silently rewrite every other team's schedule.
+			DigestSlots:    append([]string(nil), slots...),
+			DigestTimezone: tz,
 		})
 	}
 	return out

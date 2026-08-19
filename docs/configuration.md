@@ -78,6 +78,9 @@ Two defaults are worth reading before you trust the table:
 | **Dry-run switches**                              |                                      |                     |
 | `AI_REVIEWER_SERVICE_SLACK_SEND_ENABLED`          | `service.slack_send_enabled`         | `false`             |
 | `AI_REVIEWER_SERVICE_AI_REVIEW_PUBLISH_ENABLED`   | `service.ai_review_publish_enabled`  | `false`             |
+| **Digest schedule**                               |                                      |                     |
+| `AI_REVIEWER_DIGEST_TIMEZONE`                     | `digest.timezone`                    | `Europe/Moscow`     |
+| `AI_REVIEWER_DIGEST_SLOTS`                        | `digest.slots`                       | `09:00,14:00,17:30` |
 | **PostgreSQL**                                    |                                      |                     |
 | `AI_REVIEWER_POSTGRES_HOST`                       | `postgres.host`                      | `localhost`         |
 | `AI_REVIEWER_POSTGRES_PORT`                       | `postgres.port`                      | `5432`              |

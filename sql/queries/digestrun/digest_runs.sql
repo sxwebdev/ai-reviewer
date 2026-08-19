@@ -21,7 +21,7 @@ LIMIT 1;
 
 -- GetBySlotAttempt addresses one specific run. It is what the scheduled job must
 -- use: `digest --force` earlier in the day creates attempt 1, so asking GetBySlot
--- whether the 09:00 slot already ran would answer "yes, attempt 1" and the
+-- whether a slot already ran would answer "yes, attempt 1" and the
 -- scheduled attempt 0 would collide with digest_runs_slot_uniq instead of being
 -- recognised as a run that has not happened yet.
 -- name: GetBySlotAttempt :one

@@ -41,11 +41,6 @@ func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 				return err
 			}
 
-			schedule, err := scheduler.NewDigest()
-			if err != nil {
-				return err
-			}
-
 			pg, q, err := a.Queue(ctx)
 			if err != nil {
 				return err
@@ -59,6 +54,15 @@ func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 
 			now := time.Now()
 			for _, team := range teams {
+				// Built per team, from the schedule the team carries: a manual digest
+				// has to land on exactly the slot and calendar day the scheduled run
+				// would have used, and with per-team schedules one shared Daily would
+				// name another team's slot — which the digest_runs unique index cannot
+				// catch, because it is a different slot rather than a repeat.
+				schedule, err := scheduler.NewDigest(team.DigestSlots, team.DigestTimezone)
+				if err != nil {
+					return fmt.Errorf("digest schedule for team %q: %w", team.Name, err)
+				}
 				if err := enqueueDigest(ctx, q, st, team, schedule, now, cmd.Bool("force")); err != nil {
 					return err
 				}

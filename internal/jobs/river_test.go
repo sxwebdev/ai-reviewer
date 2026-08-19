@@ -186,7 +186,7 @@ func TestDigestUniquenessPerSlot(t *testing.T) {
 		args jobs.DigestArgs
 	}{
 		{"--force takes the next attempt", jobs.DigestArgs{Team: team, Slot: "09:00", RunDate: "2026-08-13", Attempt: 1}},
-		{"the other slot of the same day", jobs.DigestArgs{Team: team, Slot: "16:30", RunDate: "2026-08-13", Attempt: 0}},
+		{"the other slot of the same day", jobs.DigestArgs{Team: team, Slot: "17:30", RunDate: "2026-08-13", Attempt: 0}},
 		{"the next day", jobs.DigestArgs{Team: team, Slot: "09:00", RunDate: "2026-08-14", Attempt: 0}},
 		{"another team", jobs.DigestArgs{Team: f.team(1).Name, Slot: "09:00", RunDate: "2026-08-13", Attempt: 0}},
 	}

@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
@@ -23,6 +25,17 @@ import (
 )
 
 var digestDay = time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+
+// mustGather reads the default registry, which is the only way to tell an absent
+// series from a zero one — testutil.ToFloat64 creates the series it reads.
+func mustGather(t *testing.T) []*dto.MetricFamily {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	return families
+}
 
 func TestTruncateDay(t *testing.T) {
 	t.Parallel()
@@ -225,7 +238,7 @@ func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *test
 	issue := linear.Issue{
 		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
 		URL:   "https://linear.app/CHAIN-184",
-		State: linear.WorkflowState{Name: linear.InReviewState},
+		State: testState(t, linear.InReviewState),
 		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
 	}
 	h.linear.issues = []linear.Issue{issue}
@@ -255,6 +268,495 @@ func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *test
 	}
 	if strings.Contains(text, "Rita Reviewer") || strings.Contains(text, "review 1") {
 		t.Errorf("approved linked MR still asks its remaining reviewer:\n%s", text)
+	}
+}
+
+// The readiness gate, end to end. This is the report that started it: an open MR
+// with an unreviewed reviewer whose Linear card never left In Progress was pushed
+// to three reviewers, while the one person who could fix it — the author — was
+// told nothing.
+func TestBuildDigestBeforeInReviewParksTheMRWithItsAuthor(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-184 Scheduler wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	issue := linear.Issue{
+		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+		URL:   "https://linear.app/CHAIN-184",
+		State: testState(t, "In Progress"),
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+	}
+	h.linear.issuesByNumbers = []linear.Issue{issue}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestBuilt {
+		t.Errorf("status = %q, want %q — the board being behind is not a failure", out.Status, DigestBuilt)
+	}
+	if h.linear.teamCalls != 1 {
+		t.Errorf("GetTeam calls = %d, want one per configured Linear team", h.linear.teamCalls)
+	}
+
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if strings.Contains(text, "Rita Reviewer") {
+		t.Errorf("a card that never reached In Review still asked its reviewer:\n%s", text)
+	}
+	// And it is not lost either: the author owns it, and the row says which column
+	// the card is actually in.
+	for _, want := range []string{"Ann Author", "move <https://linear.app/CHAIN-184|CHAIN-184> to In Review", "(now In Progress)"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("digest is missing %q:\n%s", want, text)
+		}
+	}
+	if out.MRCount != 1 {
+		t.Errorf("mr count = %d, want the merge request still counted once", out.MRCount)
+	}
+}
+
+// A board whose column order cannot be established must change nothing: the gate
+// switches off, reviewers are notified exactly as before, and the digest says so
+// rather than quietly behaving differently.
+func TestBuildDigestUnreadableWorkflowKeepsNotifyingReviewers(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-184 Scheduler wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	// No In Review column at all, so linear.NewWorkflow refuses the board.
+	h.linear.teamStates = []linear.WorkflowState{
+		{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
+	}
+	h.linear.issuesByNumbers = []linear.Issue{{
+		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+		URL:   "https://linear.app/CHAIN-184",
+		State: linear.WorkflowState{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+	}}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial {
+		t.Errorf("status = %q, want %q", out.Status, DigestPartial)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if !strings.Contains(text, "Rita Reviewer") {
+		t.Errorf("an unreadable board silenced a reviewer:\n%s", text)
+	}
+	// The warning has to name *this* degradation, and to claim only what happened:
+	// this merge request was linked to the unorderable board and did keep notifying
+	// its reviewer. "Linear issue links could not be resolved" would be false — the
+	// link is right there in the row above.
+	if !strings.Contains(text, "a Linear board could not be ordered; merge requests linked to it were not graded against it") {
+		t.Errorf("digest does not explain the disabled gate:\n%s", text)
+	}
+	if strings.Contains(text, "issue links could not be resolved") {
+		t.Errorf("digest blames the wrong half of Linear:\n%s", text)
+	}
+}
+
+// GitLab refusing GET /approvals is the outage that made the whole Linear
+// completion rule inert without a word anywhere. The reviewer keeps being asked —
+// which is the safe direction — and nothing pretends the review is finished.
+func TestBuildDigestUnreadableApprovalsNeverReadAsUnapproved(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	// Its own team label: the gauge asserted below lives on the default registry,
+	// and every other test in this package publishes under testTeam.
+	team.Name = "payments-blind-approvals"
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-184 Scheduler wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	// The approval exists in GitLab; the service is simply not allowed to read it.
+	setApprovals(h.fake, proj, testMRIID, &gitlab.Approvals{ApprovedBy: []gitlab.ApprovedBy{{
+		User: gitlab.User{ID: 77, Username: "approver", Name: "Alice Approver"},
+	}}})
+	h.gl.failApprovals = &gitlab.APIError{Status: 403, Path: "/approvals"}
+	issue := linear.Issue{
+		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+		URL:   "https://linear.app/CHAIN-184",
+		State: testState(t, linear.InReviewState),
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+	}
+	h.linear.issuesByNumbers = []linear.Issue{issue}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if !strings.Contains(text, "Rita Reviewer") {
+		t.Errorf("unknown approvals were read as an approval and silenced the reviewer:\n%s", text)
+	}
+	if strings.Contains(text, "forward in Linear") {
+		t.Errorf("unknown approvals were read as a finished review:\n%s", text)
+	}
+	// The rendering assertions above hold with or without ApprovalsKnown — an
+	// unreadable endpoint leaves ApprovedBy empty either way, so on their own they
+	// pin the *pre-fix* behaviour. This is the assertion only the flag can satisfy:
+	// the difference between "nobody approved" and "we could not ask" has to be
+	// observable somewhere, and this gauge is where.
+	if got := testutil.ToFloat64(
+		metrics.MergeRequestsWithUnknownApprovals.WithLabelValues(team.Name),
+	); got != 1 {
+		t.Errorf("unknown-approvals gauge = %v, want 1 — the outage is invisible", got)
+	}
+}
+
+// A service team may map several Linear teams, and each orders its own columns.
+// Grading an issue against another team's In Review position is how a card that
+// *is* ready reads as unready — and the merge request then silently stops
+// reaching its reviewers, which is the exact failure the gate is supposed to fix.
+func TestBuildDigestGradesEachIssueAgainstItsOwnLinearTeam(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	const chainTeam, opsTeam = "team-chain", "team-ops"
+	team.LinearTeamIDs = []string{chainTeam, opsTeam}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	first := testMR(101, withReviewers(reviewer))
+	first.Title = "CHAIN-1 chain side"
+	second := testMR(102, withReviewers(reviewer))
+	second.Title = "OPS-2 ops side"
+	seedGitLab(h.fake, proj, first, second)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		101: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+		102: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+
+	// One column id, opposite verdicts. Sharing the id across the two boards is
+	// what makes "which board was consulted" observable *in both directions*: with
+	// distinct ids a wrong-board lookup merely misses and fails open, which is
+	// indistinguishable from the correct answer on the reviewer side, and a test
+	// built that way passes while the grading is hard-wired to one team.
+	chainTesting := linear.WorkflowState{ID: "testing", Name: "Testing", Type: "started", Position: 300}
+	opsTesting := linear.WorkflowState{ID: "testing", Name: "Testing", Type: "started", Position: 100}
+	h.linear.teamStatesByID = map[string][]linear.WorkflowState{
+		chainTeam: {
+			{ID: "c-review", Name: linear.InReviewState, Type: "started", Position: 200},
+			chainTesting,
+		},
+		opsTeam: {
+			opsTesting,
+			{ID: "o-review", Name: linear.InReviewState, Type: "started", Position: 200},
+		},
+	}
+	h.linear.issuesByNumbers = []linear.Issue{
+		{
+			ID: "i1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
+			State: chainTesting, Team: linear.Team{ID: chainTeam, Key: "CHAIN"},
+		},
+		{
+			ID: "i2", Identifier: "OPS-2", Number: 2, URL: "https://linear.app/OPS-2",
+			State: opsTesting, Team: linear.Team{ID: opsTeam, Key: "OPS"},
+		},
+	}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if h.linear.teamCalls != 2 {
+		t.Errorf("GetTeam calls = %d, want one per configured Linear team", h.linear.teamCalls)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	// Chain's card is past review on Chain's board, so its reviewer is asked and it
+	// gets no author row.
+	if !strings.Contains(text, "Rita Reviewer") || !strings.Contains(text, "!101") {
+		t.Errorf("the merge request past its own board's In Review lost its reviewer:\n%s", text)
+	}
+	if strings.Contains(text, "CHAIN-1> to In Review") {
+		t.Errorf("chain's card was graded against another team's board:\n%s", text)
+	}
+	// Ops's identically-keyed card is behind review on Ops's board, so its author is
+	// asked instead.
+	if !strings.Contains(text, "move <https://linear.app/OPS-2|OPS-2> to In Review") {
+		t.Errorf("the merge request behind its own board's In Review was not parked with its author:\n%s", text)
+	}
+}
+
+// One unusable board must not cost the other team its gate, and the digest still
+// reports the degradation.
+func TestBuildDigestKeepsWorkingWorkflowsWhenOneTeamIsBroken(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	const goodTeam, badTeam = "team-good", "team-bad"
+	team.LinearTeamIDs = []string{badTeam, goodTeam}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-1 wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	h.linear.teamStatesByID = map[string][]linear.WorkflowState{
+		badTeam:  {{ID: "b1", Name: "Doing", Type: "started", Position: 1}}, // no In Review
+		goodTeam: testWorkflowStates(),
+	}
+	h.linear.issuesByNumbers = []linear.Issue{{
+		ID: "i1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
+		State: testState(t, "In Progress"), Team: linear.Team{ID: goodTeam, Key: "CHAIN"},
+	}}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestPartial {
+		t.Errorf("status = %q, want %q — one broken board is a degradation", out.Status, DigestPartial)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if !strings.Contains(text, "move <https://linear.app/CHAIN-1|CHAIN-1> to In Review") {
+		t.Errorf("the readable board lost its gate because another team's was broken:\n%s", text)
+	}
+	// And the warning may not deny what the row above it just did. The digest-wide
+	// "every linked merge request was treated as ready for review" was printed here,
+	// directly contradicting the gated row: no merge request in this digest was
+	// linked to the board that failed.
+	if !strings.Contains(text, "no merge request in this digest was linked to it") {
+		t.Errorf("warning does not describe the partial failure:\n%s", text)
+	}
+	if strings.Contains(text, "were not graded against it") {
+		t.Errorf("warning claims an effect on merge requests that were not affected:\n%s", text)
+	}
+}
+
+// The uncovered corner where "nothing to look up" and "the board is unreadable"
+// meet: with no merge request naming a Linear id the link set is complete and
+// empty, so the digest must not report the links as the thing that failed.
+func TestBuildDigestUnorderableBoardWithNoLinkedMergeRequests(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	seedGitLab(h.fake, proj, testMR(testMRIID, withReviewers(reviewer))) // title names no issue
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	h.linear.teamStates = []linear.WorkflowState{
+		{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
+	}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if h.linear.lookupCalls != 0 {
+		t.Errorf("issue lookup calls = %d, want none — no merge request named an issue", h.linear.lookupCalls)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if strings.Contains(text, "issue links could not be resolved") {
+		t.Errorf("an empty link set was reported as a failed lookup:\n%s", text)
+	}
+	if !strings.Contains(text, "no merge request in this digest was linked to it") {
+		t.Errorf("warning does not name the unorderable board:\n%s", text)
+	}
+}
+
+// The not-ready gauge must go *absent* when the column order is unreadable, not to
+// zero. Every card then grades unknown, so the count computes to zero while the
+// merge requests are still parked exactly where they were — and the reviewers they
+// fell back to show up as a jump in waiting_human_review, so an operator reads the
+// pair as work moving forward.
+// Both halves have to be known, and there are two ways to lose one: the board's
+// column order, and the per-merge-request link lookup. Either leaves the count a
+// hard zero — "nothing is stuck before In Review" — while the merge requests stay
+// exactly where they were, so both must take the series away instead.
+func TestBuildDigestClearsTheNotReadyGaugeWheneverTheGateCouldNotRun(t *testing.T) {
+	tests := []struct {
+		name   string
+		break_ func(*harness)
+	}{
+		{
+			name: "board has no In Review column",
+			break_: func(h *harness) {
+				h.linear.teamStates = []linear.WorkflowState{
+					{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
+				}
+			},
+		},
+		{
+			// gateKnown is decided before this call, so it stays true: the guard has
+			// to consult linksKnown as well or the same false zero returns by the
+			// other door.
+			name:   "issue link lookup fails",
+			break_: func(h *harness) { h.linear.lookupErr = errors.New("Linear lookup unavailable") },
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+			team := testTeamConfig()
+			// Distinct per subtest: the gauge lives on the default registry.
+			team.Name = fmt.Sprintf("payments-gauge-gate-%d", i)
+			team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+			proj := testProject()
+			reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+			mr := testMR(testMRIID, withReviewers(reviewer))
+			mr.Title = "CHAIN-184 Scheduler wrapper"
+			seedGitLab(h.fake, proj, mr)
+			h.gql.States = map[int64][]gitlab.ReviewerState{
+				testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+			}
+			h.linear.issuesByNumbers = []linear.Issue{{
+				ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+				URL: "https://linear.app/CHAIN-184", State: testState(t, "In Progress"),
+				Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+			}}
+
+			// First a healthy build, so the series exists and is non-zero.
+			if _, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0); err != nil {
+				t.Fatalf("BuildDigest: %v", err)
+			}
+			if got := testutil.ToFloat64(
+				metrics.MergeRequestsLinearNotReady.WithLabelValues(team.Name),
+			); got != 1 {
+				t.Fatalf("not-ready gauge = %v, want 1", got)
+			}
+
+			tt.break_(h)
+			if _, err := h.svc.BuildDigest(t.Context(), team, "14:00", digestDay, 0); err != nil {
+				t.Fatalf("BuildDigest: %v", err)
+			}
+			assertSeriesAbsent(t, "merge_requests_linear_not_ready_total", team.Name)
+		})
+	}
+}
+
+// assertSeriesAbsent fails when a gauge still publishes a series for team. It reads
+// the registry directly because testutil.ToFloat64 *creates* the series it reads,
+// so it can never tell an absent one from a zero.
+func assertSeriesAbsent(t *testing.T, metric, team string) {
+	t.Helper()
+	for _, m := range mustGather(t) {
+		if m.GetName() != metric {
+			continue
+		}
+		for _, series := range m.GetMetric() {
+			for _, label := range series.GetLabel() {
+				if label.GetValue() == team {
+					t.Errorf("%s is still published at %v for %q; it must be absent, not zero",
+						metric, series.GetGauge().GetValue(), team)
+				}
+			}
+		}
+	}
+}
+
+// An ambiguous match switches the gate off, and that has to be visible from
+// outside the process. The log line alone answers "our card is in Backlog, why were
+// three reviewers still pinged?" only for somebody already reading logs.
+func TestBuildDigestAmbiguousLinearMatchIsCountedAndFailsOpen(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.Name = "payments-ambiguous"
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	// The first identifier names a superseded card; the branch names the live one.
+	mr.Title = "CHAIN-1 superseded by CHAIN-2 work"
+	mr.SourceBranch = "feature/CHAIN-2-impl"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	linearTeam := linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"}
+	h.linear.issuesByNumbers = []linear.Issue{
+		{
+			ID: "l1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
+			State: testState(t, "Backlog"), Team: linearTeam,
+		},
+		{
+			ID: "l2", Identifier: "CHAIN-2", Number: 2, URL: "https://linear.app/CHAIN-2",
+			State: testState(t, linear.InReviewState), Team: linearTeam,
+		},
+	}
+
+	before := testutil.ToFloat64(metrics.LinearGateAmbiguousTotal.WithLabelValues(team.Name))
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if got := testutil.ToFloat64(
+		metrics.LinearGateAmbiguousTotal.WithLabelValues(team.Name),
+	); got != before+1 {
+		t.Errorf("ambiguity counter = %v, want %v", got, before+1)
+	}
+
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	// Fail open: the Backlog card must not silence the reviewer, because the merge
+	// request also names a card that is properly in review.
+	if !strings.Contains(text, "Rita Reviewer") {
+		t.Errorf("an ambiguous match silenced the reviewer:\n%s", text)
+	}
+	if strings.Contains(text, "to In Review") {
+		t.Errorf("an ambiguous match produced a board nudge:\n%s", text)
+	}
+}
+
+// A canceled card, end to end.// A canceled card, end to end. Nothing above linear.Workflow exercised it, so the
+// claim that naming the column tells the author whether to move the card or close
+// the merge request was asserted nowhere.
+func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
+	team := testTeamConfig()
+	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	mr := testMR(testMRIID, withReviewers(reviewer))
+	mr.Title = "CHAIN-184 Scheduler wrapper"
+	seedGitLab(h.fake, proj, mr)
+	h.gql.States = map[int64][]gitlab.ReviewerState{
+		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
+	}
+	canceled := linear.WorkflowState{ID: "st-canceled", Name: "Canceled", Type: "canceled", Position: 8192}
+	h.linear.teamStates = append(testWorkflowStates(), canceled)
+	h.linear.issuesByNumbers = []linear.Issue{{
+		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
+		URL: "https://linear.app/CHAIN-184", State: canceled,
+		Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+	}}
+
+	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if out.Status != DigestBuilt {
+		t.Errorf("status = %q, want %q", out.Status, DigestBuilt)
+	}
+	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
+	if strings.Contains(text, "Rita Reviewer") {
+		t.Errorf("a canceled card still asked its reviewer:\n%s", text)
+	}
+	// The column is named, which is the difference between "move the card" and
+	// "close the merge request".
+	if !strings.Contains(text, "(now Canceled)") {
+		t.Errorf("the author row does not name the column:\n%s", text)
 	}
 }
 
@@ -422,7 +924,7 @@ func TestBuildDigestCountsBothSourcesAndClearsTheLinearGaugeOnFailure(t *testing
 	// the counters have to have been written already — the early return used to
 	// skip them.
 	h.linear.err = errors.New("Linear unavailable")
-	if _, err := h.svc.BuildDigest(t.Context(), team, "16:30", digestDay, 0); err == nil {
+	if _, err := h.svc.BuildDigest(t.Context(), team, "17:30", digestDay, 0); err == nil {
 		t.Fatal("BuildDigest succeeded with every configured source unavailable")
 	}
 
@@ -454,6 +956,16 @@ func TestBuildDigestFailsWhenGitLabAndLinearAreUnavailable(t *testing.T) {
 }
 
 // renderedText concatenates every section of a message for substring checks.
+// decodeMessage unwraps one persisted part into the Block Kit message it holds.
+func decodeMessage(t *testing.T, m *models.DigestMessage) slack.Message {
+	t.Helper()
+	var message slack.Message
+	if err := json.Unmarshal(m.Payload, &message); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	return message
+}
+
 func renderedText(m slack.Message) string {
 	var b strings.Builder
 	b.WriteString(m.Text)
@@ -808,6 +1320,46 @@ func TestTeamStateCountsEachMROnce(t *testing.T) {
 	if got.UnresolvedThreads != 1 || got.Conflicts != 1 || got.FailedPipeline != 1 {
 		t.Errorf("team state = %+v, want every counter at 1", got)
 	}
+	// This fixture never loaded approvals, so "unknown" is the honest count.
+	if got.ApprovalsUnknown != 1 {
+		t.Errorf("ApprovalsUnknown = %d, want 1", got.ApprovalsUnknown)
+	}
+}
+
+// The two gauges added with the readiness gate answer questions a dashboard
+// could not ask before: "why is the review queue empty" and "are we blind to
+// approvals". Both must be per merge request, and LinearNotReady must be the
+// mutually exclusive counterpart of WaitingHumanReview.
+func TestTeamStateCountsBoardGatedAndApprovalBlindMergeRequests(t *testing.T) {
+	t.Parallel()
+	mr := func(iid int64) domain.MergeRequest {
+		return domain.MergeRequest{State: "opened", IID: iid}
+	}
+	reviewers := []domain.Reviewer{{User: domain.User{ID: 1, Username: "a"}, State: domain.ReviewStateUnreviewed}}
+	gated := domain.MergeRequestSnapshot{
+		Project: domain.Project{ID: 1}, MR: mr(1), Reviewers: reviewers, ApprovalsKnown: true,
+	}
+	waiting := domain.MergeRequestSnapshot{
+		Project: domain.Project{ID: 1}, MR: mr(2), Reviewers: reviewers, ApprovalsKnown: true,
+	}
+	blind := domain.MergeRequestSnapshot{
+		Project: domain.Project{ID: 1}, MR: mr(3), Reviewers: reviewers,
+	}
+	state := linearDigestState{enabled: true, linksByMR: map[string]linearLink{
+		snapshotKey(1, 1): {issue: linear.Issue{Identifier: "CHAIN-1"}, stage: linear.StageBeforeReview},
+		snapshotKey(1, 2): {issue: linear.Issue{Identifier: "CHAIN-2"}, stage: linear.StageReviewOrLater},
+	}}
+
+	got := teamState([]domain.MergeRequestSnapshot{gated, waiting, blind}, state)
+	if got.LinearNotReady != 1 {
+		t.Errorf("LinearNotReady = %d, want 1", got.LinearNotReady)
+	}
+	if got.WaitingHumanReview != 2 {
+		t.Errorf("WaitingHumanReview = %d, want 2 — the gated one is not waiting on a reviewer", got.WaitingHumanReview)
+	}
+	if got.ApprovalsUnknown != 1 {
+		t.Errorf("ApprovalsUnknown = %d, want 1", got.ApprovalsUnknown)
+	}
 }
 
 func TestTeamStateReportsZerosSoGaugesCannotGoStale(t *testing.T) {
@@ -825,7 +1377,7 @@ func TestBuildDigestDryRunOfAnEmptyTeamStillJournalsTheRun(t *testing.T) {
 	h := newHarness(t, withDB)
 	empty := domain.Team{Name: "empty", SlackChannel: "C000", Repositories: nil}
 
-	out, err := h.svc.BuildDigest(t.Context(), empty, "16:30", digestDay, 0)
+	out, err := h.svc.BuildDigest(t.Context(), empty, "17:30", digestDay, 0)
 	if err != nil {
 		t.Fatalf("BuildDigest: %v", err)
 	}
@@ -838,7 +1390,7 @@ func TestBuildDigestDryRunOfAnEmptyTeamStillJournalsTheRun(t *testing.T) {
 
 	// Re-running the same slot returns the same run without rebuilding, and a
 	// dry run still exposes no delivery jobs.
-	again, err := h.svc.BuildDigest(t.Context(), empty, "16:30", digestDay, 0)
+	again, err := h.svc.BuildDigest(t.Context(), empty, "17:30", digestDay, 0)
 	if err != nil {
 		t.Fatalf("second BuildDigest: %v", err)
 	}

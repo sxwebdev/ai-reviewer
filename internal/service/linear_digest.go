@@ -15,20 +15,55 @@ import (
 // only an issue returned from one of the configured Linear teams is a match.
 var linearIdentifierRE = regexp.MustCompile(`(?i)[a-z][a-z0-9]*-[0-9]+`)
 
-type linearDigestState struct {
-	enabled       bool
-	inReviewCount int
-	issuesByMR    map[string]linear.Issue
+// linearLink is one merge request's resolved Linear task: the issue, plus where
+// its status sits relative to In Review in that issue's own team.
+//
+// The stage is stored rather than recomputed because it depends on the *team's*
+// workflow, which the rules below have no access to — and because an
+// unresolvable ordering has to travel with the link instead of being guessed at
+// each call site.
+type linearLink struct {
+	issue linear.Issue
+	stage linear.Stage
 }
 
-func (s linearDigestState) issueFor(snapshot domain.MergeRequestSnapshot) (linear.Issue, bool) {
-	issue, ok := s.issuesByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)]
-	return issue, ok
+type linearDigestState struct {
+	// enabled is "the board total arrived" — the one fact allowed to decide that
+	// Linear contributed nothing at all.
+	enabled       bool
+	inReviewCount int
+	// linksKnown and gateKnown are the two halves that can degrade
+	// independently, and they are tracked separately because they produce
+	// different behaviour and therefore need different words in the digest: with
+	// no links Linear stops narrowing anything, while with no gate the links are
+	// present and only the column *order* is missing. One shared "Linear is
+	// degraded" line for both told an operator neither.
+	linksKnown bool
+	gateKnown  bool
+	// gateDegradedLinks is true when at least one merge request was graded against
+	// a board whose order was missing. gateKnown says a board failed;
+	// this says a merge request noticed. Only the second licenses the digest to
+	// claim that merge requests were treated as ready for review.
+	gateDegradedLinks bool
+	linksByMR         map[string]linearLink
+}
+
+// linkFor returns the merge request's Linear task. The bool answers "was a task
+// matched", not "could the board be read": a link whose stage is
+// linear.StageUnknown is still a link, and every rule below fails open on that
+// stage rather than on a missing one.
+func (s linearDigestState) linkFor(snapshot domain.MergeRequestSnapshot) (linearLink, bool) {
+	link, ok := s.linksByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)]
+	return link, ok
 }
 
 type linearIssueMatch struct {
-	issue      linear.Issue
-	found      bool
+	issue linear.Issue
+	found bool
+	// candidates are every valid issue the title and branch named, chosen first,
+	// in match order. The readiness gate needs them all, not just the winner: see
+	// linearStage.
+	candidates []linear.Issue
 	conflicts  []string
 	matchField string
 }
@@ -52,6 +87,7 @@ func matchLinearIssue(mr domain.MergeRequest, issues map[string]linear.Issue) li
 	}
 
 	seen := map[string]bool{strings.ToUpper(chosen.Identifier): true}
+	candidates := []linear.Issue{chosen}
 	var conflicts []string
 	for _, candidate := range append(title, branch...) {
 		identifier := strings.ToUpper(candidate.Identifier)
@@ -59,9 +95,38 @@ func matchLinearIssue(mr domain.MergeRequest, issues map[string]linear.Issue) li
 			continue
 		}
 		seen[identifier] = true
+		candidates = append(candidates, candidate)
 		conflicts = append(conflicts, candidate.Identifier)
 	}
-	return linearIssueMatch{issue: chosen, found: true, conflicts: conflicts, matchField: field}
+	return linearIssueMatch{
+		issue: chosen, found: true, candidates: candidates,
+		conflicts: conflicts, matchField: field,
+	}
+}
+
+// linearStage grades a match, and refuses to grade an ambiguous one.
+//
+// "First valid identifier in the title wins" is a reasonable rule for *naming*
+// the card in a digest row, and it was harmless while Linear could only ever
+// stop notifications that an approval had already stopped. The readiness gate
+// removed that precondition, which handed the heuristic the power to silence
+// every reviewer on a merge request: a title like
+// "CHAIN-1 superseded by CHAIN-2 work" picks CHAIN-1, and if that card is
+// canceled while CHAIN-2 is properly In Review, nobody is asked to review and the
+// author is told to move a card that cannot be moved.
+//
+// So when a merge request names several valid issues, the gate only applies where
+// they agree. Disagreement is StageUnknown, i.e. today's behaviour, which is the
+// one answer that cannot hide work. The winner still owns the identifier and URL
+// the digest renders — that part of the heuristic is unchanged.
+func linearStage(match linearIssueMatch, stageOf func(linear.Issue) linear.Stage) linear.Stage {
+	stage := stageOf(match.issue)
+	for _, candidate := range match.candidates {
+		if stageOf(candidate) != stage {
+			return linear.StageUnknown
+		}
+	}
+	return stage
 }
 
 func validLinearIssues(candidates []string, issues map[string]linear.Issue) []linear.Issue {
@@ -134,15 +199,35 @@ func hasRequestedChanges(snapshot domain.MergeRequestSnapshot) bool {
 	return false
 }
 
-// needsReviewerAction applies the Linear completion gate on top of GitLab's
-// per-reviewer classifier. One approval completes a linked task for review
-// purposes, except that any REQUESTED_CHANGES verdict keeps the ordinary GitLab
-// flow active. Missing Linear tasks and zero approvals always fail open.
-func needsReviewerAction(snapshot domain.MergeRequestSnapshot, reviewer domain.Reviewer, linked bool) bool {
+// needsReviewerAction applies both Linear gates on top of GitLab's per-reviewer
+// classifier: readiness before the review and completion after it.
+//
+// Missing tasks, an unreadable board and unknown approvals all fail open — the
+// board may narrow who is asked, never on the strength of a question that was
+// not answered.
+func needsReviewerAction(snapshot domain.MergeRequestSnapshot, reviewer domain.Reviewer, link linearLink, linked bool) bool {
 	if !domain.NeedsHumanReview(snapshot, reviewer) {
 		return false
 	}
-	if !linked || len(snapshot.ApprovedBy) == 0 || hasRequestedChanges(snapshot) {
+	// Readiness, and it outranks everything below — including a standing
+	// REQUESTED_CHANGES verdict, which is the deliberate reversal of the original
+	// rule ("any status + no approvals → ordinary GitLab classification"). A card
+	// the author has not moved to In Review is work that was never offered, so
+	// asking three reviewers to look at it nudges everyone except the one person
+	// who can fix it.
+	//
+	// The merge request is not lost by this: needsLinearStart is true for exactly
+	// this set — same open/non-draft guard, same stage — so every suppression here
+	// produces an author row. That pairing is the digest's partition rule, and it
+	// is the precondition for being allowed to silence anyone on board state at
+	// all. Change one without the other and the merge request disappears.
+	if linked && link.stage == linear.StageBeforeReview {
+		return false
+	}
+	// Completion. Unknown approvals must not read as zero approvals: that is a
+	// question GitLab refused to answer, and the answer which keeps notifying
+	// reviewers is the one that cannot hide work.
+	if !linked || !snapshot.ApprovalsKnown || len(snapshot.ApprovedBy) == 0 || hasRequestedChanges(snapshot) {
 		return true
 	}
 	return false
@@ -158,10 +243,39 @@ func needsReviewerAction(snapshot domain.MergeRequestSnapshot, reviewer domain.R
 // an approval on a draft is an early look, not a finished review, so telling the
 // author to advance the board asks them to move a card for work they have not
 // finished marking as ready.
-func needsLinearMove(snapshot domain.MergeRequestSnapshot, issue linear.Issue, linked bool) bool {
+func needsLinearMove(snapshot domain.MergeRequestSnapshot, link linearLink, linked bool) bool {
 	if !snapshot.MR.IsOpen() || snapshot.MR.Draft {
 		return false
 	}
-	return linked && len(snapshot.ApprovedBy) > 0 && !hasRequestedChanges(snapshot) &&
-		strings.EqualFold(strings.TrimSpace(issue.State.Name), linear.InReviewState)
+	// The state *name*, not the stage: "move it forward" is only true of a card
+	// sitting exactly on In Review, whereas StageReviewOrLater also covers Done —
+	// where there is nothing left to advance.
+	//
+	// ApprovalsKnown for the same reason needsReviewerAction needs it, pointed the
+	// other way: with the endpoint unreadable this must not claim a review
+	// finished. That is the half of the outage nothing used to report — the author
+	// was never asked to advance the board either.
+	//
+	// See domain.MergeRequestSnapshot.ApprovalsKnown for why unreadable happens.
+	return linked && snapshot.ApprovalsKnown && len(snapshot.ApprovedBy) > 0 && !hasRequestedChanges(snapshot) &&
+		strings.EqualFold(strings.TrimSpace(link.issue.State.Name), linear.InReviewState)
+}
+
+// needsLinearStart tells the MR author that the linked card is still parked
+// before In Review, which is why the digest asked nobody to review it.
+//
+// The guard is deliberately identical to the one needsReviewerAction inherits
+// from domain.NeedsHumanReview (open, not draft), which is what makes this row a
+// superset of every readiness suppression rather than a matching set. The
+// superset direction is the safe one: an extra author row costs a line, a
+// missing one costs the merge request.
+//
+// Drafts are excluded because a draft whose card is In Progress is simply
+// consistent — the author is working, the board says so, and nothing is being
+// hidden from anyone since a draft never asks for review in the first place.
+func needsLinearStart(snapshot domain.MergeRequestSnapshot, link linearLink, linked bool) bool {
+	if !snapshot.MR.IsOpen() || snapshot.MR.Draft {
+		return false
+	}
+	return linked && link.stage == linear.StageBeforeReview
 }

@@ -91,6 +91,69 @@ func TestLinearSummaryAndMoveAction(t *testing.T) {
 	}
 }
 
+// The row that keeps a board-gated merge request in the digest. It has to name
+// the column, because "not in review" leaves the author unable to tell whether to
+// move the card or close the merge request.
+func TestLinearStartActionNamesTheCurrentColumn(t *testing.T) {
+	t.Parallel()
+	d := slack.DigestData{
+		Team: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{Display: "Ann"},
+			Own: []slack.AuthorItem{{
+				IID: 42, Title: "PAY-42 checkout", WebURL: "https://gitlab/42",
+				StartLinear: true, LinearIdentifier: "PAY-42",
+				LinearWebURL: "https://linear.app/PAY-42", LinearState: "In Progress",
+			}},
+		}},
+	}
+	text := rendered(slack.BuildDigest(d)[0])
+	if !strings.Contains(text, "move <https://linear.app/PAY-42|PAY-42> to In Review (now In Progress)") {
+		t.Errorf("render is missing the start action:\n%s", text)
+	}
+}
+
+// Both halves degrade rather than render an empty link or a dangling "(now )".
+func TestLinearActionsSurviveMissingIdentifierAndState(t *testing.T) {
+	t.Parallel()
+	d := slack.DigestData{
+		Team: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{Display: "Ann"},
+			Own: []slack.AuthorItem{{
+				IID: 42, Title: "checkout", WebURL: "https://gitlab/42", StartLinear: true,
+			}},
+		}},
+	}
+	text := rendered(slack.BuildDigest(d)[0])
+	if !strings.Contains(text, "move task to In Review") {
+		t.Errorf("render lost the action:\n%s", text)
+	}
+	if strings.Contains(text, "(now ") {
+		t.Errorf("render left a dangling state clause:\n%s", text)
+	}
+}
+
+// A card name is workspace-authored text on the same footing as a title, so it
+// goes through the same escaping.
+func TestLinearStateIsEscaped(t *testing.T) {
+	t.Parallel()
+	d := slack.DigestData{
+		Team: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{Display: "Ann"},
+			Own: []slack.AuthorItem{{
+				IID: 42, Title: "checkout", WebURL: "https://gitlab/42",
+				StartLinear: true, LinearIdentifier: "PAY-42", LinearState: "R&D <hold>",
+			}},
+		}},
+	}
+	text := rendered(slack.BuildDigest(d)[0])
+	if !strings.Contains(text, "R&amp;D &lt;hold&gt;") {
+		t.Errorf("state was not escaped:\n%s", text)
+	}
+}
+
 func TestLinearHealthyZeroStillRendersSummary(t *testing.T) {
 	t.Parallel()
 	msgs := slack.BuildDigest(slack.DigestData{Team: "payments", LinearEnabled: true})

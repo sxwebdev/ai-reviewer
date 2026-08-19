@@ -237,7 +237,8 @@ func (PublishReviewArgs) InsertOpts() river.InsertOpts {
 // digest_runs + digest_messages. It does not talk to Slack; slack_send does.
 type DigestArgs struct {
 	Team string `json:"team" river:"unique"`
-	// Slot is scheduler.Daily.Slot's value ("09:00" / "16:30").
+	// Slot is scheduler.Daily.SlotAt's value: one of the team's configured slots,
+	// formatted with scheduler.SlotLayout.
 	Slot string `json:"slot" river:"unique"`
 	// RunDate is a plain YYYY-MM-DD string in the schedule's own zone, not a
 	// time.Time: the uniqueness hash is computed over the encoded args, and a

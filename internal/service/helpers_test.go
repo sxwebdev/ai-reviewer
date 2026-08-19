@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -194,10 +195,11 @@ type countingGitLab struct {
 	versionCalls    int
 	approvalCalls   int
 
-	failProject map[string]error
-	failMR      map[int64]error
-	failDiffs   error
-	failOpenMRs error
+	failProject   map[string]error
+	failMR        map[int64]error
+	failDiffs     error
+	failOpenMRs   error
+	failApprovals error
 }
 
 func newCountingGitLab(f *gitlab.FakeClient) *countingGitLab {
@@ -254,6 +256,9 @@ func (c *countingGitLab) ListMRVersions(ctx context.Context, pk string, iid int6
 
 func (c *countingGitLab) GetMRApprovals(ctx context.Context, pk string, iid int64) (*gitlab.Approvals, error) {
 	c.approvalCalls++
+	if c.failApprovals != nil {
+		return nil, c.failApprovals
+	}
 	return c.FakeClient.GetMRApprovals(ctx, pk, iid)
 }
 
@@ -287,10 +292,62 @@ type fakeLinear struct {
 	issuesByNumbers []linear.Issue
 	err             error
 	lookupErr       error
-	calls           int
-	lookupCalls     int
-	teamIDs         []string
-	numbers         []int
+	teamErr         error
+	// teamStates overrides the board a GetTeam call reports. Nil means
+	// testWorkflowStates, i.e. an ordinary Linear board — the default is a *live*
+	// readiness gate on purpose, so a test has to opt out of it rather than
+	// accidentally exercise a dormant one.
+	teamStates []linear.WorkflowState
+	// teamStatesByID gives each Linear team its own board, which is the only way
+	// to exercise two teams that put In Review in different places.
+	teamStatesByID map[string][]linear.WorkflowState
+	calls          int
+	lookupCalls    int
+	teamCalls      int
+	teamIDs        []string
+	numbers        []int
+}
+
+// testWorkflowStates is a plain Linear board: two columns before In Review, one
+// after. Positions are spaced the way Linear's own floats are, and every state
+// carries the type the ordering actually depends on.
+func testWorkflowStates() []linear.WorkflowState {
+	return []linear.WorkflowState{
+		{ID: "st-backlog", Name: "Backlog", Type: "backlog", Position: 0},
+		{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
+		{ID: "st-review", Name: linear.InReviewState, Type: "started", Position: 2048},
+		{ID: "st-done", Name: "Done", Type: "completed", Position: 4096},
+	}
+}
+
+// testState is one column of testWorkflowStates, so a fixture issue carries the
+// id, type and position a real one does. A state built by name alone resolves to
+// linear.StageUnknown, which silently disables the readiness gate — a fixture
+// that does that tests the fail-open path while claiming to test the board.
+func testState(t *testing.T, name string) linear.WorkflowState {
+	t.Helper()
+	for _, st := range testWorkflowStates() {
+		if strings.EqualFold(strings.TrimSpace(st.Name), strings.TrimSpace(name)) {
+			return st
+		}
+	}
+	t.Fatalf("no workflow state named %q in the fixture board", name)
+	return linear.WorkflowState{}
+}
+
+func (f *fakeLinear) GetTeam(_ context.Context, id string) (*linear.Team, error) {
+	f.teamCalls++
+	if f.teamErr != nil {
+		return nil, f.teamErr
+	}
+	states := f.teamStates
+	if byID, ok := f.teamStatesByID[id]; ok {
+		states = byID
+	}
+	if states == nil {
+		states = testWorkflowStates()
+	}
+	return &linear.Team{ID: id, Key: "CHAIN", Name: "Chain", States: states}, nil
 }
 
 func (f *fakeLinear) ListIssuesByNumbers(_ context.Context, teamIDs []string, numbers []int) ([]linear.Issue, error) {

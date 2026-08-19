@@ -54,10 +54,14 @@ uniqueness, retries and metrics as a scheduled one.
 
 `ai-reviewer doctor` checks, in order: configuration, GitLab TLS, `git`, the
 `claude` binary and `claude auth status --json` **under the configured auth
-mode**, the `Europe/Moscow` timezone, PostgreSQL connectivity, pending
+mode**, PostgreSQL connectivity, pending
 migrations, River's tables, GitLab authentication (`GET /user`), GraphQL
-availability, every configured repository, `head_pipeline` visibility, Linear
-authentication/team UUIDs/`In Review` states, Slack
+availability, every configured repository, `head_pipeline` visibility,
+`/approvals` visibility, each team's
+resolved digest schedule (slots and timezone, printed in full — with per-team
+schedules there is no other way to answer "when does ours arrive"), Linear
+authentication/team UUIDs/`In Review` states, each team's review-gate column
+split, Slack
 `auth.test`, bot membership of each channel, the Slack **directory**
 (`users.list` — it names the missing scope, and warns when no member exposes an
 email), every `slack.user_map` entry resolved against that directory, and whether
@@ -150,16 +154,24 @@ Reading it:
 - **Age markers** are 🔴 from a week, 🟡 from two days, ▫️ below that. They
   classify; they do not filter.
 - **Own merge requests** are the `🛠` rows, with the flags in a fixed order:
-  changes requested → threads → conflicts → pipeline → move Linear card.
+  changes requested → threads → conflicts → pipeline → advance Linear card →
+  move Linear card to In Review.
 - **The project name** sits in the title when the digest covers one repository,
   and moves into each row when it covers several — it is what tells two `!1404`s
   apart.
 - **Titles** are cut to 55 characters at a word boundary. The ticket key comes
   first in practice, so it survives the cut.
-- **Linear-aware completion:** a linked MR with at least one approval stops
-  notifying its remaining reviewers. If its issue is still `In Review`, the
-  author gets `move CHAIN-N forward in Linear`. Zero approvals, a missing issue
-  or any `REQUESTED_CHANGES` verdict keep the ordinary GitLab flow.
+- **Linear-aware readiness:** a linked MR whose card has not reached `In Review`
+  asks **nobody** to review it. Its author gets
+  `move CHAIN-N to In Review (now In Progress)` instead — the column is named
+  because the difference between `In Progress` and `Canceled` is the difference
+  between moving the card and closing the merge request. This outranks approvals
+  and `REQUESTED_CHANGES` alike, and a forgotten card therefore costs a review;
+  the author row is what stops the merge request disappearing from the digest.
+- **Linear-aware completion:** at `In Review` or later, a linked MR with at least
+  one *readable* approval stops notifying its remaining reviewers. If its issue is
+  still exactly `In Review`, the author gets `move CHAIN-N forward in Linear`.
+  Zero approvals or any `REQUESTED_CHANGES` verdict keep the ordinary GitLab flow.
 
 A person who owes nothing is not listed. Without Linear, a digest with no
 actions is not posted; with Linear enabled, the healthy `In Review` aggregate
@@ -175,13 +187,76 @@ so a `slack_send` retry never reads Linear again. A Linear outage degrades an
 otherwise available digest to `partial` and adds a visible warning; if GitLab
 and Linear are both unavailable, no misleading digest is created.
 
-The two Linear reads degrade separately, and the warning says which one failed.
+The three Linear reads degrade separately, and the warning names the degradation
+whose consequence the reader can see. When more than one fails the warning names
+the most consequential and the log line carries all of them
+(`count_known`, `links_known`, `gate_known`, plus every error).
 Losing the board query removes the count entirely — *Partial data: Linear could
 not be inspected.* — because an unknown count must never render as a zero.
 Losing only the per-MR issue lookup keeps the count and says so — *Partial data:
 Linear issue links could not be resolved; the In Review count is current.* — and
 every reviewer falls back to the ordinary GitLab classification, so no merge
-request is hidden by a link the service could not resolve.
+request is hidden by a link the service could not resolve. Losing only a team's
+workflow order keeps both — *Partial data: Linear workflow order could not be
+read; every linked merge request was treated as ready for review.* — which is the
+one degradation that changes who the digest asks, so it is named rather than
+folded into the others.
+
+### Column order and the review gate
+
+"Before `In Review`" is decided by the team's own board, not by a list of status
+names in the service. Linear gives every workflow state a `type` whose order it
+fixes itself — `triage` → `backlog` → `unstarted` → `started` → `completed` /
+`canceled` — plus a `position` that orders states *within* one type. Only
+`In Review` is ever named in configuration; everything else is whatever the team
+called it.
+
+`canceled` is graded as **before** review on purpose. Linear sorts it last so it
+falls off the end of a board, but an open merge request on a cancelled card is
+work that stopped, not work that finished review — its author needs to move the
+card or close the merge request, and three reviewers do not need to read it.
+
+A card contributes only its state **id**; the board contributes the order. That is
+deliberate: the card's own copy of its status arrives from a different query, and a
+missing or `null` position there is indistinguishable from a real `0`, which would
+grade every column after `In Review` as "never offered" and silence a whole team's
+reviewers. A column the board did not report — a page truncated below it, one
+created since — is unorderable and therefore fails open.
+
+`doctor` prints the resulting split per team, in board order (type first, then
+position), which is the only way to answer "why did my merge request not reach a
+reviewer". It is printed even when another team's mapping is broken. A column whose
+`type` this build cannot order raises a warning on the same line: those cards fail
+open — reviewers are notified exactly as before — which is safe but silent.
+
+A merge request naming several valid Linear issues is graded only if they agree.
+"First valid identifier in the title wins" is fine for naming a card, but a title
+like `CHAIN-1 superseded by CHAIN-2 work` would otherwise let a cancelled duplicate
+silence every reviewer and hand the author an instruction they cannot follow.
+
+Every issue is graded against **its own** Linear team. A service team may map
+several `linear_team_ids`, and each of them orders its columns independently.
+
+### Approvals readability
+
+Both completion rules read `ApprovedBy` together with `ApprovalsKnown`, because
+"nobody approved" and "we could not ask" have to be different answers.
+
+`GET /projects/:id/merge_requests/:iid/approvals` is available on **every** GitLab
+tier — unlike approval *rules*, which are Premium — so a refusal here is a
+**permissions** problem, exactly like `head_pipeline` above: the service account
+needs at least Reporter on the project, and `merge_requests_access_level` must not
+be restricted below it. While it is refused, every merge request reads as
+unapproved and both completion rules go inert: reviewers keep being nudged after
+approving, and, where Linear is configured, no author is asked to advance a card.
+
+Nothing in a digest shows that, so it is reported three ways: `doctor`'s
+`approvals visibility` check, the
+`merge_requests_with_unknown_approvals_total{team}` gauge (any non-zero value means
+some approvals were unreadable; a value that stays non-zero across slots means the
+endpoint is refused rather than flaky), and one WARN per run naming both
+consequences. The readiness gate does not depend on approvals, so it keeps working
+through this.
 
 ---
 
@@ -190,16 +265,19 @@ request is hidden by a link the service could not resolve.
 | Schedule                   | What it does                                                     |
 | -------------------------- | ---------------------------------------------------------------- |
 | `review.scan_interval` (5m) | enqueues `scan`, which fans out one `scan_repo` per repository   |
-| **09:00 and 16:30 Europe/Moscow** | enqueues one `digest` per team                            |
+| **each team's `digest.slots`** in its `digest.timezone` (default 09:00, 14:00, 17:30 Europe/Moscow) | enqueues one `digest` for that team |
 | `jobs.cleanup_interval` (1h) | sweeps orphaned worktrees and stale mirrors under `review.workdir` |
 
 Periodic jobs are inserted by the River **leader** only, so they fire once
 across all replicas. `scan` and `cleanup` also run immediately on start (a fresh
 replica should not idle for a whole interval, and a SIGKILL is exactly what
-leaves worktrees behind); `digest` does not, so a restart at 11:00 cannot fire
-the 09:00 slot.
+leaves worktrees behind). `digest` carries `RunOnStart` too, but it is guarded by
+a same-day slot check, so a restart only fires a slot whose time has already
+passed **today** and which has no run recorded yet — the hedge exists because
+periodic jobs are leader-only and a leadership change must not skip a slot.
 
-**The digest times are Europe/Moscow and are not configurable.** The zone is
+**The digest schedule is configuration** — `digest.slots` and `digest.timezone`,
+overridable per team. The zone is
 resolved from tzdata embedded in the binary (`internal/scheduler` imports
 `time/tzdata`), so the schedule does not depend on the container's local time or
 on the image shipping a zone database. The digest's `run_date` and slot are
@@ -300,7 +378,10 @@ Metrics worth alerting on:
 | `ai_reviewer_linear_issues_in_review{team}` | last successfully collected Linear issue count |
 | `ai_reviewer_digest_source_errors_total{team,source}` | source failures that degraded a digest |
 | `merge_requests_scanned_total{team}`               | counter: open MRs inspected                    |
-| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten on every digest build — twice a day, not every scan, because the classification needs a whole team at once. A flat line between 09:00 and 16:30 is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
+| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten on every digest build — once per slot, not every scan, because the classification needs a whole team at once. A flat line between two slots is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
+| `merge_requests_linear_not_ready_total{team}` | gauge, same cadence: merge requests the readiness gate parked with their author because the card has not reached `In Review`. The mutually exclusive counterpart of `waiting_human_review`, so an empty review queue can be read against it. A number that stays up means the team routinely opens merge requests without moving the board |
+| `merge_requests_with_unknown_approvals_total{team}` | gauge, same cadence: merge requests whose approvals GitLab refused to report. Zero is the only healthy value; a value that stays non-zero across slots means the endpoint is refused rather than flaky, and both Linear completion rules are inert |
+| `linear_gate_ambiguous_total{team}` | **counter**: merge requests whose readiness gate was skipped because they named Linear issues at different statuses. Meant to be rare — the identifier match yields candidates, not identifiers, so an ordinary branch name can contribute a second issue when the workspace owns a team with that key |
 | `slack_digest_runs_total{team,result}`, `slack_messages_sent_total`, `slack_send_errors_total`, `slack_resend_uncertain_total` | digest delivery |
 | `slack_user_match_total{result}`                  | matching quality — watch `ambiguous`/`not_found` |
 | `river_jobs_total{kind,state}`, `river_job_duration_seconds`, `river_job_retries_total` | queue health |
@@ -340,7 +421,7 @@ no secret values, so its output is safe to paste into a ticket.
 | `migrations` check reports pending                  | A replica started with `migrate_on_start: false`; run `ai-reviewer migrations up`, or turn it back on     |
 | Reviews never start, `readyz` red                   | Postgres unreachable. The service is designed to stop rather than proceed blind                          |
 | "pipeline failed" never appears in the digest       | The token cannot see pipelines — the service account needs at least Reporter (§ GitLab permissions)      |
-| Digest posts nothing, token looks fine              | The bot is not a member of the channel — `doctor` checks this per channel                                |
+| Digest posts nothing, token looks fine              | The bot is not a member of the channel — `doctor` checks this per channel. If that check instead reports `missing_scope`, the token cannot read the channel at all: add `channels:read` (`groups:read` for a private one). Delivery is unaffected by those two; membership is what it needs |
 | Everyone in the digest appears without a mention    | The token cannot read the directory. `doctor` says which scope is missing (`users:read`, then `users:read.email`); GitLab also rarely exposes emails, so add `slack.user_map` overrides |
 | One person appears as plain text while others ping  | Ambiguous match, a deactivated Slack account, or a `user_map` entry that did not resolve — the log says which. Deactivated accounts are excluded on purpose |
 | A `user_map` entry seems to be ignored              | It did not resolve, which looks identical to having no entry. `doctor` resolves every entry and prints what it became |
@@ -349,6 +430,9 @@ no secret values, so its output is safe to paste into a ticket.
 | `claude auth` check fails                           | The mode and the credential disagree. `oauth-token` needs `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`; `existing-login` will not work in a container |
 | Reviewer states look coarse                         | GraphQL is disabled or unsupported; the REST heuristic is in use. `doctor` says which                    |
 | Linear section is missing                           | The team declares no `linear_team_ids`, or Linear failed — an empty board still renders `Linear · In Review: 0`, so an absent line never means "no issues". A failure also adds a warning and marks the run `partial`. Run `doctor` to validate the key, UUIDs and workflow state |
+| A merge request reaches nobody's review queue       | Its Linear card has not reached `In Review`, so the readiness gate parked it with its author — look for the `move CHAIN-N to In Review` row under the author, and check `merge_requests_linear_not_ready_total`. `doctor`'s `linear review gate` line prints which columns count as "before" for that team and board |
+| A card is behind `In Review` but reviewers are still asked | The gate refused to grade it. Either the board could not be ordered (the digest carries a `Partial data: a Linear board could not be ordered` warning, and `merge_requests_linear_not_ready_total` goes absent), or the merge request names several Linear issues at different statuses — check `linear_gate_ambiguous_total` and the `references Linear issues at different statuses` log line |
+| Reviewers are still nudged after somebody approved  | `GET /approvals` is unreadable, so the approval is invisible to the service and both completion rules are inert. It is available on every GitLab tier, so the cause is access: give the service account at least Reporter and check `merge_requests_access_level`. Confirm with `doctor`'s `approvals visibility` check or the `merge_requests_with_unknown_approvals_total` gauge |
 | A review job runs but publishes nothing             | It ran as a dry run. Re-run with `ai-reviewer review <ref> --publish --wait`                              |
 | `scan --team X` reports it was folded in            | A full scan was already in flight; scan uniqueness is by kind. Wait for the next pass                    |
 | A finding lost its line anchor                      | GitLab rejected the stored position; the finding is posted as an unpositioned discussion rather than lost |

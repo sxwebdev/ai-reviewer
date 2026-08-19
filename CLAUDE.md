@@ -9,7 +9,9 @@ read-only Linear source for Slack digests. It scans the open merge
 requests of configured repositories, reviews each one with the Claude Code CLI
 when its head SHA changes, publishes validated findings as inline discussions
 from a service account, classifies human-review and author-action state, and
-sends a per-team Slack digest at 09:00 and 16:30 Europe/Moscow.
+sends each team its Slack digest on that team's own schedule (`digest.slots` and
+`digest.timezone`, overridable per team; 09:00, 14:00 and 17:30 Europe/Moscow by
+default).
 
 It runs as N replicas on PostgreSQL + [River](https://riverqueue.com) +
 [mx](https://github.com/tkcrm/mx). There is no web UI, no manual
@@ -51,12 +53,16 @@ Runtime: `ai-reviewer {start,scan,review,digest,doctor,migrations}`.
   `start` executes it. `review --local` is the exception — it runs the worker's
   code in the CLI process.
 - `doctor [--local]` checks config, git, `claude` auth under the configured
-  mode, timezone, Postgres, pending migrations, River tables, GitLab auth and
-  every repository, `head_pipeline` visibility, Slack membership per channel,
-  the Slack **directory** (`users.list` — the scope failure that silently breaks
-  every mention) and every `slack.user_map` entry resolved against it, Linear
-  auth/team/status mappings when configured, and workdir writability. Non-zero
-  exit on any failure. Run it after config changes.
+  mode, **each team's resolved digest schedule** (slots and timezone, printed in
+  full — with per-team schedules nothing else answers "when does ours arrive"),
+  Postgres, pending migrations, River tables, GitLab auth and
+  every repository, `head_pipeline` visibility, **`/approvals` visibility** (the
+  permissions 403 that silently disables both Linear completion rules), Slack
+  membership per channel, the Slack **directory** (`users.list` — the scope failure
+  that silently breaks every mention) and every `slack.user_map` entry resolved
+  against it, Linear auth/team mappings and **each team's review-gate column split**
+  when configured, and workdir writability. Non-zero exit on any failure. Run it
+  after config changes.
 - `<ref>` accepts a full MR URL, `group/sub/repo!123` or `project-id:iid`
   (`internal/gitlab/ref.go`).
 
@@ -192,13 +198,68 @@ example — it is why `internal/service` never imports River).
 - **GitLab is the source of truth about merge requests and Linear is the source
   of truth about digest issues; Postgres holds only this service's operational
   state and aggregate counts.** Never mirror either source into Postgres.
-- **Linear gates linked MR review; it is not a second task list.** Match a valid
-  identifier in the title, then source branch, case-insensitively. A linked MR
-  with one approval stops notifying remaining reviewers; if its card remains
-  `In Review`, nudge the MR author to move it. Zero approvals, no matching issue,
-  Linear failure, or any `REQUESTED_CHANGES` verdict must fail open to the
-  ordinary GitLab classifier. Never let board state hide an unapproved or
-  changes-requested MR.
+- **Linear gates linked MR review at both ends; it is not a second task list.**
+  Match a valid identifier in the title, then source branch, case-insensitively.
+  Then two gates, and *readiness outranks everything*:
+  - **Readiness.** A card that has not reached `In Review` means the work was
+    never offered, so no reviewer is asked — not even against a standing
+    `REQUESTED_CHANGES`. This deliberately reverses the original "any status +
+    no approvals → ordinary GitLab classification": pinging three reviewers for
+    work the board says is unfinished nudges everyone except the one person who
+    can fix it. **The price is real and accepted** — a card forgotten in
+    `In Progress` now costs the team a review.
+  - **Completion.** One *readable* approval stops notifying remaining reviewers;
+    if the card is still exactly `In Review`, nudge the author to move it
+    forward (`StageReviewOrLater` also covers `Done`, where there is nothing to
+    advance — hence the name check, not the stage).
+  - **The partition is what makes suppression legal.** Every readiness
+    suppression must produce an author row (`needsLinearStart`), whose guard is
+    deliberately *identical* to the one `needsReviewerAction` inherits from
+    `NeedsHumanReview`, making the author set a superset. A superset costs a
+    line; a subset costs the merge request, and this repository has shipped that
+    once already. Pinned as a property, not a table:
+    `TestReadinessSuppressionAlwaysHandsTheMRToItsAuthor`.
+  - **Order comes from the team's own board, never from names in code, and a card
+    contributes only its state id.** `linear.NewWorkflow` pre-answers `Stage` for
+    every column the board reported, comparing `WorkflowState.Type` (Linear's
+    fixed `triage < backlog < unstarted < started < completed < canceled`) and
+    then `Position` within one type — always against In Review's *actual* type,
+    which a team may set to anything. `Workflow.Stage` then reads `state.ID` and
+    nothing else, because the copy riding on an issue comes from a different
+    query and `Position float64` cannot tell `null` or an absent key from a
+    legitimate 0: comparing that 0 graded every column *after* In Review as
+    "never offered" and silenced every reviewer on the team. Do not reintroduce a
+    comparison against the caller's copy. Only `In Review` is ever named;
+    "Ready", "Blocked", "QA" are the team's invention and a list here would drift
+    silently. `canceled` is the one type whose rank lies — Linear sorts it last,
+    but stopped work is not work past review, so it grades as *before*. Grade
+    every issue against **its own** `Issue.Team.ID`, and use
+    `linear.CompareStates` for board order — `Position` alone only ranks columns
+    sharing a type.
+  - **An ambiguous match is not graded.** "First valid identifier in the title
+    wins" was harmless while Linear could only stop notifications an approval had
+    already stopped; the readiness gate handed it the power to silence every
+    reviewer, so `linearStage` returns `StageUnknown` unless every valid candidate
+    agrees. The winner still owns the rendered identifier and URL.
+  - **Fail open, always, and only into today's behaviour:** no matching issue,
+    Linear unreachable, no single `In Review` state, an unknown state type (a
+    seventh Linear type must not silence every reviewer at once), or two states
+    tied on `Position`. The board may narrow who is asked; it may never do so on
+    the strength of a comparison that did not happen.
+- **`ApprovedBy` empty is not "nobody approved" — `ApprovalsKnown` is.** Where
+  `GET /approvals` answers 401/403 — a service account below Reporter, or a project
+  with `merge_requests_access_level` restricted — every MR read as unapproved, both
+  completion rules were inert, no author was ever asked to advance a card, and
+  nothing anywhere said so. The failure is still non-fatal (a snapshot without approvals is worth
+  building) but it is now *visible*: `ApprovalsKnown` fails both rules open,
+  `merge_requests_with_unknown_approvals_total` gauges it, `doctor`'s
+  `approvals visibility` probes it, and the warn-once names **both** consequences —
+  the Linear half conditionally, since a deployment without `linear_team_ids`
+  cannot reach it. The endpoint is **not** a paid feature (only approval *rules*
+  are; `internal/gitlab/endpoints.go` says so at the call site), so the remedy
+  doctor prints is a membership change — at least Reporter — never a tier upgrade.
+  `depthReview` never asks, so it is honestly "unknown" there too — the flag
+  claims completeness, not failure.
 - **Team isolation.** A repository belongs to exactly one team (validated
   fail-fast, the error naming both). One team's failure must not affect another's
   digest.
@@ -342,7 +403,7 @@ commands.
   the **templated** path (wire it through `gitlab.Config.Observer`);
   `SetTeamState` must be called on **every digest build, including when all counts
   are zero**, or a stale gauge persists forever (per digest, not per scan — the
-  classification needs a whole team at once, so the gauges step twice a day and a
+  classification needs a whole team at once, so the gauges step once per slot and a
   flat line between the slots is correct); and `internal/review` does **not** import
   this package — like `internal/gitlab`, it reports numbers on its result and
   `internal/service` publishes them (`ReviewFindingsSuppressed`).

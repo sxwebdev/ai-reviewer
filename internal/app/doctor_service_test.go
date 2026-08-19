@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -126,6 +127,248 @@ type refusingPipelines struct {
 
 func (r refusingPipelines) ListMRPipelines(context.Context, string, int64) ([]gitlab.Pipeline, error) {
 	return nil, &gitlab.APIError{Status: r.status, Method: "GET", Path: "/pipelines"}
+}
+
+// refusingApprovals is the same trick for GET /approvals. The endpoint exists on
+// every GitLab tier, so a refusal is an access problem — the same one that hides
+// pipelines — and it lasts exactly as long as the missing permission.
+type refusingApprovals struct {
+	*gitlab.FakeClient
+	status int
+}
+
+func (r refusingApprovals) GetMRApprovals(context.Context, string, int64) (*gitlab.Approvals, error) {
+	return nil, &gitlab.APIError{Status: r.status, Method: "GET", Path: "/approvals"}
+}
+
+// The approvals endpoint failing costs the digest both Linear completion rules
+// and raises nothing anywhere, so doctor is the only place an operator can learn
+// about it — the same argument as pipeline visibility above.
+func TestProbeRepositoryApprovalsVisibility(t *testing.T) {
+	t.Parallel()
+	const repo = "backend/payments"
+	key := projectKey(repo)
+
+	newFake := func() *gitlab.FakeClient {
+		f := gitlab.NewFake()
+		f.Projects[key] = &gitlab.Project{ID: 42, PathWithNamespace: repo}
+		f.OpenMRs[key] = []gitlab.MergeRequest{{IID: 7}}
+		f.MRs[key+"/7"] = &gitlab.MergeRequest{IID: 7, HeadPipeline: &gitlab.Pipeline{ID: 1}}
+		return f
+	}
+
+	t.Run("readable", func(t *testing.T) {
+		t.Parallel()
+		if got := probeRepository(t.Context(), newFake(), "payments", repo); got.approvals != approvalsVisible {
+			t.Errorf("approvals = %v, want visible", got.approvals)
+		}
+	})
+
+	for _, status := range []int{401, 403} {
+		t.Run("refused "+strconv.Itoa(status), func(t *testing.T) {
+			t.Parallel()
+			got := probeRepository(t.Context(), refusingApprovals{newFake(), status}, "payments", repo)
+			if got.approvals != approvalsHidden {
+				t.Errorf("approvals = %v, want hidden", got.approvals)
+			}
+		})
+	}
+
+	// A 500 concludes nothing about access — but it is not "nothing to check"
+	// either, and collapsing the two made a 502 at a repository with forty open
+	// merge requests print "no open merge request to check /approvals against".
+	t.Run("an unrelated failure is reported, not silently unknown", func(t *testing.T) {
+		t.Parallel()
+		got := probeRepository(t.Context(), refusingApprovals{newFake(), 503}, "payments", repo)
+		if got.approvals != approvalsError {
+			t.Errorf("approvals = %v, want error", got.approvals)
+		}
+	})
+
+	t.Run("no open merge request", func(t *testing.T) {
+		t.Parallel()
+		f := gitlab.NewFake()
+		f.Projects[key] = &gitlab.Project{ID: 42, PathWithNamespace: repo}
+		if got := probeRepository(t.Context(), f, "payments", repo); got.approvals != approvalsUnknown {
+			t.Errorf("approvals = %v, want unknown", got.approvals)
+		}
+	})
+
+	// The pipeline story and the approvals story are independent, and the probe
+	// answers both: an early return on one used to leave the other unasked.
+	t.Run("both are reported from one probe", func(t *testing.T) {
+		t.Parallel()
+		f := newFake()
+		f.MRs[key+"/7"] = &gitlab.MergeRequest{IID: 7} // head_pipeline absent
+		got := probeRepository(t.Context(), refusingPipelines{f, 403}, "payments", repo)
+		if got.pipeline != pipelineHidden || got.approvals != approvalsVisible {
+			t.Errorf("probe = pipeline %v, approvals %v; want hidden and visible", got.pipeline, got.approvals)
+		}
+	})
+}
+
+// The aggregate line has to name the consequence, not the endpoint: "GET
+// /approvals is refused" alone reads like a cosmetic gap.
+func TestCheckRepositoriesReportsBlindApprovals(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	a := &App{Config: cfg, Log: quietLogger()}
+
+	f := gitlab.NewFake()
+	for _, repo := range []string{"backend/payments", "platform/auth", "platform/gateway"} {
+		key := projectKey(repo)
+		f.Projects[key] = &gitlab.Project{ID: 1, PathWithNamespace: repo}
+		f.OpenMRs[key] = []gitlab.MergeRequest{{IID: 1}}
+		f.MRs[key+"/1"] = &gitlab.MergeRequest{IID: 1, HeadPipeline: &gitlab.Pipeline{ID: 1}}
+	}
+
+	col := &checkCollector{}
+	a.checkRepositories(t.Context(), col, refusingApprovals{f, 403})
+
+	var check DoctorCheck
+	for _, c := range col.checks {
+		if c.Name == "approvals visibility" {
+			check = c
+		}
+	}
+	if check.Status != StatusWarn {
+		t.Fatalf("approvals visibility = %+v, want a warning", check)
+	}
+	for _, want := range []string{"backend/payments", "nudged after approving", "at least Reporter"} {
+		if !strings.Contains(check.Detail, want) {
+			t.Errorf("detail is missing %q: %s", want, check.Detail)
+		}
+	}
+	// The endpoint is available on every GitLab tier, so the remedy is a membership
+	// change. Naming licensing sends the operator to buy a tier they already have
+	// while three reviewers keep getting nudged.
+	for _, unwanted := range []string{"paid", "Premium", "licensing limit"} {
+		if strings.Contains(check.Detail, unwanted) {
+			t.Errorf("detail blames %q, but approvals are a Free-tier endpoint: %s", unwanted, check.Detail)
+		}
+	}
+	// No team declares linear_team_ids here, so `linked` is always false and neither
+	// completion rule can fire: promising the operator a Linear consequence would
+	// describe a feature they do not run.
+	if strings.Contains(check.Detail, "Linear") {
+		t.Errorf("detail promises a Linear consequence on a deployment without Linear: %s", check.Detail)
+	}
+}
+
+// ...and names it when Linear *is* configured, since that is the half that costs
+// the team its author nudges.
+func TestCheckRepositoriesNamesTheLinearConsequenceWhenLinearIsConfigured(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	cfg.Teams[0].LinearTeamIDs = []string{"3f1b4a9e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"}
+	a := &App{Config: cfg, Log: quietLogger()}
+
+	f := gitlab.NewFake()
+	key := projectKey("backend/payments")
+	f.Projects[key] = &gitlab.Project{ID: 1, PathWithNamespace: "backend/payments"}
+	f.OpenMRs[key] = []gitlab.MergeRequest{{IID: 1}}
+	f.MRs[key+"/1"] = &gitlab.MergeRequest{IID: 1, HeadPipeline: &gitlab.Pipeline{ID: 1}}
+
+	col := &checkCollector{}
+	a.checkRepositories(t.Context(), col, refusingApprovals{f, 403})
+
+	for _, c := range col.checks {
+		if c.Name == "approvals visibility" && !strings.Contains(c.Detail, "Linear card") {
+			t.Errorf("detail omits the Linear consequence: %s", c.Detail)
+		}
+	}
+}
+
+// refusingListing answers the merge-request listing with a status. A refused
+// listing is not "this repository has no open merge requests", and reporting it as
+// such is a claim the operator can see is false.
+type refusingListing struct {
+	*gitlab.FakeClient
+	status int
+}
+
+func (r refusingListing) ListOpenMRs(context.Context, string) ([]gitlab.MergeRequest, error) {
+	return nil, &gitlab.APIError{Status: r.status, Method: "GET", Path: "/merge_requests"}
+}
+
+func TestCheckRepositoriesDistinguishesARefusedListingFromNoMergeRequests(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	a := &App{Config: cfg, Log: quietLogger()}
+
+	f := gitlab.NewFake()
+	for _, repo := range []string{"backend/payments", "platform/auth", "platform/gateway"} {
+		key := projectKey(repo)
+		f.Projects[key] = &gitlab.Project{ID: 1, PathWithNamespace: repo}
+	}
+
+	col := &checkCollector{}
+	a.checkRepositories(t.Context(), col, refusingListing{f, 403})
+
+	byName := map[string]DoctorCheck{}
+	for _, c := range col.checks {
+		byName[c.Name] = c
+	}
+	for _, name := range []string{"pipeline visibility", "approvals visibility"} {
+		check, ok := byName[name]
+		if !ok {
+			t.Fatalf("no %q check: %+v", name, col.checks)
+		}
+		if !strings.Contains(check.Detail, "listing was refused") {
+			t.Errorf("%s does not name the refused listing: %s", name, check.Detail)
+		}
+		if strings.Contains(check.Detail, "no open merge request") {
+			t.Errorf("%s claims there was nothing to check: %s", name, check.Detail)
+		}
+	}
+
+	// A repository that genuinely has no open merge requests still reports that,
+	// or every quiet repository would raise a permissions warning.
+	quiet := &checkCollector{}
+	a.checkRepositories(t.Context(), quiet, f)
+	for _, c := range quiet.checks {
+		if c.Name != "approvals visibility" {
+			continue
+		}
+		if !strings.Contains(c.Detail, "no open merge request") {
+			t.Errorf("a quiet repository was reported as refused: %s", c.Detail)
+		}
+	}
+}
+
+// An inconclusive repository must be named rather than absorbed by a healthy one —// An inconclusive repository must be named rather than absorbed by a healthy one —
+// that silent gap is the class this whole check exists to close.
+func TestCheckRepositoriesNamesInconclusiveApprovalProbes(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig(t)
+	a := &App{Config: cfg, Log: quietLogger()}
+
+	f := gitlab.NewFake()
+	for _, repo := range []string{"backend/payments", "platform/auth", "platform/gateway"} {
+		key := projectKey(repo)
+		f.Projects[key] = &gitlab.Project{ID: 1, PathWithNamespace: repo}
+		f.OpenMRs[key] = []gitlab.MergeRequest{{IID: 1}}
+		f.MRs[key+"/1"] = &gitlab.MergeRequest{IID: 1, HeadPipeline: &gitlab.Pipeline{ID: 1}}
+	}
+	// Every repository answers 502: nothing is concluded, and that has to be said.
+	col := &checkCollector{}
+	a.checkRepositories(t.Context(), col, refusingApprovals{f, 502})
+
+	var check DoctorCheck
+	for _, c := range col.checks {
+		if c.Name == "approvals visibility" {
+			check = c
+		}
+	}
+	if check.Status != StatusWarn {
+		t.Fatalf("approvals visibility = %+v, want a warning", check)
+	}
+	if !strings.Contains(check.Detail, "could not be checked in backend/payments") {
+		t.Errorf("detail does not name the inconclusive repository: %s", check.Detail)
+	}
+	if strings.Contains(check.Detail, "no open merge request") {
+		t.Errorf("detail claims there was nothing to check: %s", check.Detail)
+	}
 }
 
 // TestCheckRepositoriesSummarises exercises the fan-out: unresolved

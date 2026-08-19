@@ -69,9 +69,29 @@ type User struct {
 }
 
 // WorkflowState is a Linear team's workflow status.
+//
+// Type and Position are what make the state *orderable*, and the digest needs
+// the order rather than the name: "before In Review" has to be answerable for
+// states this service has never heard of ("Ready", "Blocked", "QA"), because the
+// only name in the configuration is In Review itself and every team invents the
+// rest. See Workflow.
 type WorkflowState struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// Type is Linear's own coarse category — triage, backlog, unstarted,
+	// started, completed, canceled — whose relative order is fixed by Linear and
+	// not by the team.
+	Type string `json:"type"`
+	// Position orders states *within* one type, and only within one type: it is
+	// a float Linear reshuffles as the team drags columns around, so it is
+	// meaningless across types and never compared across teams. Use
+	// CompareStates for board order rather than this field alone.
+	//
+	// Only the copy that arrives with a *team's board* is ever ordered. The copy
+	// riding along on an issue is not: a bare float64 cannot tell `null` or an
+	// absent key from a legitimate 0, so trusting it there fails closed. See
+	// Workflow.
+	Position float64 `json:"position"`
 }
 
 // Team is a Linear team and the workflow states visible to the API key.
@@ -80,6 +100,20 @@ type Team struct {
 	Key    string          `json:"key"`
 	Name   string          `json:"name"`
 	States []WorkflowState `json:"-"`
+}
+
+// Label names the team for a diagnostic. The key is parenthesised only when the
+// API actually returned one: GetTeam requires an id and nothing else, so a team
+// with no key rendered as "Chain ()" everywhere the two were concatenated by hand.
+func (t Team) Label() string {
+	name := strings.TrimSpace(t.Name)
+	if name == "" {
+		name = strings.TrimSpace(t.ID)
+	}
+	if key := strings.TrimSpace(t.Key); key != "" {
+		return name + " (" + key + ")"
+	}
+	return name
 }
 
 // Issue is the subset of a Linear issue the digest actually needs: the
@@ -115,7 +149,7 @@ const issuesByNumbersQuery = `query IssuesByNumbers($teamIds: [ID!]!, $numbers: 
   ) {
     nodes {
       id identifier number url
-      state { id name }
+      state { id name type position }
       team { id key name }
     }
     pageInfo { hasNextPage endCursor }
@@ -245,12 +279,15 @@ func (c *Client) Viewer(ctx context.Context) (*User, error) {
 	return &data.Viewer, nil
 }
 
-const teamQuery = `query Team($id: String!) {
+// teamQuery is built from statesPageSize rather than repeating it: NewWorkflow's
+// "the board may be truncated" hint is only correct while the two agree, and
+// nothing else would notice them drifting apart.
+var teamQuery = fmt.Sprintf(`query Team($id: String!) {
   team(id: $id) {
     id key name
-    states(first: 50) { nodes { id name } }
+    states(first: %d) { nodes { id name type position } }
   }
-}`
+}`, statesPageSize)
 
 // GetTeam returns a configured team and its visible workflow states.
 func (c *Client) GetTeam(ctx context.Context, id string) (*Team, error) {
@@ -285,7 +322,7 @@ const issuesInReviewQuery = `query IssuesInReview($teamIds: [ID!]!, $stateName: 
   ) {
     nodes {
       id identifier number url
-      state { id name }
+      state { id name type position }
       team { id key name }
     }
     pageInfo { hasNextPage endCursor }

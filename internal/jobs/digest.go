@@ -8,8 +8,6 @@ import (
 
 	"github.com/riverqueue/river"
 	"github.com/tkcrm/mx/logger"
-
-	"github.com/sxwebdev/ai-reviewer/internal/scheduler"
 )
 
 // DigestWorker builds one team's digest and queues its parts for delivery.
@@ -22,7 +20,6 @@ type DigestWorker struct {
 	log      logger.Logger
 	svc      *Service
 	digester Digester
-	schedule scheduler.Daily
 }
 
 func (w *DigestWorker) Timeout(*river.Job[DigestArgs]) time.Duration { return digestTimeout }
@@ -38,14 +35,30 @@ func (w *DigestWorker) Work(ctx context.Context, job *river.Job[DigestArgs]) err
 			return nil
 		}
 
-		// Parsed in the schedule's own location, not the container's: run_date
-		// names a Moscow calendar day, and at 23:30 UTC that is tomorrow.
+		// Parsed in this team's own location — looked up rather than held on the
+		// worker, because one worker serves every team and per-team schedules can
+		// disagree about which zone a slot was named in.
 		//
+		// Being honest about the stakes: today this cannot change the outcome.
+		// args.RunDate carries no time, so parsing it anywhere yields midnight in
+		// that zone, and service.truncateDay immediately reduces it to its calendar
+		// date. The zone is used because it is the *correct* one by construction and
+		// costs nothing — so the day run_date grows a time component, or a caller
+		// uses it for something other than a date, this is already right.
+		//
+		// The lookup's failure is deliberately not fatal and deliberately not a
+		// skip: it cannot happen (findTeam already proved the team is configured,
+		// and the schedule map is built from the same slice), and dropping a team's
+		// digest over an unobservable difference would be a real loss to avoid an
+		// imaginary one. A zero Daily's Location() is UTC, which is exactly the
+		// fallback that changes nothing.
+		schedule, _ := w.svc.ScheduleFor(args.Team)
+
 		// Location() rather than the Loc field: it is the accessor the scheduler
 		// provides for exactly this, degrading a nil zone to UTC the way Next and
 		// SlotAt do. time.ParseInLocation panics on a nil *time.Location, so the
 		// field read would turn a degenerate schedule into a worker panic.
-		runDate, err := time.ParseInLocation(runDateLayout, args.RunDate, w.schedule.Location())
+		runDate, err := time.ParseInLocation(runDateLayout, args.RunDate, schedule.Location())
 		if err != nil {
 			return fmt.Errorf("parse run_date %q: %w", args.RunDate, err)
 		}

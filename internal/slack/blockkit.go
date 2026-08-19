@@ -139,9 +139,21 @@ type AuthorItem struct {
 	PipelineWebURL string
 	// MoveLinear is set when GitLab already has an approval but the linked task
 	// is still In Review. The author owns advancing the board status.
-	MoveLinear       bool
+	MoveLinear bool
+	// StartLinear is set when the linked task has not reached In Review, which is
+	// why no reviewer was asked to look at this merge request. Mutually exclusive
+	// with MoveLinear by construction — one needs the card on In Review, the other
+	// needs it behind — and it is the row that keeps such a merge request in the
+	// digest at all rather than silently dropping out of both sections.
+	StartLinear      bool
 	LinearIdentifier string
 	LinearWebURL     string
+	// LinearState is the card's current status name, rendered with StartLinear.
+	// Without it the row says the card is in the wrong column but not which one,
+	// and "not in review" is the one fact an author cannot act on: the difference
+	// between In Progress and Canceled is the difference between moving the card
+	// and closing the merge request.
+	LinearState string
 }
 
 // Message is one Slack post. A digest that exceeds the block or character
@@ -517,7 +529,8 @@ func reviewEntry(mr ReviewItem, withProject bool) string {
 
 // authorEntry renders one of the author's own merge requests on a single line,
 // with the flags in a fixed order — changes requested, threads, conflicts,
-// pipeline — so the digest reads the same way every day.
+// pipeline, advance the Linear card, move the Linear card to In Review — so the
+// digest reads the same way every day.
 func authorEntry(mr AuthorItem, withProject bool) string {
 	var b strings.Builder
 	b.WriteString("🛠 ")
@@ -547,11 +560,14 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 		flags = append(flags, "❌ "+link(mr.PipelineWebURL, "pipeline"))
 	}
 	if mr.MoveLinear {
-		identifier := escape(strings.TrimSpace(mr.LinearIdentifier))
-		if identifier == "" {
-			identifier = "task"
+		flags = append(flags, "➡️ move "+linearTask(mr)+" forward in Linear")
+	}
+	if mr.StartLinear {
+		flag := "⏳ move " + linearTask(mr) + " to In Review"
+		if state := stateLabel(mr.LinearState); state != "" {
+			flag += " (now " + state + ")"
 		}
-		flags = append(flags, "➡️ move "+link(mr.LinearWebURL, identifier)+" forward in Linear")
+		flags = append(flags, flag)
 	}
 	if len(flags) > 0 {
 		b.WriteString(" · ")
@@ -562,6 +578,39 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 		b.WriteString(t)
 	}
 	return b.String()
+}
+
+// maxStateRunes bounds a workflow-state name. A column name is workspace-authored
+// text like a title, and it is rendered *before* the title, so an unbounded one
+// pushes the title off the end of the section.
+const maxStateRunes = 24
+
+// stateLabel renders a workflow-state name for a digest row: whitespace collapsed
+// and length bounded, then escaped.
+//
+// Collapsing is not cosmetic. Every other rendered field goes through the same
+// step (see shortTitle), and this one skipped it, so a column named "In\nProgress"
+// split the row in two and broke the one-row-per-merge-request rule the whole
+// layout rests on. Nothing stops a Linear workspace from containing that.
+func stateLabel(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if runeLen(s) <= maxStateRunes {
+		return escape(s)
+	}
+	// TrimRight before the ellipsis: cutting mid-space rendered "Waiting for …" as
+	// "Waiting for " + "…", the same trailing-space artefact shortTitle avoids.
+	cut := strings.TrimRight(string([]rune(s)[:maxStateRunes-1]), " ")
+	return escape(cut) + "…"
+}
+
+// linearTask renders the linked card as a link, falling back to a bare word when
+// the identifier is missing so the row never renders an empty link label.
+func linearTask(mr AuthorItem) string {
+	identifier := escape(strings.TrimSpace(mr.LinearIdentifier))
+	if identifier == "" {
+		identifier = "task"
+	}
+	return link(mr.LinearWebURL, identifier)
 }
 
 // maxTitleRunes bounds a title so an entry stays one line in Slack. Titles here

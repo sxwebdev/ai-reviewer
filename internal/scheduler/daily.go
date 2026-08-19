@@ -4,7 +4,9 @@
 package scheduler
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	// The digest fires at fixed Europe/Moscow wall-clock times, and the
@@ -18,14 +20,6 @@ import (
 
 	"github.com/riverqueue/river"
 )
-
-// DigestTZ is the zone the digest slots are expressed in. Not configurable:
-// the team reads the digest at Moscow office hours (plan §6.6).
-const DigestTZ = "Europe/Moscow"
-
-// DigestTimes are the two daily digest slots. 09:00 and 16:30 are a product
-// requirement, deliberately not exposed in config.
-var DigestTimes = []Clock{{Hour: 9, Minute: 0}, {Hour: 16, Minute: 30}}
 
 // SlotLayout is how a slot name is encoded, in digest_runs.slot and everywhere
 // else. Exported so a caller that has to describe a non-slot instant (a
@@ -41,6 +35,55 @@ type Clock struct {
 // String renders the slot as "HH:MM" — the same form stored in
 // digest_runs.slot, so the two cannot drift.
 func (c Clock) String() string { return fmt.Sprintf("%02d:%02d", c.Hour, c.Minute) }
+
+// ParseClock reads one configured slot in the same "HH:MM" form String writes,
+// which is what keeps the config vocabulary and digest_runs.slot identical.
+//
+// It exists here rather than in the config package so exactly one parser answers
+// what a slot string means. time.Parse is not enough on its own: it accepts a
+// single-digit hour ("9:00") and would silently give the schedule a name that
+// never round-trips through String, so the round trip is asserted instead of
+// assumed.
+func ParseClock(s string) (Clock, error) {
+	t, err := time.Parse(SlotLayout, strings.TrimSpace(s))
+	if err != nil {
+		return Clock{}, fmt.Errorf("slot %q must be HH:MM in 24-hour form", s)
+	}
+	c := Clock{Hour: t.Hour(), Minute: t.Minute()}
+	if c.String() != strings.TrimSpace(s) {
+		return Clock{}, fmt.Errorf("slot %q must be zero-padded HH:MM (write %q)", s, c)
+	}
+	return c, nil
+}
+
+// ParseClocks reads a whole configured schedule, rejecting an empty list and
+// duplicates.
+//
+// Empty is refused because a Daily with no Times cannot name a slot at all: it
+// would leave every digest unnamed rather than merely unscheduled, and SlotAt
+// reports that as a failure the caller has to handle. Duplicates are refused
+// because two identical names are indistinguishable in digest_runs and the
+// second one can only ever be absorbed by the unique index — an operator writing
+// one meant something else.
+func ParseClocks(values []string) ([]Clock, error) {
+	if len(values) == 0 {
+		return nil, errors.New("at least one digest slot is required")
+	}
+	out := make([]Clock, 0, len(values))
+	seen := make(map[Clock]bool, len(values))
+	for _, v := range values {
+		c, err := ParseClock(v)
+		if err != nil {
+			return nil, err
+		}
+		if seen[c] {
+			return nil, fmt.Errorf("slot %s is listed twice", c)
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out, nil
+}
 
 // Slot is a scheduled firing: the name written to digest_runs.slot and the
 // instant it names. At is always in the schedule's location, so At's calendar
@@ -123,10 +166,11 @@ func (d Daily) Next(current time.Time) time.Time {
 //
 // Snapping — rather than formatting t — is the whole point. digest_runs is keyed
 // by (team, run_date, slot, attempt), so a name that is not one of Times defeats
-// that index: a manual run at 18:33 filed under "18:33" collides with nothing
-// and sends a second copy of the 16:30 digest. The periodic path has the same
-// exposure, because River's enqueuer fires near the scheduled instant, not
-// exactly on it — a job constructed at 09:00:31 must still say "09:00".
+// that index: a manual run after the last slot, filed under its own clock time,
+// collides with nothing and sends a second copy of that slot's digest. The periodic path has the
+// same exposure, because River's enqueuer fires near the scheduled instant, not
+// exactly on it — a job constructed half a minute late must still name its own
+// slot.
 //
 // ok is false only when the schedule has no Times and therefore cannot name a
 // slot at all; the returned Slot is then zero. Callers must handle that
@@ -165,13 +209,43 @@ func (d Daily) SlotAt(t time.Time) (Slot, bool) {
 	return Slot{}, false
 }
 
-// NewDigest builds the digest schedule, loading Europe/Moscow. The error is
-// surfaced (rather than panicking) so startup validation can report a broken
-// tzdata build as a config failure — see plan §7.3.
-func NewDigest() (Daily, error) {
-	loc, err := time.LoadLocation(DigestTZ)
+// NewDigest builds one digest schedule from the configured slots and zone. Both
+// errors are surfaced rather than panicking so startup validation can report a
+// malformed slot or an unknown zone as a config failure.
+//
+// The slots arrive as the strings the operator wrote, not as Clocks, so this is
+// the only place that turns config into a schedule and no caller can assemble a
+// Daily out of values ParseClocks would have rejected.
+//
+// An empty timezone is rejected rather than defaulted: Daily.Location() degrades
+// a nil zone to UTC so the type stays safe, but silently scheduling a team's
+// digest in UTC because a config key was blank would move every slot by hours
+// without anything saying so. The default belongs to the config schema.
+func NewDigest(slots []string, timezone string) (Daily, error) {
+	times, err := ParseClocks(slots)
 	if err != nil {
-		return Daily{}, fmt.Errorf("load timezone %s: %w", DigestTZ, err)
+		return Daily{}, err
 	}
-	return Daily{Times: DigestTimes, Loc: loc}, nil
+	loc, err := LoadLocation(timezone)
+	if err != nil {
+		return Daily{}, err
+	}
+	return Daily{Times: times, Loc: loc}, nil
+}
+
+// LoadLocation resolves a configured IANA zone name. Exported so config
+// validation and doctor answer "is this zone loadable" exactly the way the
+// schedule will, including on a stripped image with no tzdata — which this
+// package embeds, so it should never fail, but the failure it guards is
+// invisible until the first missed digest.
+func LoadLocation(name string) (*time.Location, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("timezone is required")
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("timezone %q cannot be loaded (missing tzdata in the image?): %w", name, err)
+	}
+	return loc, nil
 }

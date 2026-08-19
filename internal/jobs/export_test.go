@@ -46,7 +46,7 @@ func WorkPublishReview(ctx context.Context, s *Service, args PublishReviewArgs) 
 
 // WorkDigest runs the digest builder.
 func WorkDigest(ctx context.Context, s *Service, args DigestArgs) error {
-	w := &DigestWorker{log: s.log, svc: s, digester: s.deps.Digester, schedule: s.schedule}
+	w := &DigestWorker{log: s.log, svc: s, digester: s.deps.Digester}
 	return w.Work(ctx, testJob(args))
 }
 

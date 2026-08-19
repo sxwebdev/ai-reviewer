@@ -53,11 +53,18 @@ func newFixture(t *testing.T) *fixture {
 		teams: []domain.Team{
 			{
 				Name: "payments-" + token, SlackChannel: "C1", AIReview: true,
-				Repositories: []string{token + "/payments", token + "/billing"},
+				Repositories:   []string{token + "/payments", token + "/billing"},
+				DigestSlots:    []string{"09:00", "14:00", "17:30"},
+				DigestTimezone: "Europe/Moscow",
 			},
 			{
+				// A second zone on purpose: every fixture that exercises two teams
+				// then exercises two schedules, which is the shape the per-team
+				// change introduced.
 				Name: "platform-" + token, SlackChannel: "C2", AIReview: true,
-				Repositories: []string{token + "/auth"},
+				Repositories:   []string{token + "/auth"},
+				DigestSlots:    []string{"10:00", "18:00"},
+				DigestTimezone: "Europe/Lisbon",
 			},
 		},
 	}
@@ -176,6 +183,17 @@ func (f *fixture) newService(t *testing.T, cfg jobs.Config, deps jobs.Deps) *job
 	t.Helper()
 	if cfg.Teams == nil {
 		cfg.Teams = f.teams
+	}
+	// A schedule is required per team — NewService refuses a team it cannot
+	// schedule, and every real caller gets one from app.Teams. Filled in here so
+	// the tests that hand-build a team need not say so.
+	for i := range cfg.Teams {
+		if len(cfg.Teams[i].DigestSlots) == 0 {
+			cfg.Teams[i].DigestSlots = []string{"09:00", "14:00", "17:30"}
+		}
+		if cfg.Teams[i].DigestTimezone == "" {
+			cfg.Teams[i].DigestTimezone = "Europe/Moscow"
+		}
 	}
 	svc, err := jobs.NewService(testLogger(), cfg, f.pool, deps)
 	if err != nil {
