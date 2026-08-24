@@ -159,13 +159,30 @@ func (f *fakeSlackSocket) push(frame string) {
 // drop kills the live connection without a disconnect envelope, the way a lost
 // network does.
 func (f *fakeSlackSocket) drop() {
-	f.mu.Lock()
-	conn := f.cur
-	f.cur = nil
-	f.mu.Unlock()
-	if conn != nil {
-		_ = conn.CloseNow()
+	f.t.Helper()
+	// Waits for a live connection rather than taking whatever cur happens to hold,
+	// because serveWS bumps conns *before* it publishes cur — it publishes only
+	// after the hello write, so the test's writer and serveWS never hold the
+	// connection at once. waitForConns(1) therefore returns during that window,
+	// and a drop that read a nil cur closed nothing at all: the listener stayed
+	// connected, no reconnect followed, and the failure surfaced five seconds
+	// later as "timed out waiting for 2 connection(s); got 1" — a reconnect bug
+	// that was never in the listener.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		conn := f.cur
+		if conn != nil {
+			f.cur = nil
+		}
+		f.mu.Unlock()
+		if conn != nil {
+			_ = conn.CloseNow()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
+	f.t.Fatal("no live connection to drop")
 }
 
 // gotAcks returns the acknowledgements received so far.
