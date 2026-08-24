@@ -290,20 +290,56 @@ func periodicJobs(cfg Config, schedules map[string]scheduler.Daily) []*river.Per
 	return jobs
 }
 
+// slotSnapMargin is how far before a slot an instant is still treated as that
+// slot's firing.
+//
+// It exists to cancel River's own margin, not to be lenient. River's periodic
+// enqueuer runs every job whose next run is before `now + 100ms`, deliberately,
+// so that a timer firing a hair early does not postpone a slot by a whole cycle
+// — and it records the intended instant in the job's scheduled_at while handing
+// the constructor nothing. A constructor that asks time.Now() can therefore be
+// microseconds *before* the slot it was fired for.
+//
+// Observed, not theorised: on 2026-08-24 the 14:00 job was inserted at
+// 13:59:59.999745 with scheduled_at 14:00:00, so SlotAt answered "09:00" — the
+// previous slot, already delivered that morning by the RunOnStart path. The
+// args matched the existing run exactly, BuildDigest handed back the delivered
+// one, slack_send found its message already sent, and the team's 14:00 digest
+// simply never arrived, with nothing anywhere saying why.
+//
+// Two seconds rather than River's own 100ms: the gap between the enqueuer
+// reading the clock and this function reading it again is unbounded in
+// principle, and the cost of being generous is nil — slots are hours apart, so
+// the last two seconds before one are not a meaningful part of the previous
+// slot's territory.
+const slotSnapMargin = 2 * time.Second
+
 // digestSlotForNow names the digest run the instant `at` belongs to, and
 // reports whether it should be inserted at all.
 //
-// A scheduled firing always passes: the enqueuer calls this just after a slot
-// elapsed, so the slot it snaps to is that same slot, today. The check bites
-// only on the RunOnStart path, where `at` can be any time a replica happened to
-// win the leader election — 03:00, when the slot the instant belongs to is
-// yesterday's last one. Yesterday's digest is not worth sending; today's,
+// A scheduled firing always passes: the enqueuer calls this at (or fractionally
+// before) a slot, so the slot it snaps to is that same slot, today. The day
+// check bites only on the RunOnStart path, where `at` can be any time a replica
+// happened to win the leader election — 03:00, when the slot the instant belongs
+// to is yesterday's last one. Yesterday's digest is not worth sending; today's,
 // missing, is.
 func digestSlotForNow(team string, schedule scheduler.Daily, at time.Time) (DigestArgs, bool) {
+	// Snap forward onto a slot we are within a whisker of, so the name matches the
+	// firing rather than the clock — see slotSnapMargin.
+	//
+	// Compared with After rather than by subtracting: a schedule that skips every
+	// day answers neverTime, and while time.Sub clamps rather than overflowing,
+	// not relying on that is cheaper than remembering it does.
+	if next := schedule.Next(at); !next.After(at.Add(slotSnapMargin)) {
+		at = next
+	}
 	// A skipped day is skipped on this path too. Next steps over it, so the timer
 	// never fires there — but RunOnStart does not go through Next, and a replica
 	// starting on a Saturday morning would otherwise build and send the very
 	// digest the skip list exists to suppress.
+	//
+	// Checked after the snap, which cannot move `at` onto a skipped day: Next only
+	// ever returns one the skip list allows.
 	if schedule.Skipped(at) {
 		return DigestArgs{}, false
 	}

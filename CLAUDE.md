@@ -289,6 +289,19 @@ example — it is why `internal/service` never imports River).
   doctor prints is a membership change — at least Reporter — never a tier upgrade.
   `depthReview` never asks, so it is honestly "unknown" there too — the flag
   claims completeness, not failure.
+- **The slot a digest job names comes from the firing, not from the clock.**
+  River's periodic enqueuer runs every job whose next run is before `now + 100ms`
+  — deliberately, so a timer firing a hair early does not postpone a slot by a
+  whole cycle — and it hands the constructor nothing but records the intended
+  instant in `scheduled_at`. So `time.Now()` inside the constructor can be
+  *before* the slot it was fired for, and `SlotAt` then answers the previous one.
+  `jobs.slotSnapMargin` cancels River's margin: an instant within two seconds of
+  the coming slot is that slot's. Not theoretical — on 2026-08-24 the 14:00 job
+  was inserted at `13:59:59.999745` with `scheduled_at 14:00:00`, named slot
+  `09:00`, matched the run RunOnStart had already delivered that morning, and the
+  team's 14:00 digest never arrived. Every layer behaved correctly and the whole
+  chain was silent, which is why `BuildDigest` now logs the already-built path:
+  INFO, not WARN, because the ordinary way there is a restart between two slots.
 - **A skipped day is a day nothing is built on, not a day something is
   withheld.** `digest.skip_weekdays` / `digest.skip_dates` live in
   `scheduler.Daily.Skip`, and `Next` steps over those days — so River never

@@ -60,6 +60,21 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 		if existing.Status != DigestFailed {
 			// Already built for this slot and attempt — hand back what is there
 			// rather than assembling a second copy.
+			//
+			// Logged because this is what silence looks like from the outside. When
+			// a job named an already-delivered slot the whole chain behaved
+			// correctly and posted nothing: BuildDigest returned the old run,
+			// slack_send found its message already sent, and the only record that
+			// the slot had fired at all was a row in river_job. "The 14:00 digest
+			// did not arrive" then had no answer short of a database query.
+			//
+			// INFO and not WARN on purpose: the common way here is a restart between
+			// two slots, where RunOnStart correctly finds nothing to do. A warning on
+			// every deploy is a warning nobody reads.
+			s.log.Infow("digest slot was already built; returning the existing run",
+				"team", team.Name, "slot", slot, "run_date", day.Format(time.DateOnly),
+				"attempt", attempt, "existing_status", existing.Status,
+				"built_at", existing.CreatedAt.Format(time.RFC3339))
 			return s.outcomeForRun(ctx, existing)
 		}
 		// A failed attempt left a row but no messages; the unique index means

@@ -368,7 +368,20 @@ func TestDigestSlotForNow(t *testing.T) {
 		// Before the first slot of the day the instant belongs to yesterday's
 		// last one. Yesterday's digest is not worth sending.
 		{"03:00 belongs to yesterday and is refused", at(3, 0), "", "", false},
-		{"one second before the morning slot", at(9, 0).Add(-time.Second), "", "", false},
+		{"a minute before the morning slot is still yesterday's", at(9, 0).Add(-time.Minute), "", "", false},
+		// Inside slotSnapMargin the instant is the coming slot's, not the previous
+		// one's. River fires up to 100ms early by design, and on the RunOnStart path
+		// this means a replica starting in the last seconds before a slot delivers
+		// it now rather than a moment later — which is what the flag is for.
+		{"a second before the morning slot is that slot", at(9, 0).Add(-time.Second), "09:00", "2026-08-13", true},
+		{"exactly slotSnapMargin before still snaps", at(9, 0).Add(-slotSnapMargin), "09:00", "2026-08-13", true},
+		{"a hair past the margin does not", at(9, 0).Add(-slotSnapMargin - time.Millisecond), "", "", false},
+		// The regression, to the microsecond. River inserted the 14:00 job at
+		// 13:59:59.999745 with scheduled_at 14:00:00; the constructor read the clock,
+		// got the previous slot, and the team's 14:00 digest was answered with the
+		// morning's already-delivered run.
+		{"River's early firing names the slot it fired for",
+			at(14, 0).Add(-255 * time.Microsecond), "14:00", "2026-08-13", true},
 	}
 
 	for _, tc := range cases {
