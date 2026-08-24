@@ -77,6 +77,13 @@ func (a *App) Start(ctx context.Context) error {
 		),
 	)
 
+	// Registered after the queue it inserts into, so shutdown (LIFO) closes the
+	// socket first: a command accepted while River is already stopping would be
+	// acknowledged in Slack and then have nothing to run it.
+	if rt.SlackSocket != nil {
+		ln.ServicesRunner().Register(launcher.NewService(launcher.WithService(rt.SlackSocket)))
+	}
+
 	return ln.Run()
 }
 
@@ -100,11 +107,21 @@ func (a *App) logEffectiveMode() {
 		idle = append(idle, t.Name)
 	}
 
+	commands := "off (no slack.app_token)"
+	if a.commandsEnabled() {
+		commands = a.Config.Slack.Commands.Team + " " + a.Config.Slack.Commands.Mine
+	}
+
 	a.Log.Infow("effective mode",
 		"ai_review_teams", reviewing,
 		"digest_only_teams", idle,
 		"publish_findings", a.Config.Service.AIReviewPublishEnabled,
 		"send_to_slack", a.Config.Service.SlackSendEnabled,
+		// Printed for the same reason the two switches above are: "why does /all
+		// do nothing" is otherwise unanswerable from the log, and the answer is
+		// usually that this deployment has no app token or that the workspace
+		// registered a different name.
+		"slack_commands", commands,
 		"agent_mode", a.Config.LLM.Claude.AgentMode,
 		"workdir", a.Config.Review.WorkDir,
 		"model", a.Config.LLM.Claude.Model,

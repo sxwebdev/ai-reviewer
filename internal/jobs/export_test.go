@@ -61,3 +61,9 @@ func WorkCleanup(ctx context.Context, s *Service) error {
 	w := &CleanupWorker{log: s.log, workdir: s.cfg.WorkDir}
 	return w.Work(ctx, testJob(CleanupArgs{}))
 }
+
+// WorkSlackCommand runs one in-chat command answer.
+func WorkSlackCommand(ctx context.Context, s *Service, args SlackCommandArgs) error {
+	w := &SlackCommandWorker{log: s.log, svc: s, commander: s.deps.Commander}
+	return w.Work(ctx, testJob(args))
+}

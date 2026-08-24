@@ -9,9 +9,10 @@ read-only Linear source for Slack digests. It scans the open merge
 requests of configured repositories, reviews each one with the Claude Code CLI
 when its head SHA changes, publishes validated findings as inline discussions
 from a service account, classifies human-review and author-action state, and
-sends each team its Slack digest on that team's own schedule (`digest.slots` and
-`digest.timezone`, overridable per team; 09:00, 14:00 and 17:30 Europe/Moscow by
-default).
+sends each team its Slack digest on that team's own schedule (`digest.slots`,
+`digest.timezone` and the `digest.skip_weekdays` / `digest.skip_dates` exception
+lists, all overridable per team; 09:00, 14:00 and 17:30 Europe/Moscow every day
+by default).
 
 It runs as N replicas on PostgreSQL + [River](https://riverqueue.com) +
 [mx](https://github.com/tkcrm/mx). There is no web UI, no manual
@@ -50,17 +51,30 @@ Runtime: `ai-reviewer {start,scan,review,digest,doctor,migrations}`.
   mx ops server (`/livez`, `/readyz`, `/metrics` on 10000; `/debug/pprof` only
   when `ops.profiler.enabled`, which nothing authenticates, hence opt-in).
 - `scan`, `digest`, `review` **enqueue a River job and print its id**; a running
-  `start` executes it. `review --local` is the exception — it runs the worker's
-  code in the CLI process.
+  `start` executes it. There are two exceptions, both running the service's own
+  code in the CLI process rather than a copy of it: `review --local`, and
+  `digest --dry-run`, which assembles one team's digest through the same
+  `service.PreviewDigest` → `renderDigest` path the scheduled build uses and
+  prints it — no `digest_runs` row, no `digest_messages`, no `slack_send` job, no
+  `chat.postMessage`, no slot consumed, no metrics published (the per-team gauges
+  describe the service's view of a team, not a hand-run command's). `--json`
+  prints the untouched `chat.postMessage` payloads; without it Slack ids are
+  rendered as the names the matcher resolved them from, because a terminal draws
+  `<@U024BE7LH>` as an id.
 - `doctor [--local]` checks config, git, `claude` auth under the configured
-  mode, **each team's resolved digest schedule** (slots and timezone, printed in
-  full — with per-team schedules nothing else answers "when does ours arrive"),
+  mode, **each team's resolved digest schedule** (slots, timezone and skipped
+  days, printed in full — with per-team schedules nothing else answers "when does
+  ours arrive", and without the skips nothing answers "why was there nothing
+  today"),
   Postgres, pending migrations, River tables, GitLab auth and
   every repository, `head_pipeline` visibility, **`/approvals` visibility** (the
   permissions 403 that silently disables both Linear completion rules), Slack
   membership per channel, the Slack **directory** (`users.list` — the scope failure
   that silently breaks every mention) and every `slack.user_map` entry resolved
-  against it, Linear auth/team mappings and **each team's review-gate column split**
+  against it, the **in-chat commands** (the app-level token proved against
+  `apps.connections.open` — the bot token there answers `not_allowed_token_type`,
+  which is the likely mistake — plus the two names this deployment answers to,
+  since Slack has no API that lists an app's slash commands), Linear auth/team mappings and **each team's review-gate column split**
   when configured, and workdir writability. Non-zero exit on any failure. Run it
   after config changes.
 - `<ref>` accepts a full MR URL, `group/sub/repo!123` or `project-id:iid`
@@ -102,6 +116,7 @@ deployed from an intermediate state. Later changes use numbered pairs (currently
 ```text
 GitLab (truth about MRs) ──REST v4 + GraphQL──┐
 Linear (digest only) ───────────GraphQL───────┤
+Slack Socket Mode (/all, /my) ──WebSocket─────┤   (outbound; nothing is exposed)
                                               ▼
    cli ──► app ──► jobs (River) ──► service ──► {store, gitlab, linear, slack,
                                                  match, git, llm, review, domain}
@@ -120,14 +135,16 @@ example — it is why `internal/service` never imports River).
 - **`internal/app`** — composition root. `runtime.go` wires everything,
   `start.go` registers it with the mx launcher, `doctor*.go` the checks,
   `adapters.go` maps `service` types onto the interfaces `jobs` declares.
-- **`internal/jobs`** — River. Seven kinds in two chains:
+- **`internal/jobs`** — River. Eight kinds in two chains:
   `scan → scan_repo → {review → publish_review, publish_review sweep}` and
-  `digest → slack_send`, plus `cleanup`. Owns queues, uniqueness, attempt
-  budgets, timeouts, the periodic schedule and the drain.
+  `digest → slack_send`, plus `cleanup` and `slack_command` (the in-chat
+  commands, enqueued by the Socket Mode listener rather than by a schedule).
+  Owns queues, uniqueness, attempt budgets, timeouts, the periodic schedule and
+  the drain.
 - **`internal/service`** — one operation end to end: `ScanRepository`,
-  `RunReview`, `PublishReview`, `BuildDigest`, `SendMessage`. The only layer that
-  touches GitLab, Slack, the engine and Postgres in the same breath, and the
-  owner of every wire→domain mapping.
+  `RunReview`, `PublishReview`, `BuildDigest`, `SendMessage`, `RunSlackCommand`.
+  The only layer that touches GitLab, Slack, the engine and Postgres in the same
+  breath, and the owner of every wire→domain mapping.
 - **`internal/domain`** — pure classifiers over `MergeRequestSnapshot`. No I/O,
   no config, no logging.
 - **`internal/review`** — the engine: fan-out passes → cross-pass dedupe →
@@ -186,6 +203,18 @@ example — it is why `internal/service` never imports River).
   can never fire — the author read "changes requested by X" for the life of the MR
   and X was never asked to look again. Zero now means "no note of any kind was
   readable", the residual case, and it still parks the MR with the author.
+- **Every digest row names its action, in the imperative.** `review !1369`,
+  `your MR !1366`, `resolve 3 threads`, `fix merge conflicts`,
+  `fix the failed pipeline`, `move CHAIN-184 to In Review`. The icons stay
+  because they make a long list scannable, but they may never be the only thing
+  a row says: the two kinds of row sit in the same block, one under the other,
+  and `▫️ !1369` above `🛠 !1366` asked the reader to already know which of the
+  two was theirs to fix. Pinned as a vocabulary over every `·`-separated
+  segment, not as a golden string — `TestEveryRowSaysWhatToDo` — so a flag added
+  later without a verb fails there instead of shipping as another unreadable
+  icon. The compressed tail is the one exception and states the rule: it names
+  the action once, on the `+8 more to review:` line the ids hang off.
+
 - **Dedup by fingerprint** — `review.Fingerprint(projectID, mrIID, file,
   category, title)`, sha256, head-SHA-independent. This is the dedupe contract in
   Postgres *and* in the GitLab markers: do not change its inputs or format.
@@ -260,9 +289,77 @@ example — it is why `internal/service` never imports River).
   doctor prints is a membership change — at least Reporter — never a tier upgrade.
   `depthReview` never asks, so it is honestly "unknown" there too — the flag
   claims completeness, not failure.
+- **A skipped day is a day nothing is built on, not a day something is
+  withheld.** `digest.skip_weekdays` / `digest.skip_dates` live in
+  `scheduler.Daily.Skip`, and `Next` steps over those days — so River never
+  inserts the job, and the day costs no GitLab requests. The RunOnStart path does
+  not go through `Next`, so `digestSlotForNow` repeats the check; a replica
+  starting on a skipped Saturday would otherwise send exactly the digest the list
+  suppresses. `SlotAt` is deliberately *not* skip-aware: it answers "which slot
+  does this instant belong to", which a manual run on a Saturday still needs. The
+  skip never touches delivery — a Friday digest whose `slack_send` retries into
+  Saturday is still delivered. Dates come in two forms (`2026-12-31` once,
+  `05-09` every year), the annual one because a list of full dates expires each
+  December and the failure is silent. All seven weekdays is legal, means "no
+  scheduled digest for this team", terminates via `neverTime`, and is reported by
+  `doctor` as a warning that names the consequence.
 - **Team isolation.** A repository belongs to exactly one team (validated
   fail-fast, the error naming both). One team's failure must not affect another's
   digest.
+- **In-chat commands answer questions; they never change state.** `/all` and
+  `/my` (`slack.commands.*`) build through `PreviewDigest` like
+  `digest --dry-run` and record nothing: no `digest_runs` row, no
+  `digest_messages`, no slot consumed, no metric gauge moved. A command that
+  filed a slot would make the *scheduled* run collide with the unique index —
+  the failure would land on the wrong side.
+  - **`/my` is a filter, not a second classification.** `slack.DigestData.OnlyPerson`
+    narrows the digest that was going to be built anyway, keyed on the Slack id
+    the matcher already resolved. Resolving a Slack id back to a GitLab user and
+    re-running the rules would be a second implementation of "what does this
+    person owe", and the two would answer differently the first time one changed.
+    The filter drops the Linear aggregate (it is the team's board, not the
+    caller's) and keeps the partial-data warnings (a half-built digest is exactly
+    as incomplete for one person). A miss returns *nothing*, never everything —
+    falling through to the full digest would post the whole team's queue as an
+    answer meant for one person.
+  - **An empty personal answer names both readings.** "Nothing waiting on you"
+    *or* "your Slack account is not matched to your GitLab one": an unmatched
+    person is simply absent from the digest, exactly like a person with an empty
+    queue, so the service cannot tell them apart — and telling a reviewer with
+    three merge requests waiting that they are clear is the failure that matters.
+  - **The transport is outbound and nothing is exposed.** Socket Mode, so there
+    is no ingress, no certificate and no request signature to verify — there is
+    no unauthenticated request. `slack.app_token` (`xapp-…`) is the whole switch:
+    it is the one credential `apps.connections.open` accepts, and it cannot
+    answer on the connection it opens, which is why config validation requires
+    `slack.token` alongside it.
+  - **The response URL is a capability in a database column.** It lets whoever
+    holds it post into that conversation as the app for 30 minutes, so it is
+    never logged and never echoed into an error, and `Respond` pins the host to
+    `hooks.slack.com` — the URL is read back out of a job argument minutes later,
+    on another replica. Its budget is five messages; a longer digest is cut with
+    a visible line saying how many parts are missing.
+  - **The socket acknowledges, the queue answers.** Slack allows three seconds
+    and a digest is dozens of GitLab requests, so the listener resolves the team
+    from the channel, enqueues `slack_command` and returns — the acknowledgement
+    payload is the immediate reply. Uniqueness is (scope, team, caller,
+    **channel**), so a double press folds instead of starting a second GitLab
+    pass. The channel is in that key because the answer goes to the response URL
+    of whichever invocation won it: without the channel, a single-team
+    deployment — where `SlackCommandTeam` resolves *any* conversation, a DM
+    included, to the one team — acknowledges the second caller and then answers
+    in the first conversation.
+  - **A transport that cannot connect must not take the process down.** mx
+    returns from `Run()` on a `Start` error *before* its stop block, so a failed
+    start stops nothing that already started: River is never drained, an
+    in-flight review is cut and the next digest slot is missed. `Socket.Start`
+    therefore fails startup only on a credential this app can never use
+    (`permanentSocketAuthCodes`, plus 401/403) and hands every transient failure
+    to the run loop's existing backoff. The list is an allowlist on purpose —
+    guessing "permanent" for an unfamiliar Slack code exits the process, while
+    guessing "transient" only leaves a warning. Whatever path returns an error
+    must still `close(s.done)`, or `Stop` waits out its whole shutdown context on
+    a loop that was never started.
 - **The success marker is written last.** Findings first, each `note_id` recorded
   immediately after its POST; then the summary note carrying the review marker;
   then `status='succeeded'`. Nothing may be posted after the summary, so
@@ -307,7 +404,10 @@ commands.
      because it is leader-only and its TTLs (6h worktrees, 30d mirrors) dwarf any
      job's lifetime.
 - **Jobs.** `review` has `MaxAttempts = 1` (a failed review already burned
-  tokens); `publish_review` and `slack_send` get 10, being cheap network retries.
+  tokens); `publish_review` and `slack_send` get 10, being cheap network retries;
+  `slack_command` gets 3, because its answer has a deadline nothing else here
+  does — the response URL dies after 30 minutes, so a fourth attempt would spend
+  a whole digest build on a URL that is probably already gone.
   Uniqueness always restricts `ByState` to in-flight states — River's default
   includes `Completed`, which would make a re-review of the same SHA silently
   vanish. `river:"unique"` tags do nothing without `UniqueOpts.ByArgs = true`.

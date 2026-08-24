@@ -17,7 +17,7 @@ import (
 // derive the same (slot, run_date) from the same instant.
 func TestNewDigestArgsNamesTheSlot(t *testing.T) {
 	t.Parallel()
-	sched, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
+	sched, err := scheduler.NewDigest(scheduler.DigestSpec{Slots: []string{"09:00", "14:00", "17:30"}, Timezone: "Europe/Moscow"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -156,7 +156,9 @@ func TestBuildDigestPersistsRunAndParts(t *testing.T) {
 	}
 	rendered := renderedText(m)
 	// One row per merge request now, with the author's flags inline.
-	for _, want := range []string{"<@U42>", "<@U01>", "!481", "💬 1 thread", "⚠️ conflicts", "https://pipelines/5"} {
+	for _, want := range []string{
+		"<@U42>", "<@U01>", "!481", "💬 resolve 1 thread", "⚠️ fix merge conflicts", "https://pipelines/5",
+	} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("digest is missing %q:\n%s", want, rendered)
 		}
@@ -1227,7 +1229,7 @@ func TestBuildDigestMeasuresWaitingFromTheLastPush(t *testing.T) {
 	if err := json.Unmarshal(msgs[0].Payload, &m); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
-	if text := renderedText(m); !strings.Contains(text, "|!481> 18h") {
+	if text := renderedText(m); !strings.Contains(text, "|!481> · waiting 18h") {
 		t.Errorf("digest does not report the wait since the last push:\n%s", text)
 	}
 }
@@ -1435,5 +1437,122 @@ func TestBuildDigestScheduledSlotIsIdempotentAfterAForcedRepeat(t *testing.T) {
 	}
 	if n := h.count(t, `SELECT count(*) FROM digest_runs WHERE team = $1 AND slot = '09:00'`, testTeam); n != 2 {
 		t.Errorf("digest_runs rows = %d, want exactly one per attempt", n)
+	}
+}
+
+// TestPreviewDigestWritesNothing is the whole contract of `digest --dry-run`:
+// the same digest a build would produce, with no trace of it anywhere. A
+// preview that filed a digest_runs row would consume the slot the scheduled run
+// needs, and the unique index would then reject that run rather than the
+// preview — the failure would land on the wrong side.
+func TestPreviewDigestWritesNothing(t *testing.T) {
+	h := digestHarness(t, func(h *harness) {
+		h.matcher = stubMatcher{results: map[string]match.Result{
+			"reviewer": {Status: match.Matched, SlackID: "U42", Display: "Rita"},
+			"author":   {Status: match.Matched, SlackID: "U01", Display: "Ann"},
+		}}
+	})
+
+	preview, err := h.svc.PreviewDigest(t.Context(), testTeamConfig())
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	if len(preview.Messages) != 1 {
+		t.Fatalf("messages = %d, want the digest rendered", len(preview.Messages))
+	}
+	if preview.MRCount != 1 {
+		t.Errorf("mr count = %d, want 1", preview.MRCount)
+	}
+	// The data travels with the messages so a caller can map a Slack id back onto
+	// the person it stands for; a terminal cannot render <@U42>.
+	if len(preview.Data.People) != 2 {
+		t.Errorf("people = %d, want the reviewer and the author", len(preview.Data.People))
+	}
+	text := renderedText(preview.Messages[0])
+	for _, want := range []string{"<@U42>", "<@U01>", "!481"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("preview is missing %q:\n%s", want, text)
+		}
+	}
+
+	if len(h.slack.posts) != 0 {
+		t.Errorf("chat.postMessage was called %d times by a preview", len(h.slack.posts))
+	}
+	for _, table := range []string{"digest_runs", "digest_messages"} {
+		var n int
+		if err := h.pool.QueryRow(t.Context(), "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s has %d row(s); a preview must persist nothing", table, n)
+		}
+	}
+}
+
+// TestPreviewDigestRendersWhatTheBuildWouldSend: the preview is only worth
+// running if it is the same digest. Both paths render through renderDigest, and
+// this is what keeps that true — a second renderer added for the CLI would
+// eventually disagree with the one that ships.
+func TestPreviewDigestRendersWhatTheBuildWouldSend(t *testing.T) {
+	h := digestHarness(t)
+
+	preview, err := h.svc.PreviewDigest(t.Context(), testTeamConfig())
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	out, err := h.svc.BuildDigest(t.Context(), testTeamConfig(), "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	msgs := h.digestMessages(t, out.RunID)
+	if len(msgs) != len(preview.Messages) {
+		t.Fatalf("parts = %d built, %d previewed", len(msgs), len(preview.Messages))
+	}
+	for i, row := range msgs {
+		var built slack.Message
+		if err := json.Unmarshal(row.Payload, &built); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if got, want := renderedText(preview.Messages[i]), renderedText(built); got != want {
+			t.Errorf("part %d differs:\npreview: %q\nbuilt:   %q", i+1, got, want)
+		}
+	}
+}
+
+// TestPreviewDigestReportsDegradedSources: a preview has no status column to
+// record a partial run in, so it hands the failures back to the caller. Reading
+// "3 merge requests" without knowing that half the repositories were unreachable
+// is how a preview lies without saying anything false.
+func TestPreviewDigestReportsDegradedSources(t *testing.T) {
+	h := digestHarness(t)
+	team := testTeamConfig()
+	team.Repositories = append(team.Repositories, "backend/broken")
+	h.gl.failProject[url.PathEscape("backend/broken")] = &gitlab.APIError{
+		Status: 500, Method: "GET", Path: "/projects/backend%2Fbroken",
+	}
+
+	preview, err := h.svc.PreviewDigest(t.Context(), team)
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	if preview.FailedRepos != 1 {
+		t.Errorf("failed repos = %d, want 1", preview.FailedRepos)
+	}
+	if !strings.Contains(renderedText(preview.Messages[0]), "Partial data") {
+		t.Errorf("the message itself must carry the partial-data warning:\n%s",
+			renderedText(preview.Messages[0]))
+	}
+}
+
+// TestPreviewDigestFailsWhenEverySourceDid: the one case where there is nothing
+// to show. It is an error rather than an empty digest for the same reason
+// BuildDigest refuses to record one — "nobody owes anything" and "we could not
+// look" must not render identically.
+func TestPreviewDigestFailsWhenEverySourceDid(t *testing.T) {
+	h := digestHarness(t)
+	h.gl.failOpenMRs = errors.New("gitlab is down")
+
+	if _, err := h.svc.PreviewDigest(t.Context(), testTeamConfig()); err == nil {
+		t.Fatal("a preview with no readable source must fail, not render an empty digest")
 	}
 }

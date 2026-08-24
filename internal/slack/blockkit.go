@@ -156,6 +156,41 @@ type AuthorItem struct {
 	LinearState string
 }
 
+// OnlyPerson narrows a digest to one person, by their Slack id. It answers
+// false when the digest does not mention them at all.
+//
+// This is what the personal command is: a filter over the digest that was going
+// to be built anyway, not a second classification. The alternative — asking the
+// matcher to resolve a Slack id back to a GitLab user and then re-running the
+// rules for them — is a second implementation of "what does this person owe",
+// and the two would answer differently the first time one of them changed.
+//
+// The Linear line does not survive the filter: "In Review: 4" is the team's
+// board, and a personal answer that opens with a team-wide number invites
+// reading it as the caller's own. The warnings do survive — a digest built on
+// half the repositories is exactly as incomplete for one person as for
+// everybody, and dropping the notice would make the gap silent.
+//
+// A person with no Slack id can never match: they are named in the digest but
+// nobody can address them, and every id here came from the same matcher that
+// produced the caller's.
+func (d DigestData) OnlyPerson(slackID string) (DigestData, bool) {
+	id := strings.TrimSpace(slackID)
+	if id == "" {
+		return DigestData{}, false
+	}
+	out := d
+	out.People = nil
+	out.LinearEnabled = false
+	out.LinearInReviewCount = 0
+	for _, p := range d.People {
+		if strings.TrimSpace(p.Person.SlackID) == id {
+			out.People = append(out.People, p)
+		}
+	}
+	return out, len(out.People) > 0
+}
+
 // Message is one Slack post. A digest that exceeds the block or character
 // limits becomes several numbered messages, each delivered by its own
 // slack_send job.
@@ -281,15 +316,29 @@ func (b Builder) blocks(d DigestData) []Block {
 // fifteen in full is what made the digest two messages long.
 const reviewDetailRows = 3
 
+// Every row and every flag names the action it is asking for, in the
+// imperative. The icons alone did not say one: a reader looking at
+// "▫️ !1369" directly above "🛠 !1366" — the two kinds sit in the same block,
+// one under the other — had to already know that the first is somebody else's
+// merge request waiting on them and the second is their own waiting on a fix.
+// The icons stay, because they are what makes the list scannable once you know
+// them; the word is what makes it readable the first time.
+const (
+	// reviewAction labels a merge request this person owes a review.
+	reviewAction = "review "
+	// authorAction labels one of this person's own merge requests.
+	authorAction = "your MR "
+)
+
 // personHead is the one line that says what this person owes, e.g.
-// "*@alice* · review 15 · yours 3".
+// "*@alice* · to review 15 · your MRs 3".
 func personHead(p PersonDigest) string {
 	head := "*" + p.Person.render() + "*"
 	if n := len(p.ToReview); n > 0 {
-		head += fmt.Sprintf(" · review %d", n)
+		head += fmt.Sprintf(" · to review %d", n)
 	}
 	if n := len(p.Own); n > 0 {
-		head += fmt.Sprintf(" · yours %d", n)
+		head += fmt.Sprintf(" · your MRs %d", n)
 	}
 	return head
 }
@@ -362,7 +411,7 @@ func tailEntries(tail []ReviewItem, withProject bool, budget int) []string {
 		n = runeLen(head)
 		count = 0
 	}
-	start(fmt.Sprintf("%s+%d more:", tailIndent, len(tail)))
+	start(fmt.Sprintf("%s+%d more to review:", tailIndent, len(tail)))
 	for _, mr := range tail {
 		item := reviewRef(mr, withProject)
 		// An entry always takes its first item, however long: an entry that could
@@ -492,16 +541,11 @@ func ageMarker(d time.Duration) string {
 	}
 }
 
-// reviewRef identifies one merge request: age marker, link, and the project
-// label when the digest spans several projects.
-//
-// Shared by the detail rows and the compressed tail so the two cannot drift
-// apart. The tail once rendered the bare link, which lost both halves of the
-// identification at once: two !1404s from different repositories read
-// identically, and so did a 110-day-old merge request and a 2-day-old one.
-func reviewRef(mr ReviewItem, withProject bool) string {
+// reviewLink names one merge request: the link, plus the project label when the
+// digest spans several projects. It is what tells two !1404s from different
+// repositories apart.
+func reviewLink(mr ReviewItem, withProject bool) string {
 	var b strings.Builder
-	b.WriteString(ageMarker(mr.Waiting))
 	b.WriteString(link(mr.WebURL, mrRef(mr.IID)))
 	if withProject {
 		if p := escape(strings.TrimSpace(mr.Project)); p != "" {
@@ -511,13 +555,30 @@ func reviewRef(mr ReviewItem, withProject bool) string {
 	return b.String()
 }
 
+// reviewRef identifies one merge request in the compressed tail: age marker plus
+// reviewLink.
+//
+// The tail carries no action word, because the line it hangs off already says
+// "+8 more to review:" — repeating it on every entry is what the tail exists to
+// avoid. It does keep both halves of the identification: rendering the bare link
+// once made a 110-day-old merge request read exactly like a 2-day-old one, and
+// two !1404s from different repositories identical.
+func reviewRef(mr ReviewItem, withProject bool) string {
+	return ageMarker(mr.Waiting) + reviewLink(mr, withProject)
+}
+
 // reviewEntry renders one pending review as a single line:
-// "🔴 !1370 17d — CHAIN-182 optimize the Metabase wallet lookup".
+// "🔴 review !1370 · waiting 17d — CHAIN-182 optimize the Metabase wallet lookup".
 func reviewEntry(mr ReviewItem, withProject bool) string {
 	var b strings.Builder
-	b.WriteString(reviewRef(mr, withProject))
+	b.WriteString(ageMarker(mr.Waiting))
+	b.WriteString(reviewAction)
+	b.WriteString(reviewLink(mr, withProject))
 	if mr.Waiting > 0 {
-		b.WriteByte(' ')
+		// "waiting 17d", not a bare "17d": next to a row that reads
+		// "your MR !1366 · resolve 3 threads" a lone duration is the one number on
+		// the line nobody can name.
+		b.WriteString(" · waiting ")
 		b.WriteString(humanDuration(mr.Waiting))
 	}
 	if t := shortTitle(mr.Title); t != "" {
@@ -531,9 +592,15 @@ func reviewEntry(mr ReviewItem, withProject bool) string {
 // with the flags in a fixed order — changes requested, threads, conflicts,
 // pipeline, advance the Linear card, move the Linear card to In Review — so the
 // digest reads the same way every day.
+//
+// Every flag is the imperative form of what the author has to do. The two that
+// already were ("conflicts", "pipeline") were the only ones a reader could act
+// on without being told what the icon meant, and a digest whose rows have to be
+// decoded is a digest nobody reads twice.
 func authorEntry(mr AuthorItem, withProject bool) string {
 	var b strings.Builder
 	b.WriteString("🛠 ")
+	b.WriteString(authorAction)
 	b.WriteString(link(mr.WebURL, mrRef(mr.IID)))
 	if withProject {
 		if p := escape(strings.TrimSpace(mr.Project)); p != "" {
@@ -547,17 +614,17 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 		for _, m := range mr.ChangesRequestedBy {
 			names = append(names, m.render())
 		}
-		flags = append(flags, "🔁 changes requested by "+strings.Join(names, ", "))
+		flags = append(flags, "🔁 address changes requested by "+strings.Join(names, ", "))
 	}
 	if mr.UnresolvedThreads > 0 {
-		flags = append(flags, fmt.Sprintf("💬 %d %s", mr.UnresolvedThreads,
+		flags = append(flags, fmt.Sprintf("💬 resolve %d %s", mr.UnresolvedThreads,
 			plural(mr.UnresolvedThreads, "thread", "threads")))
 	}
 	if mr.MergeConflicts {
-		flags = append(flags, "⚠️ conflicts")
+		flags = append(flags, "⚠️ fix merge conflicts")
 	}
 	if mr.PipelineFailed {
-		flags = append(flags, "❌ "+link(mr.PipelineWebURL, "pipeline"))
+		flags = append(flags, "❌ fix the failed "+link(mr.PipelineWebURL, "pipeline"))
 	}
 	if mr.MoveLinear {
 		flags = append(flags, "➡️ move "+linearTask(mr)+" forward in Linear")

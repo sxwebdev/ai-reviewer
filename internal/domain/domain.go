@@ -33,6 +33,12 @@ type Team struct {
 	// with the team is what makes disagreeing impossible.
 	DigestSlots    []string
 	DigestTimezone string
+	// DigestSkipWeekdays and DigestSkipDates are the days this team gets no
+	// digest at all — weekends, holidays — resolved the same way and empty unless
+	// configured. They travel with the team for the same reason the slots do: the
+	// day a digest is skipped has to be the same day everywhere that asks.
+	DigestSkipWeekdays []string
+	DigestSkipDates    []string
 }
 
 // User is a GitLab account as the digest needs it. Email is frequently empty —

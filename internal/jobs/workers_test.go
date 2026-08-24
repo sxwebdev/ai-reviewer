@@ -451,3 +451,73 @@ func TestSlackSendErrorClassification(t *testing.T) {
 		})
 	}
 }
+
+// TestSlackCommandDelegatesToTheService: the worker resolves the team from the
+// name in its args and forwards everything else untouched — the digest, the
+// filtering and the delivery are the service's.
+func TestSlackCommandDelegatesToTheService(t *testing.T) {
+	f := newFixture(t)
+	cmd := &fakeCommander{}
+	deps := newDeps(nil, nil, nil)
+	deps.Commander = cmd
+	svc := f.newService(t, jobs.Config{}, deps)
+
+	args := jobs.SlackCommandArgs{
+		Scope: "mine", Team: f.team(0).Name, SlackUserID: "U42",
+		ChannelID: "C1", ResponseURL: "https://hooks.slack.com/commands/T1/B2/C3",
+	}
+	if err := jobs.WorkSlackCommand(t.Context(), svc, args); err != nil {
+		t.Fatalf("slack_command: %v", err)
+	}
+	got := cmd.requests()
+	if len(got) != 1 {
+		t.Fatalf("requests = %d, want 1", len(got))
+	}
+	if got[0].Team.Name != f.team(0).Name || got[0].Scope != "mine" || got[0].SlackUserID != "U42" {
+		t.Errorf("request = %+v, want the args resolved to the configured team", got[0])
+	}
+	if got[0].ResponseURL != args.ResponseURL {
+		t.Error("the response URL must survive the hop; without it the answer has nowhere to go")
+	}
+}
+
+// TestSlackCommandForAnUnknownTeamIsANoOp: the team was renamed or removed
+// between the command and its turn on the queue. There is nothing to answer with
+// and nothing a retry would fix.
+func TestSlackCommandForAnUnknownTeamIsANoOp(t *testing.T) {
+	f := newFixture(t)
+	cmd := &fakeCommander{}
+	deps := newDeps(nil, nil, nil)
+	deps.Commander = cmd
+	svc := f.newService(t, jobs.Config{}, deps)
+
+	err := jobs.WorkSlackCommand(t.Context(), svc, jobs.SlackCommandArgs{
+		Scope: "team", Team: "retired", SlackUserID: "U42",
+		ResponseURL: "https://hooks.slack.com/commands/T1/B2/C3",
+	})
+	if err != nil {
+		t.Fatalf("an unknown team must not fail the job: %v", err)
+	}
+	if n := len(cmd.requests()); n != 0 {
+		t.Errorf("service called %d time(s) for a team that is gone", n)
+	}
+}
+
+// TestSlackCommandFailurePropagates: the answer has a deadline (the response URL
+// lives 30 minutes), so a failure has to reach River while a retry can still
+// land inside it.
+func TestSlackCommandFailurePropagates(t *testing.T) {
+	f := newFixture(t)
+	want := errors.New("gitlab is down")
+	cmd := &fakeCommander{err: want}
+	deps := newDeps(nil, nil, nil)
+	deps.Commander = cmd
+	svc := f.newService(t, jobs.Config{}, deps)
+
+	err := jobs.WorkSlackCommand(t.Context(), svc, jobs.SlackCommandArgs{
+		Scope: "team", Team: f.team(0).Name, ResponseURL: "https://hooks.slack.com/commands/T1/B2/C3",
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want the service's failure", err)
+	}
+}

@@ -101,6 +101,33 @@ func (c *Config) Validate() error {
 	if !c.Slack.Token.IsSet() && (c.Service.SlackSendEnabled || c.hasSlackChannel()) {
 		add("slack.token is empty but %s", c.slackRequiredReason())
 	}
+	// The app token opens the socket; it cannot answer on it. Every command
+	// resolves people through the Slack directory and every digest row is a
+	// mention, both of which are the bot token's work — so the pair is what makes
+	// commands usable, and half of it is a service that connects and then says
+	// nothing useful.
+	if c.Slack.AppToken.IsSet() && !c.Slack.Token.IsSet() {
+		add("slack.app_token is set but slack.token is empty: the app-level token can only open the Socket Mode connection, not answer on it")
+	}
+	if c.Slack.AppToken.IsSet() {
+		team := strings.TrimSpace(c.Slack.Commands.Team)
+		mine := strings.TrimSpace(c.Slack.Commands.Mine)
+		for field, name := range map[string]string{
+			"slack.commands.team": team,
+			"slack.commands.mine": mine,
+		} {
+			if !validSlashCommand(name) {
+				add("%s %q is not a slash command (expected e.g. /all)", field, name)
+			}
+		}
+		// Same name for both is not a naming quibble: the dispatcher would have to
+		// pick one, and picking the team digest posts one person's private queue to
+		// the channel while picking the personal one silently drops the team
+		// command.
+		if team != "" && strings.EqualFold(team, mine) {
+			add("slack.commands.team and slack.commands.mine are both %q; they must differ", team)
+		}
+	}
 
 	// --- review -------------------------------------------------------------
 	if c.Review.ScanInterval < time.Minute {
@@ -144,16 +171,25 @@ func (c *Config) Validate() error {
 	if _, err := scheduler.LoadLocation(c.Digest.Timezone); err != nil {
 		add("digest.timezone: %s", err)
 	}
+	if _, err := scheduler.ParseSkipDays(c.Digest.SkipWeekdays, c.Digest.SkipDates); err != nil {
+		add("digest: %s", err)
+	}
 	for _, t := range c.Teams {
-		slots, tz := c.DigestScheduleFor(t)
+		spec := c.DigestScheduleFor(t)
 		// Reported against the team, not against the key that happens to hold the
 		// value: an operator reading "teams[payments].digest" knows which digest
 		// is broken whether the offending value is the team's or the inherited one.
-		if _, err := scheduler.ParseClocks(slots); err != nil {
+		if _, err := scheduler.ParseClocks(spec.Slots); err != nil {
 			add("teams[%s].digest.slots: %s", t.Name, err)
 		}
-		if _, err := scheduler.LoadLocation(tz); err != nil {
+		if _, err := scheduler.LoadLocation(spec.Timezone); err != nil {
 			add("teams[%s].digest.timezone: %s", t.Name, err)
+		}
+		// A misspelled weekday or a date in the wrong shape is exactly the failure
+		// this whole check exists for: it does not stop the service, it just fails
+		// to skip the day, and nobody notices until a digest lands on a holiday.
+		if _, err := scheduler.ParseSkipDays(spec.SkipWeekdays, spec.SkipDates); err != nil {
+			add("teams[%s].digest: %s", t.Name, err)
 		}
 	}
 
@@ -283,6 +319,18 @@ func (c *Config) slackRequiredReason() string {
 		return "service.slack_send_enabled is on"
 	}
 	return "teams declare slack channels"
+}
+
+// validSlashCommand accepts Slack's slash-command shape: a leading slash and at
+// least one character, no whitespace. Slack itself allows letters, digits,
+// hyphens and underscores; this only rejects what cannot work at all, because
+// the authority on the rest is the app configuration where the command is
+// registered.
+func validSlashCommand(s string) bool {
+	if len(s) < 2 || !strings.HasPrefix(s, "/") {
+		return false
+	}
+	return !strings.ContainsAny(s, " \t\n")
 }
 
 // validSlackChannel accepts Slack's channel-id shape (C/G/D followed by

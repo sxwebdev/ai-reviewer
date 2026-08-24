@@ -171,6 +171,46 @@ numbered parts (`MR Digest — Payments (1/3)`) — never silently truncated —
 each part is its own row and its own job, so a failure on part 3 does not undo
 parts 1 and 2.
 
+### In-chat commands (optional)
+
+Two slash commands let anybody ask for a digest between the scheduled slots:
+
+| Command | Answer                                                        |
+| ------- | ------------------------------------------------------------- |
+| `/all`  | the whole team's digest, posted to the channel                |
+| `/my`   | only the caller's rows, visible only to them (ephemeral)      |
+
+They arrive over **Socket Mode**, so the service needs no public URL, no ingress
+and no TLS certificate of its own: it dials out to Slack over a WebSocket and
+there is no inbound request to authenticate. Four steps, all in the app's
+configuration:
+
+1. **Socket Mode → toggle it on.**
+2. **Basic Information → App-Level Tokens → Generate**, scope
+   `connections:write`. The token starts with `xapp-`. This is a *second* token:
+   it can only open the connection, and `apps.connections.open` is the only
+   method that accepts it — the bot token there answers
+   `not_allowed_token_type`, and the digest itself still needs the bot token for
+   the directory and for mentions.
+3. **Features → Slash Commands → Create New Command** for each of `/all` and
+   `/my`. In Socket Mode the Request URL field does not apply. If the workspace
+   already has an app owning one of the names, pick another and set it in
+   `slack.commands` — the names are configuration, not code.
+4. Set `AI_REVIEWER_SLACK_APP_TOKEN` (or `slack.app_token`). Its presence is the
+   whole switch: without it nothing listens.
+
+`ai-reviewer doctor` reports the result under `slack commands` — it opens a
+Socket Mode connection URL to prove the token, and prints the two names this
+deployment answers to, which is what makes "we typed `/digest`" answerable
+against "this deployment answers `/all`".
+
+Each replica keeps one connection and Slack load-balances commands across them
+(ten per app is the ceiling, so replica counts in that range are fine). Answering
+is a River job like everything else deferred: the socket acknowledges within
+Slack's three-second window, the job builds the digest and posts it back through
+the command's response URL. Nothing is recorded — a command consumes no digest
+slot and leaves no `digest_runs` row.
+
 ---
 
 ## Claude authentication

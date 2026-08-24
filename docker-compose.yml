@@ -70,6 +70,11 @@ services:
       # does not overwrite YAML/Vault with an empty environment variable.
       AI_REVIEWER_LINEAR_API_KEY:
       AI_REVIEWER_SLACK_TOKEN: ${AI_REVIEWER_SLACK_TOKEN:?set it in .env}
+      # Optional: the app-level token (xapp-…) that switches the in-chat
+      # commands on. Forwarded only when present, like the Linear key above — an
+      # empty value here would look like "commands configured" to config
+      # validation while nothing could ever connect.
+      AI_REVIEWER_SLACK_APP_TOKEN:
 
       # `existing-login` cannot work in a container — it inherits a login from
       # the host keychain, which is not here. Use a token.

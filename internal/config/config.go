@@ -41,6 +41,7 @@ import (
 	"github.com/tkcrm/mx/logger"
 
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/sxwebdev/ai-reviewer/internal/scheduler"
 )
 
 // EnvPrefix is prepended to every environment variable name (xconfig's
@@ -99,6 +100,20 @@ type DigestConfig struct {
 	// Changing the *zone* has the same effect for the same reason: the slot names
 	// stay, the instants they mean move.
 	Slots []string `yaml:"slots" default:"09:00,14:00,17:30" usage:"Daily digest times, HH:MM in the digest timezone"`
+
+	// SkipWeekdays and SkipDates remove whole days from the schedule: the digest
+	// is not built and nothing is sent. Both are empty by default — a deployment
+	// that does not configure them keeps sending every day, which is what it did
+	// before these existed.
+	//
+	// The calendar day is the one in Timezone, like everything else about a slot:
+	// "Saturday" means Saturday where the team is.
+	SkipWeekdays []string `yaml:"skip_weekdays" usage:"Weekdays with no digest: mon|tue|wed|thu|fri|sat|sun (long forms accepted)"`
+	// SkipDates take either form: 2026-01-01 is that one day, 01-01 is the same
+	// day every year. The annual form is the one holidays want — a list of full
+	// dates silently expires each December, and the failure is a digest that
+	// starts arriving on a holiday again.
+	SkipDates []string `yaml:"skip_dates" usage:"Dates with no digest: YYYY-MM-DD for one day, MM-DD for every year"`
 }
 
 // TeamDigestConfig overrides the global schedule for one team. Both fields are
@@ -111,6 +126,16 @@ type DigestConfig struct {
 type TeamDigestConfig struct {
 	Timezone string   `yaml:"timezone" usage:"Override the digest timezone for this team"`
 	Slots    []string `yaml:"slots" usage:"Override the digest times for this team"`
+	// SkipWeekdays and SkipDates replace the global lists for this team. Each
+	// inherits on its own, like the two above, so a team that works Saturdays can
+	// keep the company holiday list while dropping the weekend rule.
+	//
+	// Replace, never merge, and a non-empty global list therefore cannot be turned
+	// off from here — an empty list is how a team says "inherit", and there is no
+	// third value to mean "inherit nothing". Teams that differ this way are meant
+	// to carry their own list; the global block is a default, not a floor.
+	SkipWeekdays []string `yaml:"skip_weekdays" usage:"Override the skipped weekdays for this team"`
+	SkipDates    []string `yaml:"skip_dates" usage:"Override the skipped dates for this team"`
 }
 
 // DigestScheduleFor resolves one team's effective schedule: its own values where
@@ -119,15 +144,26 @@ type TeamDigestConfig struct {
 // It is a method on Config rather than a helper in app because both Validate and
 // the config→domain mapping need the answer, and two copies of an inheritance
 // rule is how a service comes to validate one schedule and run another.
-func (c *Config) DigestScheduleFor(t TeamConfig) (slots []string, timezone string) {
-	slots, timezone = t.Digest.Slots, strings.TrimSpace(t.Digest.Timezone)
-	if len(slots) == 0 {
-		slots = c.Digest.Slots
+func (c *Config) DigestScheduleFor(t TeamConfig) scheduler.DigestSpec {
+	spec := scheduler.DigestSpec{
+		Slots:        t.Digest.Slots,
+		Timezone:     strings.TrimSpace(t.Digest.Timezone),
+		SkipWeekdays: t.Digest.SkipWeekdays,
+		SkipDates:    t.Digest.SkipDates,
 	}
-	if timezone == "" {
-		timezone = strings.TrimSpace(c.Digest.Timezone)
+	if len(spec.Slots) == 0 {
+		spec.Slots = c.Digest.Slots
 	}
-	return slots, timezone
+	if spec.Timezone == "" {
+		spec.Timezone = strings.TrimSpace(c.Digest.Timezone)
+	}
+	if len(spec.SkipWeekdays) == 0 {
+		spec.SkipWeekdays = c.Digest.SkipWeekdays
+	}
+	if len(spec.SkipDates) == 0 {
+		spec.SkipDates = c.Digest.SkipDates
+	}
+	return spec
 }
 
 // PostgresConfig is the operational store. Username/password are Vault-backed:
@@ -226,8 +262,18 @@ type LinearConfig struct {
 
 // SlackConfig holds the digest delivery settings.
 type SlackConfig struct {
-	Token        Secret        `yaml:"token" secret:"true" vault:"true" usage:"Slack bot token (users:read, users:read.email, chat:write, channels:read; groups:read for private channels)"`
-	DirectoryTTL time.Duration `yaml:"directory_ttl" default:"15m" usage:"In-process TTL of the users.list directory cache"`
+	Token Secret `yaml:"token" secret:"true" vault:"true" usage:"Slack bot token (users:read, users:read.email, chat:write, channels:read; groups:read for private channels)"`
+	// AppToken switches the in-chat commands on, and it is the only switch they
+	// have: it is the one credential that can open a Socket Mode connection, so a
+	// deployment that does not set it cannot listen however it is otherwise
+	// configured. A separate `enabled` boolean would only add a way for the two to
+	// disagree.
+	AppToken Secret `yaml:"app_token" secret:"true" vault:"true" usage:"Slack app-level token (xapp-…, connections:write) — enables the in-chat commands over Socket Mode"`
+	// Commands names the two slash commands. They are configurable because the
+	// name is claimed workspace-wide: another installed app may already own /all,
+	// and that must cost a config line rather than a release.
+	Commands     SlackCommandsConfig `yaml:"commands"`
+	DirectoryTTL time.Duration       `yaml:"directory_ttl" default:"15m" usage:"In-process TTL of the users.list directory cache"`
 	// UserMap is an optional gitlab_username → Slack identity override, in any of
 	// three forms: a user id (U…/W…), an @handle or bare handle, or an email.
 	// match.ParseOverride owns that grammar — doctor and the matcher both drive it,
@@ -240,6 +286,18 @@ type SlackConfig struct {
 	// override that resolves to nothing is a configuration error rather than a
 	// fallback to the name-matching ladder — `doctor` names the entry.
 	UserMap map[string]string `yaml:"user_map" env:"SLACK_USER_MAP" usage:"Override: gitlab_username -> Slack id, @handle or email"`
+}
+
+// SlackCommandsConfig names the two in-chat commands.
+//
+// Team is the digest everybody sees, posted to the channel it was asked in;
+// Mine is the same digest narrowed to the caller and shown only to them. They
+// are two commands rather than one with an argument because the difference is
+// who reads the answer, and a mistyped argument would post one person's queue to
+// the whole channel.
+type SlackCommandsConfig struct {
+	Team string `yaml:"team" default:"/all" usage:"Slash command that posts the whole team digest to the channel"`
+	Mine string `yaml:"mine" default:"/my" usage:"Slash command that shows the caller their own rows only"`
 }
 
 // LLMConfig selects and configures the LLM provider. claude-cli is the only

@@ -170,30 +170,55 @@ func addDigestSchedule(cfg *config.Config, add func(string, CheckStatus, string)
 	if len(cfg.Teams) == 0 {
 		// The global block still has to be loadable: it is what the first team
 		// added will inherit.
-		if err := checkDigestSchedule(cfg.Digest.Slots, cfg.Digest.Timezone); err != nil {
+		spec := scheduler.DigestSpec{
+			Slots: cfg.Digest.Slots, Timezone: cfg.Digest.Timezone,
+			SkipWeekdays: cfg.Digest.SkipWeekdays, SkipDates: cfg.Digest.SkipDates,
+		}
+		schedule, err := scheduler.NewDigest(spec)
+		if err != nil {
 			add("digest schedule", StatusFail, err.Error())
 			return
 		}
 		add("digest schedule", StatusOK,
-			fmt.Sprintf("%s %s (no teams configured)", cfg.Digest.Timezone, strings.Join(cfg.Digest.Slots, ", ")))
+			fmt.Sprintf("%s %s%s (no teams configured)",
+				cfg.Digest.Timezone, strings.Join(cfg.Digest.Slots, ", "), skipClause(schedule)))
 		return
 	}
 	for _, t := range cfg.Teams {
-		slots, tz := cfg.DigestScheduleFor(t)
-		if err := checkDigestSchedule(slots, tz); err != nil {
+		spec := cfg.DigestScheduleFor(t)
+		schedule, err := scheduler.NewDigest(spec)
+		if err != nil {
 			add("digest schedule", StatusFail, fmt.Sprintf("%s: %s", t.Name, err))
 			continue
 		}
-		add("digest schedule", StatusOK, fmt.Sprintf("%s → %s %s", t.Name, tz, strings.Join(slots, ", ")))
+		// A team that skips every weekday is not an error — there is no other way
+		// to say "this team wants no scheduled digest" — but it is the one skip
+		// list whose consequence is total, so it is stated rather than left to be
+		// worked out from seven names.
+		status := StatusOK
+		if schedule.Skip.SkipsEveryWeekday() {
+			status = StatusWarn
+		}
+		add("digest schedule", status, fmt.Sprintf("%s → %s %s%s",
+			t.Name, spec.Timezone, strings.Join(spec.Slots, ", "), skipClause(schedule)))
 	}
 }
 
-func checkDigestSchedule(slots []string, timezone string) error {
-	if _, err := scheduler.ParseClocks(slots); err != nil {
-		return err
+// skipClause renders the skipped days for the schedule line, or "" when nothing
+// is skipped.
+//
+// It is part of that line rather than a check of its own for the reason the line
+// exists at all: "when does ours arrive" and "why did nothing arrive today" are
+// the same question, and a schedule printed without its exceptions answers the
+// first while quietly making the second unanswerable.
+func skipClause(d scheduler.Daily) string {
+	if d.Skip.Empty() {
+		return ""
 	}
-	_, err := scheduler.LoadLocation(timezone)
-	return err
+	if d.Skip.SkipsEveryWeekday() {
+		return fmt.Sprintf(" — but every weekday is skipped (%s), so no digest is ever sent", d.Skip.Describe())
+	}
+	return " — except " + d.Skip.Describe()
 }
 
 // claudeAuthStatus is the subset of `claude auth status --json` the doctor

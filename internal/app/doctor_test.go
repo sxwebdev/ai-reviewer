@@ -160,3 +160,85 @@ func TestDoctorDoesNotMarkAValidConfig(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctorPrintsTheSkippedDays: the schedule line answers "when does ours
+// arrive". Printed without its exceptions it still answers that and quietly
+// makes the other question — "why did nothing arrive today" — unanswerable.
+func TestDoctorPrintsTheSkippedDays(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig(t)
+	cfg.Digest.SkipWeekdays = []string{"sat", "sun"}
+	cfg.Digest.SkipDates = []string{"01-01"}
+	// The second team keeps its own rhythm, which is what makes the per-team
+	// resolution visible in the report rather than inferred from one global line.
+	cfg.Teams[1].Digest = config.TeamDigestConfig{SkipWeekdays: []string{"sun"}}
+
+	lines := digestScheduleLines(t, cfg)
+	if len(lines) != 2 {
+		t.Fatalf("digest schedule lines = %d, want one per team: %+v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0].Detail, "Saturday, Sunday") || !strings.Contains(lines[0].Detail, "01-01") {
+		t.Errorf("the inherited skip list is missing: %s", lines[0].Detail)
+	}
+	if strings.Contains(lines[1].Detail, "Saturday") {
+		t.Errorf("team 2 overrides the weekdays and must not show Saturday: %s", lines[1].Detail)
+	}
+	if !strings.Contains(lines[1].Detail, "01-01") {
+		t.Errorf("team 2 inherits the dates and must still show them: %s", lines[1].Detail)
+	}
+	for _, l := range lines {
+		if l.Status != StatusOK {
+			t.Errorf("an ordinary skip list must not degrade the check: %+v", l)
+		}
+	}
+}
+
+// TestDoctorWarnsWhenEveryWeekdayIsSkipped: it is a legitimate way to say "this
+// team wants no scheduled digest" — there is no other switch — but it is the one
+// skip list whose consequence is total, so it is stated rather than left to be
+// worked out from seven names.
+func TestDoctorWarnsWhenEveryWeekdayIsSkipped(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig(t)
+	cfg.Teams = cfg.Teams[:1]
+	cfg.Teams[0].Digest = config.TeamDigestConfig{
+		SkipWeekdays: []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+	}
+
+	lines := digestScheduleLines(t, cfg)
+	if len(lines) != 1 {
+		t.Fatalf("digest schedule lines = %d, want 1: %+v", len(lines), lines)
+	}
+	if lines[0].Status != StatusWarn {
+		t.Errorf("status = %v, want a warning: %+v", lines[0].Status, lines[0])
+	}
+	if !strings.Contains(lines[0].Detail, "no digest is ever sent") {
+		t.Errorf("the consequence is not stated: %s", lines[0].Detail)
+	}
+}
+
+// TestDoctorSaysNothingAboutSkipsWhenThereAreNone: a clause on every line is a
+// clause nobody reads.
+func TestDoctorSaysNothingAboutSkipsWhenThereAreNone(t *testing.T) {
+	t.Parallel()
+
+	for _, l := range digestScheduleLines(t, testConfig(t)) {
+		if strings.Contains(l.Detail, "except") {
+			t.Errorf("an unconfigured schedule mentions exceptions: %s", l.Detail)
+		}
+	}
+}
+
+// digestScheduleLines runs the config-only checks and returns the schedule ones.
+func digestScheduleLines(t *testing.T, cfg *config.Config) []DoctorCheck {
+	t.Helper()
+	var out []DoctorCheck
+	for _, c := range Doctor(t.Context(), DoctorInput{Config: cfg}) {
+		if c.Name == "digest schedule" {
+			out = append(out, c)
+		}
+	}
+	return out
+}

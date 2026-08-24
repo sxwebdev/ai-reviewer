@@ -384,3 +384,23 @@ func newDeps(rev *fakeReviewer, sc *fakeScanner, dg *fakeDigester) jobs.Deps {
 	}
 	return jobs.Deps{Reviewer: rev, Scanner: sc, Digester: dg}
 }
+
+// fakeCommander records the in-chat commands the worker forwarded.
+type fakeCommander struct {
+	mu   sync.Mutex
+	runs []jobs.CommandRequest
+	err  error
+}
+
+func (f *fakeCommander) RunSlackCommand(_ context.Context, req jobs.CommandRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs = append(f.runs, req)
+	return f.err
+}
+
+func (f *fakeCommander) requests() []jobs.CommandRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]jobs.CommandRequest(nil), f.runs...)
+}

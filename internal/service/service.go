@@ -107,8 +107,15 @@ const defaultReviewGrace = 45 * time.Minute
 // SlackAPI is the Slack surface this package needs. It is declared here rather
 // than imported as *slack.Client so a test can drive delivery through an
 // httptest server or a stub without the digest builder depending on either.
+//
+// Two ways to say something, because Slack has two: chat.postMessage delivers a
+// scheduled digest to a channel the bot belongs to, while Respond answers a
+// command through the response URL that came with it — which needs no
+// membership, works in a DM, and is the only way to answer one person without
+// the channel reading it.
 type SlackAPI interface {
 	PostMessage(ctx context.Context, req slack.PostMessageRequest) (*slack.PostMessageResult, error)
+	Respond(ctx context.Context, responseURL string, msg slack.ResponseMessage) error
 }
 
 // LinearAPI is the read-only Linear surface the digest needs.

@@ -45,7 +45,7 @@ func digestFixture(t *testing.T) (*jobs.Queue, *store.Store, domain.Team) {
 
 func testSchedule(t *testing.T) scheduler.Daily {
 	t.Helper()
-	s, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
+	s, err := scheduler.NewDigest(scheduler.DigestSpec{Slots: []string{"09:00", "14:00", "17:30"}, Timezone: "Europe/Moscow"})
 	if err != nil {
 		t.Fatal(err)
 	}

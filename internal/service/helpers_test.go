@@ -280,11 +280,23 @@ func (m stubMatcher) Match(_ context.Context, u match.GitLabUser) (match.Result,
 	return match.Result{Status: match.NotFound, Display: match.Fallback(u)}, nil
 }
 
-// recordingSlack captures chat.postMessage calls.
+// recordingSlack captures chat.postMessage and response-URL calls.
 type recordingSlack struct {
 	posts []slack.PostMessageRequest
 	err   error
 	ts    string
+
+	// responses are the delayed command answers, in order, with the response URL
+	// each was posted to — the pair is what a test needs to tell an ephemeral
+	// answer from one the whole channel sees.
+	responses    []recordedResponse
+	responseErr  error
+	responseErrs []error // per-call overrides, consumed in order
+}
+
+type recordedResponse struct {
+	URL string
+	Msg slack.ResponseMessage
 }
 
 type fakeLinear struct {
@@ -373,6 +385,16 @@ func (r *recordingSlack) PostMessage(_ context.Context, req slack.PostMessageReq
 		ts = "1700000000.000100"
 	}
 	return &slack.PostMessageResult{Channel: req.Channel, TS: ts}, nil
+}
+
+func (r *recordingSlack) Respond(_ context.Context, responseURL string, msg slack.ResponseMessage) error {
+	r.responses = append(r.responses, recordedResponse{URL: responseURL, Msg: msg})
+	if len(r.responseErrs) > 0 {
+		err := r.responseErrs[0]
+		r.responseErrs = r.responseErrs[1:]
+		return err
+	}
+	return r.responseErr
 }
 
 // harness wires a Service over fakes. Store and pool are nil unless the test

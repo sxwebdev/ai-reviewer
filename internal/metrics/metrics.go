@@ -243,6 +243,16 @@ var (
 		Help: "Digest parts resent after a crash between POST and result persistence.",
 	}, []string{"team"})
 
+	// SlackCommandsTotal counts the in-chat commands. The scope label separates
+	// the two that exist, because they answer different questions about the
+	// deployment: a busy "team" is a team reading its digest off-schedule, while a
+	// busy "mine" is people checking their own queue — and an "error" on either is
+	// somebody who typed a command and got nothing back.
+	SlackCommandsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "slack_commands_total",
+		Help: "In-chat digest commands by team, scope (team|mine) and result.",
+	}, []string{"team", "scope", "result"})
+
 	// SlackUserMatchTotal is how unmatched people become visible: the mapping is
 	// deliberately not stored in Postgres (§5.2), so this counter and the log
 	// are the whole operational surface.
@@ -454,6 +464,11 @@ func SlackSendError(team, reason string) { SlackSendErrorsTotal.WithLabelValues(
 
 // SlackResendUncertain records a possible duplicate delivery (§6.4).
 func SlackResendUncertain(team string) { SlackResendUncertainTotal.WithLabelValues(team).Inc() }
+
+// SlackCommand records one answered in-chat command.
+func SlackCommand(team, scope, result string) {
+	SlackCommandsTotal.WithLabelValues(team, scope, result).Inc()
+}
 
 // SlackUserMatch records the outcome of one GitLab → Slack user resolution.
 func SlackUserMatch(result string) { SlackUserMatchTotal.WithLabelValues(result).Inc() }

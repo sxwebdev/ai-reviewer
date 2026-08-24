@@ -39,6 +39,12 @@ type Config struct {
 	// Token is the bot token. It travels in the Authorization header only —
 	// never in a URL, a query string, or an error message.
 	Token string
+	// AppToken is the app-level token (xapp-…) that opens a Socket Mode
+	// connection, and the only thing it can do: apps.connections.open is the one
+	// method that accepts it, and it rejects the bot token with
+	// not_allowed_token_type. Empty means this deployment does not listen for
+	// commands.
+	AppToken string
 	// BaseURL defaults to https://slack.com/api. Tests point it at httptest.
 	BaseURL string
 	// Timeout is the per-request HTTP timeout (default 30s).
@@ -62,6 +68,10 @@ type Client struct {
 	// retryDelay is the transport's own backoff base, separate from any
 	// Retry-After Slack asks for.
 	retryDelay time.Duration
+	// responseHost pins where a delayed command answer may be POSTed, and
+	// insecureResponse allows plain HTTP for it. Only a test moves either.
+	responseHost     string
+	insecureResponse bool
 }
 
 // APIError is a failed Slack API call. Slack reports most failures with HTTP
@@ -127,6 +137,9 @@ func New(cfg Config) (*Client, error) {
 	// The token must never surface in logs or job output, whichever layer
 	// ends up printing an error that happens to embed it.
 	security.RegisterSecret(cfg.Token)
+	if cfg.AppToken != "" {
+		security.RegisterSecret(cfg.AppToken)
+	}
 
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = defaultBaseURL
@@ -141,11 +154,12 @@ func New(cfg Config) (*Client, error) {
 		cfg.MaxRetryAfter = 60 * time.Second
 	}
 	return &Client{
-		cfg:        cfg,
-		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
-		http:       &http.Client{Timeout: cfg.Timeout},
-		sleep:      sleepCtx,
-		retryDelay: defaultRetryDelay,
+		cfg:          cfg,
+		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
+		http:         &http.Client{Timeout: cfg.Timeout},
+		sleep:        sleepCtx,
+		retryDelay:   defaultRetryDelay,
+		responseHost: defaultResponseHost,
 	}, nil
 }
 
@@ -175,13 +189,13 @@ type envelope struct {
 // get performs a GET with query parameters and decodes a successful response
 // into out.
 func (c *Client) get(ctx context.Context, method string, query url.Values, out any) error {
-	return c.call(ctx, http.MethodGet, method, query, nil, out)
+	return c.call(ctx, http.MethodGet, method, c.cfg.Token, query, nil, out)
 }
 
 // post performs a POST with a JSON body and decodes a successful response
 // into out.
 func (c *Client) post(ctx context.Context, method string, body, out any) error {
-	return c.call(ctx, http.MethodPost, method, nil, body, out)
+	return c.call(ctx, http.MethodPost, method, c.cfg.Token, nil, body, out)
 }
 
 // call performs one Slack API call with retry/backoff. Retryable: HTTP 429,
@@ -193,7 +207,10 @@ func (c *Client) post(ctx context.Context, method string, body, out any) error {
 // overshoot is intentional slack (seconds on top of tens of seconds) — for a
 // Tier 2 method like users.list, waiting slightly too long is free and waiting
 // too little costs another 429.
-func (c *Client) call(ctx context.Context, httpMethod, apiMethod string, query url.Values, body, out any) error {
+// The token is a parameter rather than a field read because Slack has two of
+// them and they are not interchangeable: every method here takes the bot token,
+// apps.connections.open takes the app-level one and refuses the other.
+func (c *Client) call(ctx context.Context, httpMethod, apiMethod, token string, query url.Values, body, out any) error {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -226,7 +243,7 @@ func (c *Client) call(ctx context.Context, httpMethod, apiMethod string, query u
 		if err != nil {
 			return fmt.Errorf("%w: build request: %w", retry.ErrExit, err)
 		}
-		req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
+		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
 		if payload != nil {
 			req.Header.Set("Content-Type", "application/json; charset=utf-8")

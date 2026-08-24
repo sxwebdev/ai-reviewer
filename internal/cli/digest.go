@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,15 +22,35 @@ import (
 func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 	return &cli.Command{
 		Name:  "digest",
-		Usage: "Enqueue a digest run for the current slot",
+		Usage: "Enqueue a digest run for the current slot, or print one with --dry-run",
 		Flags: []cli.Flag{
 			teamFlag(),
 			&cli.BoolFlag{
 				Name:  "force",
 				Usage: "Repeat a slot that was already run, as a new attempt",
 			},
+			&cli.BoolFlag{
+				Name:    "dry-run",
+				Aliases: []string{"preview"},
+				Usage:   "Build the digest in this process and print it: no database rows, no Slack, no slot consumed",
+			},
+			&cli.BoolFlag{
+				Name:  "json",
+				Usage: "With --dry-run, print the exact chat.postMessage payloads instead of the rendered text",
+			},
 		},
 		Action: func(ctx context.Context, cmd *cli.Command) error {
+			// Refused rather than ignored: --force asks for a second *recorded*
+			// attempt at a slot, and a dry run records nothing, so honouring one and
+			// silently dropping the other is how somebody concludes they re-ran a
+			// digest that never happened.
+			if cmd.Bool("dry-run") && cmd.Bool("force") {
+				return errors.New("--force is meaningless with --dry-run: a preview files no attempt")
+			}
+			if cmd.Bool("json") && !cmd.Bool("dry-run") {
+				return errors.New("--json only applies to --dry-run")
+			}
+
 			a, err := open(ctx, boot, cmd)
 			if err != nil {
 				return err
@@ -39,6 +60,11 @@ func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 			teams, err := digestTargets(a, cmd.String("team"))
 			if err != nil {
 				return err
+			}
+
+			now := time.Now()
+			if cmd.Bool("dry-run") {
+				return previewDigests(ctx, os.Stdout, a, teams, cmd.Bool("json"), now)
 			}
 
 			pg, q, err := a.Queue(ctx)
@@ -52,16 +78,18 @@ func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 				return err
 			}
 
-			now := time.Now()
 			for _, team := range teams {
-				// Built per team, from the schedule the team carries: a manual digest
-				// has to land on exactly the slot and calendar day the scheduled run
-				// would have used, and with per-team schedules one shared Daily would
-				// name another team's slot — which the digest_runs unique index cannot
-				// catch, because it is a different slot rather than a repeat.
-				schedule, err := scheduler.NewDigest(team.DigestSlots, team.DigestTimezone)
+				schedule, err := teamSchedule(team)
 				if err != nil {
-					return fmt.Errorf("digest schedule for team %q: %w", team.Name, err)
+					return err
+				}
+				// A manual run on a skipped day is done, not refused: somebody typed
+				// the command, and the skip list describes the *schedule*. Saying so
+				// is the difference between an operator who meant it and one who
+				// forgot today is a holiday.
+				if schedule.Skipped(now) {
+					fmt.Printf("note: %s is a skipped day for %s (%s) — queuing anyway because you asked for it\n",
+						now.In(schedule.Location()).Format("Monday 2006-01-02"), team.Name, schedule.Skip.Describe())
 				}
 				if err := enqueueDigest(ctx, q, st, team, schedule, now, cmd.Bool("force")); err != nil {
 					return err
@@ -70,6 +98,26 @@ func digestCommand(boot logger.ExtendedLogger) *cli.Command {
 			return nil
 		},
 	}
+}
+
+// teamSchedule builds one team's resolved digest schedule.
+//
+// Built per team, from the values the team carries: a manual digest has to land
+// on exactly the slot and calendar day the scheduled run would have used, and
+// with per-team schedules one shared Daily would name another team's slot —
+// which the digest_runs unique index cannot catch, because it is a different
+// slot rather than a repeat.
+func teamSchedule(team domain.Team) (scheduler.Daily, error) {
+	schedule, err := scheduler.NewDigest(scheduler.DigestSpec{
+		Slots:        team.DigestSlots,
+		Timezone:     team.DigestTimezone,
+		SkipWeekdays: team.DigestSkipWeekdays,
+		SkipDates:    team.DigestSkipDates,
+	})
+	if err != nil {
+		return scheduler.Daily{}, fmt.Errorf("digest schedule for team %q: %w", team.Name, err)
+	}
+	return schedule, nil
 }
 
 // digestTargets resolves --team, or every configured team.

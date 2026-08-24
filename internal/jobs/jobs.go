@@ -53,6 +53,7 @@ const (
 	KindPublishReview = "publish_review"
 	KindDigest        = "digest"
 	KindSlackSend     = "slack_send"
+	KindSlackCommand  = "slack_command"
 	KindCleanup       = "cleanup"
 )
 
@@ -71,7 +72,13 @@ const (
 	publishMaxAttempts   = 10
 	digestMaxAttempts    = 3
 	slackSendMaxAttempts = 10
-	cleanupMaxAttempts   = 1
+	// slackCommandMaxAttempts is low because the answer has a deadline nothing
+	// else here does: the response URL a command arrives with lives 30 minutes,
+	// after which a retry can only fail. Three attempts inside that window cover a
+	// transient GitLab failure; a fourth would be spending a digest build on a URL
+	// that is probably already dead.
+	slackCommandMaxAttempts = 3
+	cleanupMaxAttempts      = 1
 )
 
 // ReviewTimeout is how long one review job may run before River cancels it.
@@ -92,7 +99,12 @@ const (
 	publishTimeout   = 5 * time.Minute
 	digestTimeout    = 10 * time.Minute
 	slackSendTimeout = 2 * time.Minute
-	cleanupTimeout   = 5 * time.Minute
+	// slackCommandTimeout is the digest build plus its delivery. Shorter than
+	// digestTimeout on purpose: somebody is watching a Slack channel waiting for
+	// it, and a command that has not answered in five minutes has failed whatever
+	// the queue thinks.
+	slackCommandTimeout = 5 * time.Minute
+	cleanupTimeout      = 5 * time.Minute
 )
 
 // uniqueInFlightStates is the unique-state set every kind in this package uses.
@@ -282,6 +294,59 @@ func (SlackSendArgs) InsertOpts() river.InsertOpts {
 	return river.InsertOpts{
 		Queue:       QueueSlack,
 		MaxAttempts: slackSendMaxAttempts,
+		UniqueOpts: river.UniqueOpts{
+			ByArgs:  true,
+			ByState: uniqueInFlightStates(),
+		},
+	}
+}
+
+// SlackCommandArgs answers one in-chat command: /all (the team's digest, posted
+// to the channel) or /my (the caller's own rows, shown only to them).
+//
+// It is a job rather than work done on the socket for the reason every other
+// deferred thing here is: Slack wants an acknowledgement within three seconds
+// and a digest is dozens of GitLab requests. The socket acknowledges, this
+// carries the work, and the answer arrives through the response URL.
+//
+// Uniqueness covers the four fields that identify the *question* — team, scope,
+// caller and conversation — and deliberately not the response URL, which is
+// different on every invocation. Double-tapping /my in one channel therefore
+// collapses into the run already in flight instead of building the same digest
+// twice, which is what the caller meant by pressing it again.
+//
+// The channel is part of that key rather than merely recorded, because the
+// answer is delivered to the response URL of whichever invocation won: folding
+// two conversations together acknowledges the second one and then answers only
+// in the first. It bites on a single-team deployment, where SlackCommandTeam
+// resolves *any* channel — a DM to the app included — to the one team, so the
+// same person running /all in the channel and then in a DM would be told the
+// answer was coming and never see it.
+type SlackCommandArgs struct {
+	// Scope is "team" or "mine", already resolved from the command name: the
+	// configured names are the operator's business and must not reach a durable
+	// job argument, or renaming a command would orphan every queued job.
+	Scope string `json:"scope" river:"unique"`
+	Team  string `json:"team" river:"unique"`
+	// SlackUserID is the caller, and for scope "mine" it is the filter.
+	SlackUserID string `json:"slack_user_id" river:"unique"`
+	// ChannelID is the conversation the command was typed in, and part of the
+	// unique key — see the type comment. Not omitempty: River builds the key from
+	// the encoded args, and a key whose shape depends on whether a field happened
+	// to be empty is one that cannot be reasoned about.
+	ChannelID string `json:"channel_id" river:"unique"`
+	// ResponseURL is Slack's delayed-response capability, valid for 30 minutes
+	// and five messages. It is a credential in a database column: never logged,
+	// never echoed into an error.
+	ResponseURL string `json:"response_url"`
+}
+
+func (SlackCommandArgs) Kind() string { return KindSlackCommand }
+
+func (SlackCommandArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       QueueSlack,
+		MaxAttempts: slackCommandMaxAttempts,
 		UniqueOpts: river.UniqueOpts{
 			ByArgs:  true,
 			ByState: uniqueInFlightStates(),

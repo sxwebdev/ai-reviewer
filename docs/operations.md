@@ -11,6 +11,7 @@ schedules, what to watch, and what the common failures look like.
 ai-reviewer start                              # the service: River workers, periodic jobs, ops server
 ai-reviewer scan   [--team <name>]             # enqueue a scan pass
 ai-reviewer digest [--team <name>] [--force]   # enqueue a digest run for the current slot
+ai-reviewer digest --dry-run [--team <name>]   # build one here and print it: no rows, no Slack
 ai-reviewer review <ref> [--publish] [--wait]  # enqueue a review of one MR
 ai-reviewer review <ref> --local [--publish]   # run it in this process (debugging)
 ai-reviewer doctor [--local]                   # diagnose config and every dependency
@@ -25,7 +26,9 @@ Global flags: `--config <path>` (repeatable, applied in order; also
 
 **The CLI enqueues; a running `start` executes.** That keeps exactly one
 implementation of every operation, and makes a manual run subject to the same
-uniqueness, retries and metrics as a scheduled one.
+uniqueness, retries and metrics as a scheduled one. `review --local` and
+`digest --dry-run` are the two exceptions, and both run the service's own code
+rather than a copy of it.
 
 - `--wait` polls the queued job to a terminal state and prints the result.
 - `--publish` lives in the *job's arguments*, not in process config, and is
@@ -51,6 +54,20 @@ uniqueness, retries and metrics as a scheduled one.
 - `digest` for a slot that already ran is refused with a readable message;
   `--force` inserts a new *attempt*, which produces a fresh `digest_runs` row
   and an honest journal of manual repeats.
+- **`digest --dry-run`** (alias `--preview`) assembles the digest in this
+  process and prints it. It reads GitLab, Linear and the Slack directory exactly
+  as the scheduled build does — it *is* the same assembly, with the persistence
+  and the delivery removed rather than reimplemented — and then writes nothing:
+  no `digest_runs` row, no `digest_messages`, no `slack_send` job, no
+  `chat.postMessage`. It consumes no slot, so it never collides with the
+  scheduled run, and unlike `slack_send_enabled: false` it needs no config
+  change and no deploy. Mentions are printed as names, because a terminal draws
+  `<@U024BE7LH>` as an id; `--json` prints the untouched `chat.postMessage`
+  payloads instead, for checking what Slack actually receives.
+
+  ```bash
+  ai-reviewer digest --dry-run --team blockchain-api
+  ```
 
 `ai-reviewer doctor` checks, in order: configuration, GitLab TLS, `git`, the
 `claude` binary and `claude auth status --json` **under the configured auth
@@ -58,13 +75,16 @@ mode**, PostgreSQL connectivity, pending
 migrations, River's tables, GitLab authentication (`GET /user`), GraphQL
 availability, every configured repository, `head_pipeline` visibility,
 `/approvals` visibility, each team's
-resolved digest schedule (slots and timezone, printed in full — with per-team
-schedules there is no other way to answer "when does ours arrive"), Linear
+resolved digest schedule (slots, timezone and skipped days, printed in full —
+with per-team schedules there is no other way to answer "when does ours arrive",
+and without the skips no way to answer "why did nothing arrive today"), Linear
 authentication/team UUIDs/`In Review` states, each team's review-gate column
 split, Slack
 `auth.test`, bot membership of each channel, the Slack **directory**
 (`users.list` — it names the missing scope, and warns when no member exposes an
-email), every `slack.user_map` entry resolved against that directory, and whether
+email), every `slack.user_map` entry resolved against that directory, the in-chat
+commands (the app-level token proved against `apps.connections.open`, plus the
+two command names this deployment answers to), and whether
 `review.workdir` is writable. Secret values are never printed. `--local` skips
 the network probes. A failed check exits non-zero.
 
@@ -125,6 +145,55 @@ classified, users matched and the Block Kit payload built and stored, with
 `slack_send` jobs enqueued. `digest_runs.status` is `dry_run`. Everything except
 the network call actually happens, so what you inspect is the real output.
 
+To read one digest without changing the deployment at all, use
+`ai-reviewer digest --dry-run` instead: the same build, printed to your terminal,
+recording nothing.
+
+---
+
+## In-chat commands
+
+Two slash commands answer between the scheduled slots, when the app-level token
+is configured (see
+[installation.md](installation.md#in-chat-commands-optional)):
+
+| Command | Answer                                                   | Who sees it        |
+| ------- | -------------------------------------------------------- | ------------------ |
+| `/all`  | the whole team's digest, exactly as the schedule posts it | the whole channel  |
+| `/my`   | only the caller's rows                                    | only the caller    |
+
+- **The channel picks the team.** A team owns exactly one channel, so a command
+  typed in it can only mean that team. In a DM or any other channel the command
+  is refused by name — on a one-team deployment it falls back to that team,
+  because there is nothing else it could mean.
+- **`/my` is a filter over the same digest**, not a second classification: the
+  digest already carries the Slack id of everybody it names. That is what stops
+  the command and the schedule from ever answering differently. Its empty answer
+  names both readings — nothing waiting, *or* a Slack account not matched to a
+  GitLab one — because the service genuinely cannot tell them apart, and "you are
+  clear" would be the wrong guess to make silently.
+- **Nothing is recorded.** No `digest_runs` row, no `digest_messages`, no slot
+  consumed, so a command can never collide with the scheduled run. Same contract
+  as `digest --dry-run`.
+- **A repeat folds into the answer already coming.** Uniqueness covers team,
+  scope, caller and channel, so a double press in the same conversation does not
+  start a second GitLab pass; the second acknowledgement says so. The same
+  command in a *different* conversation is a different question and is answered
+  separately — the answer is delivered to the response URL of the invocation that
+  won the key, so folding two conversations would acknowledge one and answer the
+  other.
+- **Slack's own budget is five messages per command.** A digest longer than that
+  is cut with a visible line saying how many parts are missing — the scheduled
+  digest carries the whole list.
+- **A Slack outage does not stop the service.** If the connection cannot be
+  opened at startup the process still comes up, logs
+  `slack socket: first connection failed, retrying in the background` and dials
+  again with backoff; commands start working when Slack does. Only a token this
+  app can never use (`invalid_auth`, `not_allowed_token_type`, a 401/403 — what
+  `doctor` probes) fails startup, because no retry fixes it and the log line is
+  the answer. Reviews, scans and digests are never held hostage to the socket.
+- `slack_commands_total{team,scope,result}` counts them.
+
 ---
 
 ## What the digest looks like
@@ -135,27 +204,35 @@ have not delivered, then their own merge requests that need work.
 ```text
 📋 MR Digest — blockchain-api
 
-@dkhristoliubov · review 11 · yours 3
-🔴 !1392 10d — CHAIN-206: raise FIREBLOCKS_PROXY_TIMEOUT above the…
-🟡 !1358 5d — CHAIN-170 index EVM ERC20 deposits via Transfer event…
-🟡 !1327 4d — CHAIN-104 partial index for unsynced blocks
-   +8 more: !1363 !1365 !1369 !1356 !1390 !1385 !1403 !1404
-🛠 !1378 · 💬 6 threads — CHAIN-122 Consolidation deposit detection improvement
-🛠 !1366 · 💬 3 threads · ⚠️ conflicts — CHAIN-184 Scheduler http wrapper
-🛠 !1375 · 💬 2 threads — CHAIN-203 Delegator integration
+@dkhristoliubov · to review 11 · your MRs 3
+🔴 review !1392 · waiting 10d — CHAIN-206: raise FIREBLOCKS_PROXY_TIMEOUT above…
+🟡 review !1358 · waiting 5d — CHAIN-170 index EVM ERC20 deposits via Transfer…
+🟡 review !1327 · waiting 4d — CHAIN-104 partial index for unsynced blocks
+   +8 more to review: !1363 !1365 !1369 !1356 !1390 !1385 !1403 !1404
+🛠 your MR !1378 · 💬 resolve 6 threads — CHAIN-122 Consolidation deposit detection
+🛠 your MR !1366 · 💬 resolve 3 threads · ⚠️ fix merge conflicts — CHAIN-184 Scheduler…
+🛠 your MR !1375 · 🔁 address changes requested by @apyshinskii — CHAIN-203 Delegator…
 ```
 
 Reading it:
 
+- **Every row names the action it asks for**, and every flag is an imperative:
+  `review`, `your MR`, `resolve N threads`, `fix merge conflicts`,
+  `fix the failed pipeline`, `move CHAIN-N to In Review`. The icons are there to
+  make the list scannable once you know them — they are not what carries the
+  meaning, because a digest whose rows have to be decoded is one nobody reads
+  twice.
 - **People are ordered by how much they owe**, most first. The biggest queue is
   the one worth looking at, and alphabetical order buried it.
-- **Reviews:** the three oldest get a full row; the rest are the `+N more:` line.
-  Every merge request is linked — nothing is dropped, only shortened.
+- **Reviews:** the three oldest get a full row; the rest are the
+  `+N more to review:` line. Every merge request is linked — nothing is dropped,
+  only shortened, and the tail names the action once rather than on every entry.
 - **Age markers** are 🔴 from a week, 🟡 from two days, ▫️ below that. They
-  classify; they do not filter.
-- **Own merge requests** are the `🛠` rows, with the flags in a fixed order:
-  changes requested → threads → conflicts → pipeline → advance Linear card →
-  move Linear card to In Review.
+  classify; they do not filter, and the row spells the wait out as
+  `waiting 10d` beside them.
+- **Own merge requests** are the `🛠 your MR` rows, with the flags in a fixed
+  order: changes requested → threads → conflicts → pipeline → advance Linear
+  card → move Linear card to In Review.
 - **The project name** sits in the title when the digest covers one repository,
   and moves into each row when it covers several — it is what tells two `!1404`s
   apart.
@@ -276,13 +353,49 @@ a same-day slot check, so a restart only fires a slot whose time has already
 passed **today** and which has no run recorded yet — the hedge exists because
 periodic jobs are leader-only and a leadership change must not skip a slot.
 
-**The digest schedule is configuration** — `digest.slots` and `digest.timezone`,
-overridable per team. The zone is
+**The digest schedule is configuration** — `digest.slots`, `digest.timezone` and
+the two skip lists, each overridable per team. The zone is
 resolved from tzdata embedded in the binary (`internal/scheduler` imports
 `time/tzdata`), so the schedule does not depend on the container's local time or
 on the image shipping a zone database. The digest's `run_date` and slot are
 resolved in that zone too — at 23:30 UTC the Moscow calendar day is already
 tomorrow.
+
+**Days with no digest** — `digest.skip_weekdays` and `digest.skip_dates`, both
+empty by default and both overridable in `teams[].digest`:
+
+```yaml
+digest:
+  skip_weekdays: [sat, sun]
+  skip_dates: ["01-01", "01-02", "05-09", "2026-12-31"]
+```
+
+- A date is either **one day** (`2026-12-31`) or **the same day every year**
+  (`05-09`). Prefer the annual form for holidays: a list of full dates expires
+  every December and the failure is silent — the digest simply starts arriving on
+  a holiday again.
+- The calendar day is the one in the schedule's `timezone`. "Saturday" means
+  Saturday where the team is.
+- Nothing is *built* on a skipped day: the periodic job never fires, so a skipped
+  day costs no GitLab requests rather than building a digest and withholding it.
+  The `RunOnStart` reconciliation obeys the same rule, so a replica that starts
+  on a Saturday morning does not send the digest the skip list exists to
+  suppress.
+- **A team's list replaces the global one; it cannot subtract from it.** An empty
+  list means "inherit", so a team that must ignore a global skip carries its own.
+  The two lists inherit independently — a support team that works weekends can
+  drop the weekend rule and keep the company holidays.
+- `ai-reviewer digest` run by hand **does** send on a skipped day: somebody typed
+  the command, and the skip list describes the schedule. It says so in a note
+  first. `digest --dry-run` prints the same note, which is what makes "why is the
+  channel quiet today" answerable without reading the config.
+- Skipping all seven weekdays is a legitimate way to say "this team wants no
+  scheduled digest" — there is no other switch for it — and `doctor` reports that
+  team's schedule as a **warning** naming the consequence, rather than leaving it
+  to be worked out from seven weekday names.
+- The skip applies to the *schedule*, not to delivery: a digest built on Friday
+  whose `slack_send` retries into Saturday is still delivered. Losing it would be
+  the wrong reading of "no digest on Saturday".
 
 Per-SHA failures back off on a fixed ladder — **15m, 1h, 6h, then stop** — until
 a new head SHA resets the count. A deterministically-broken MR would otherwise
@@ -383,6 +496,7 @@ Metrics worth alerting on:
 | `merge_requests_with_unknown_approvals_total{team}` | gauge, same cadence: merge requests whose approvals GitLab refused to report. Zero is the only healthy value; a value that stays non-zero across slots means the endpoint is refused rather than flaky, and both Linear completion rules are inert |
 | `linear_gate_ambiguous_total{team}` | **counter**: merge requests whose readiness gate was skipped because they named Linear issues at different statuses. Meant to be rare — the identifier match yields candidates, not identifiers, so an ordinary branch name can contribute a second issue when the workspace owns a team with that key |
 | `slack_digest_runs_total{team,result}`, `slack_messages_sent_total`, `slack_send_errors_total`, `slack_resend_uncertain_total` | digest delivery |
+| `slack_commands_total{team,scope,result}`         | in-chat commands; `scope` separates `/all` from `/my`, and an `error` is somebody who typed a command and got nothing back |
 | `slack_user_match_total{result}`                  | matching quality — watch `ambiguous`/`not_found` |
 | `river_jobs_total{kind,state}`, `river_job_duration_seconds`, `river_job_retries_total` | queue health |
 

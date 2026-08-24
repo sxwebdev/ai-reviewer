@@ -81,6 +81,12 @@ type Deps struct {
 	Reviewer Reviewer
 	Scanner  Scanner
 	Digester Digester
+	// Commander is optional: it is only reachable through the Slack socket, and a
+	// deployment without an app-level token never opens one. Nil leaves the
+	// slack_command worker unregistered, so a job of that kind — one queued
+	// before the token was removed — stays in the queue rather than failing
+	// repeatedly against a worker that cannot answer it.
+	Commander Commander
 }
 
 func (d Deps) validate() error {
@@ -156,6 +162,9 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 	river.AddWorker(workers, &PublishReviewWorker{log: log, reviewer: deps.Reviewer})
 	river.AddWorker(workers, &DigestWorker{log: log, svc: s, digester: deps.Digester})
 	river.AddWorker(workers, &SlackSendWorker{log: log, digester: deps.Digester})
+	if deps.Commander != nil {
+		river.AddWorker(workers, &SlackCommandWorker{log: log, svc: s, commander: deps.Commander})
+	}
 	river.AddWorker(workers, &CleanupWorker{log: log, workdir: cfg.WorkDir})
 
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
@@ -187,13 +196,25 @@ func NewService(log logger.Logger, cfg Config, pool *pgxpool.Pool, deps Deps) (*
 func teamSchedules(teams []domain.Team) (map[string]scheduler.Daily, error) {
 	out := make(map[string]scheduler.Daily, len(teams))
 	for _, t := range teams {
-		sched, err := scheduler.NewDigest(t.DigestSlots, t.DigestTimezone)
+		sched, err := scheduler.NewDigest(digestSpec(t))
 		if err != nil {
 			return nil, fmt.Errorf("digest schedule for team %q: %w", t.Name, err)
 		}
 		out[strings.ToLower(t.Name)] = sched
 	}
 	return out, nil
+}
+
+// digestSpec is one team's schedule as the scheduler wants it. It exists so the
+// four resolved values travel together: two of them are []string, and a caller
+// assembling them by hand can swap the pair without anything failing to compile.
+func digestSpec(t domain.Team) scheduler.DigestSpec {
+	return scheduler.DigestSpec{
+		Slots:        t.DigestSlots,
+		Timezone:     t.DigestTimezone,
+		SkipWeekdays: t.DigestSkipWeekdays,
+		SkipDates:    t.DigestSkipDates,
+	}
 }
 
 // periodicJobs builds the leader-only schedule (§6.6). River elects one leader
@@ -279,6 +300,13 @@ func periodicJobs(cfg Config, schedules map[string]scheduler.Daily) []*river.Per
 // yesterday's last one. Yesterday's digest is not worth sending; today's,
 // missing, is.
 func digestSlotForNow(team string, schedule scheduler.Daily, at time.Time) (DigestArgs, bool) {
+	// A skipped day is skipped on this path too. Next steps over it, so the timer
+	// never fires there — but RunOnStart does not go through Next, and a replica
+	// starting on a Saturday morning would otherwise build and send the very
+	// digest the skip list exists to suppress.
+	if schedule.Skipped(at) {
+		return DigestArgs{}, false
+	}
 	slot, ok := schedule.SlotAt(at)
 	if !ok {
 		// A schedule with no slots cannot name a run. Config validation rejects

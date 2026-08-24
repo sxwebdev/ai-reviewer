@@ -340,7 +340,7 @@ func TestTrackedRecordsTerminalState(t *testing.T) {
 // yesterday's digest at 03:00.
 func TestDigestSlotForNow(t *testing.T) {
 	t.Parallel()
-	sched, err := scheduler.NewDigest([]string{"09:00", "14:00", "17:30"}, "Europe/Moscow")
+	sched, err := scheduler.NewDigest(scheduler.DigestSpec{Slots: []string{"09:00", "14:00", "17:30"}, Timezone: "Europe/Moscow"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,4 +580,40 @@ func TestWithShutdownWatcherEndsWithItsJob(t *testing.T) {
 	}
 	t.Errorf("goroutines = %d, want back to %d: the shutdown watchers are leaking",
 		runtime.NumGoroutine(), before)
+}
+
+// TestDigestSlotForNowRefusesASkippedDay covers the path Next cannot protect.
+//
+// Next steps over a skipped day, so the timer never fires there — but RunOnStart
+// does not go through Next: a replica that wins the leader election on a Saturday
+// morning calls this directly, and without the guard it would build and send the
+// very digest the skip list exists to suppress.
+func TestDigestSlotForNowRefusesASkippedDay(t *testing.T) {
+	t.Parallel()
+
+	sched, err := scheduler.NewDigest(scheduler.DigestSpec{
+		Slots: []string{"09:00", "14:00", "17:30"}, Timezone: "Europe/Moscow",
+		SkipWeekdays: []string{"sat", "sun"}, SkipDates: []string{"01-01"},
+	})
+	if err != nil {
+		t.Fatalf("NewDigest: %v", err)
+	}
+	loc := sched.Location()
+
+	if _, ok := digestSlotForNow("payments", sched, time.Date(2026, 8, 22, 10, 0, 0, 0, loc)); ok {
+		t.Error("a Saturday start produced a digest run")
+	}
+	if _, ok := digestSlotForNow("payments", sched, time.Date(2027, 1, 1, 10, 0, 0, 0, loc)); ok {
+		t.Error("a holiday start produced a digest run")
+	}
+
+	// The working day next to them is untouched: the guard removes days, not the
+	// reconciliation RunOnStart exists for.
+	args, ok := digestSlotForNow("payments", sched, time.Date(2026, 8, 21, 10, 0, 0, 0, loc))
+	if !ok {
+		t.Fatal("a Friday start produced no digest run")
+	}
+	if args.Slot != "09:00" || args.RunDate != "2026-08-21" {
+		t.Errorf("args = %+v, want the 09:00 slot on 2026-08-21", args)
+	}
 }

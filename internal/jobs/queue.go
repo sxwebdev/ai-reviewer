@@ -98,6 +98,11 @@ func (q *Queue) EnqueueSlackSend(ctx context.Context, args SlackSendArgs) (Inser
 	return q.insert(ctx, args)
 }
 
+// EnqueueSlackCommand queues the answer to one in-chat command.
+func (q *Queue) EnqueueSlackCommand(ctx context.Context, args SlackCommandArgs) (InsertResult, error) {
+	return q.insert(ctx, args)
+}
+
 // EnqueuePublishReviewTx inserts the publication job inside the caller's
 // transaction — the §10.4 atomic hand-off. See OnPersist.
 func (q *Queue) EnqueuePublishReviewTx(ctx context.Context, tx pgx.Tx, reviewID uuid.UUID) (InsertResult, error) {

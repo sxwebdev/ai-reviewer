@@ -220,7 +220,7 @@ func TestDailyNextDegenerate(t *testing.T) {
 func TestNewDigest(t *testing.T) {
 	setLocal(t, "Asia/Tokyo")
 
-	d, err := NewDigest([]string{"09:00", "14:00", "17:30"}, testTZ)
+	d, err := NewDigest(DigestSpec{Slots: []string{"09:00", "14:00", "17:30"}, Timezone: testTZ})
 	if err != nil {
 		t.Fatalf("NewDigest: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestNewDigest(t *testing.T) {
 	// Order in config must not matter: Next and SlotAt scan Times rather than
 	// assuming it is sorted, so an operator listing the slots out of order gets
 	// the same schedule instead of a silently broken one.
-	shuffled, err := NewDigest([]string{"17:30", "09:00", "14:00"}, testTZ)
+	shuffled, err := NewDigest(DigestSpec{Slots: []string{"17:30", "09:00", "14:00"}, Timezone: testTZ})
 	if err != nil {
 		t.Fatalf("NewDigest(shuffled): %v", err)
 	}
@@ -258,10 +258,10 @@ func TestNewDigest(t *testing.T) {
 	}
 
 	// A schedule this service cannot name must not be constructible.
-	if _, err := NewDigest(nil, testTZ); err == nil {
-		t.Error("NewDigest(nil, testTZ) succeeded; a Daily with no slots cannot name a digest")
+	if _, err := NewDigest(DigestSpec{Timezone: testTZ}); err == nil {
+		t.Error("NewDigest(DigestSpec{Timezone: testTZ}) succeeded; a Daily with no slots cannot name a digest")
 	}
-	if _, err := NewDigest([]string{"9:00"}, testTZ); err == nil {
+	if _, err := NewDigest(DigestSpec{Slots: []string{"9:00"}, Timezone: testTZ}); err == nil {
 		t.Error("NewDigest accepted an unpadded slot, which never round-trips through Clock.String")
 	}
 }

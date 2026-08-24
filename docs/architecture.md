@@ -19,6 +19,9 @@ How the pieces fit, what one review actually does, and where state lives.
    │   ├─ digest   (per-team slots) ──► slack_send                     │
    │   └─ cleanup  (1h)                                                │
    │                                                                   │
+   │   Slack Socket Mode (outbound WebSocket, optional)                │
+   │   └─ /all, /my ──► slack_command                                  │
+   │                                                                   │
    │   review engine: multi-pass Claude Code → skeptic → Go validator  │
    └──────────────────────────────────────────────────────────────────┘
           │                          │                         │
@@ -35,13 +38,13 @@ Package layering, strictly downward
 | ------------------------------------ | --------------------------------------------------------------------------------------------- |
 | `internal/cli`                       | urfave/cli v3 command tree. Parses flags, **enqueues** work, does not do it                    |
 | `internal/app`                       | composition root: config → clients → services → mx launcher; `doctor`                          |
-| `internal/jobs`                      | River client, seven job kinds, periodic schedule, drain                                        |
-| `internal/service`                   | one operation end to end: `ScanRepository`, `RunReview`, `PublishReview`, `BuildDigest`, `SendMessage` |
+| `internal/jobs`                      | River client, eight job kinds, periodic schedule, drain                                        |
+| `internal/service`                   | one operation end to end: `ScanRepository`, `RunReview`, `PublishReview`, `BuildDigest`, `SendMessage`, `RunSlackCommand` |
 | `internal/domain`                    | pure classifiers over an MR snapshot — no I/O, fully unit-tested                               |
 | `internal/store` + `internal/models` | pgx pool, transactions, pgxgen-generated repositories                                          |
 | `internal/gitlab`                    | REST v4 client, GraphQL review states, comment markers                                         |
 | `internal/linear`                    | read-only GraphQL client for paginated `In Review` digest issues                                |
-| `internal/slack` + `internal/match`  | Slack client + Block Kit builder; GitLab user → Slack user matching                            |
+| `internal/slack` + `internal/match`  | Slack client, Block Kit builder, Socket Mode listener; GitLab user → Slack user matching       |
 | `internal/review`                    | the review engine: passes, skeptic, **validator**, line mapper, verifiers, risk, completeness   |
 | `internal/llm`                       | `Client` interface + the Claude Code CLI provider + deterministic auth env                     |
 | `internal/git`                       | ephemeral mirror clone + detached worktree at the head SHA                                     |

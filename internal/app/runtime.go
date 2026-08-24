@@ -39,6 +39,10 @@ type Runtime struct {
 	Linear   *linear.Client
 	Service  *service.Service
 	Jobs     *jobs.Service
+	// SlackSocket is the in-chat command listener, or nil when no app-level
+	// token is configured. `start` registers it with the launcher; the CLI paths
+	// that build a runtime for one operation never start it.
+	SlackSocket *slack.Socket
 }
 
 // Close releases the runtime's resources. The launcher stops the Postgres
@@ -224,7 +228,7 @@ func (a *App) Runtime(ctx context.Context) (*Runtime, error) {
 	}
 	rt.Linear = linearClient
 
-	slackAPI, matcher := a.slack()
+	slackClient, matcher := a.slack()
 
 	engine := review.NewEngine(a.llmClient(), a.Log)
 	cache := a.gitCache(pg.Pool)
@@ -233,7 +237,7 @@ func (a *App) Runtime(ctx context.Context) (*Runtime, error) {
 		GitLab:  gl,
 		GraphQL: gql,
 		Linear:  linearAPI(linearClient),
-		Slack:   slackAPI,
+		Slack:   slackAPI(slackClient),
 		Matcher: matcher,
 		Store:   st,
 		Engine:  engine,
@@ -245,17 +249,51 @@ func (a *App) Runtime(ctx context.Context) (*Runtime, error) {
 	}
 	rt.Service = svc
 
-	jobsSvc, err := jobs.NewService(a.Log, a.jobsConfig(), pg.Pool, jobs.Deps{
+	deps := jobs.Deps{
 		Reviewer: jobsAdapter{svc: svc},
 		Scanner:  jobsAdapter{svc: svc},
 		Digester: jobsAdapter{svc: svc},
-	})
+	}
+	// The command worker exists only where commands can arrive. Registering it
+	// unconditionally would be harmless today and wrong the first time somebody
+	// removes the app token: jobs left in the queue would be worked and answered
+	// against response URLs that expired while the listener was gone.
+	if a.commandsEnabled() {
+		deps.Commander = jobsAdapter{svc: svc}
+	}
+
+	jobsSvc, err := jobs.NewService(a.Log, a.jobsConfig(), pg.Pool, deps)
 	if err != nil {
 		return fail(err)
 	}
 	rt.Jobs = jobsSvc
 
+	if a.commandsEnabled() {
+		// Built after the jobs service because the dispatcher inserts through its
+		// client: the socket's whole job is to turn a command into a durable job
+		// within Slack's three-second window.
+		socket, err := slack.NewSocket(slack.SocketConfig{
+			Client: slackClient,
+			Handle: newCommandDispatcher(a.Log, jobsSvc.Queue, svc, a.slackCommandNames()).Handle,
+			Log:    a.Log,
+		})
+		if err != nil {
+			return fail(err)
+		}
+		rt.SlackSocket = socket
+	}
+
 	return rt, nil
+}
+
+// commandsEnabled reports whether this deployment listens for in-chat commands.
+//
+// One condition, not a switch of its own: the app-level token is the only thing
+// that can open a Socket Mode connection, so its presence *is* the intent. The
+// bot token is required alongside it (config validation says so) because the
+// answer needs a directory and mentions.
+func (a *App) commandsEnabled() bool {
+	return a.Config.Slack.AppToken.IsSet() && a.Config.Slack.Token.IsSet()
 }
 
 // gitCache builds the repository cache with cross-process exclusion wired in.
@@ -364,15 +402,33 @@ func usesLinear(cfg *config.Config) bool {
 	return false
 }
 
+// slackAPI hands the concrete client to the service as the interface it
+// declares, mapping "no client" onto a nil interface rather than a nil pointer
+// inside one — the same trap linearAPI exists for, and with the same
+// consequence: service.RunSlackCommand's "no Slack client is configured" guard
+// could never fire through a typed nil.
+func slackAPI(c *slack.Client) service.SlackAPI {
+	if c == nil {
+		return nil
+	}
+	return c
+}
+
 // slack builds the Slack client, the workspace directory and the user matcher.
 // All three are optional: without a token the digest still builds and persists,
 // it simply cannot be delivered, and every mention degrades to a plain name.
-func (a *App) slack() (service.SlackAPI, match.UserMatcher) {
+func (a *App) slack() (*slack.Client, match.UserMatcher) {
 	cfg := a.Config.Slack
 	if !cfg.Token.IsSet() {
 		return nil, nil
 	}
-	client, err := slack.New(slack.Config{Token: cfg.Token.Unmask()})
+	client, err := slack.New(slack.Config{
+		Token: cfg.Token.Unmask(),
+		// Carried even when commands are off: the client is the one place that
+		// knows how to open a socket, and a token present in config but absent
+		// from the client would be a puzzle to debug.
+		AppToken: cfg.AppToken.Unmask(),
+	})
 	if err != nil {
 		// Only a missing token can fail here, and that is already excluded.
 		a.Log.Warnw("slack client not built", "error", err)
@@ -479,7 +535,7 @@ func (a *App) jobsConfig() jobs.Config {
 func Teams(cfg *config.Config) []domain.Team {
 	out := make([]domain.Team, 0, len(cfg.Teams))
 	for _, t := range cfg.Teams {
-		slots, tz := cfg.DigestScheduleFor(t)
+		spec := cfg.DigestScheduleFor(t)
 		out = append(out, domain.Team{
 			Name:          t.Name,
 			SlackChannel:  t.SlackChannel,
@@ -488,8 +544,10 @@ func Teams(cfg *config.Config) []domain.Team {
 			Repositories:  t.Repositories,
 			// Copied: the resolver may hand back the global slice, and a team
 			// mutating it would silently rewrite every other team's schedule.
-			DigestSlots:    append([]string(nil), slots...),
-			DigestTimezone: tz,
+			DigestSlots:        append([]string(nil), spec.Slots...),
+			DigestTimezone:     spec.Timezone,
+			DigestSkipWeekdays: append([]string(nil), spec.SkipWeekdays...),
+			DigestSkipDates:    append([]string(nil), spec.SkipDates...),
 		})
 	}
 	return out

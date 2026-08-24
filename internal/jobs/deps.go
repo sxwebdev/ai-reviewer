@@ -120,3 +120,27 @@ type Digester interface {
 	// (already sent, failed, dry-run), because those are successes.
 	SendMessage(ctx context.Context, messageID uuid.UUID) error
 }
+
+// CommandRequest is one in-chat command to answer.
+//
+// Scope is a plain string across this seam rather than the service's own typed
+// constant, for the same reason the job args carry one: it arrives from a
+// durable row, and this package must be able to hand across whatever was
+// written there — including a value a future version stops recognising, which is
+// the service's judgement to make and report, not the queue's to silently drop.
+type CommandRequest struct {
+	Team        domain.Team
+	Scope       string // team | mine
+	SlackUserID string
+	// ResponseURL is Slack's delayed-response capability for this command.
+	ResponseURL string
+}
+
+// Commander answers in-chat commands. Optional: a deployment without a Slack
+// app-level token never receives one, and the worker is not registered.
+type Commander interface {
+	// RunSlackCommand builds the requested digest and delivers it to the
+	// response URL. It reports an error only when the caller was left without an
+	// answer worth retrying for — a digest with nothing in it is a success.
+	RunSlackCommand(ctx context.Context, req CommandRequest) error
+}

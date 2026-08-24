@@ -260,6 +260,7 @@ func (c *Config) RegisterSecrets() {
 		c.GitLab.Token,
 		c.Linear.APIKey,
 		c.Slack.Token,
+		c.Slack.AppToken,
 		c.LLM.Claude.Auth.OAuthToken,
 		c.LLM.Claude.Auth.APIKey,
 		c.Postgres.Username,

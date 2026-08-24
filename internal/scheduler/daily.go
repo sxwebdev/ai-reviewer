@@ -93,11 +93,16 @@ type Slot struct {
 	At   time.Time
 }
 
-// Daily fires every day at each of Times, interpreted in Loc. It implements
-// river.PeriodicSchedule, so River drives it directly.
+// Daily fires every day at each of Times, interpreted in Loc, except on the days
+// Skip names. It implements river.PeriodicSchedule, so River drives it directly.
 type Daily struct {
 	Times []Clock
 	Loc   *time.Location
+	// Skip removes whole days from the schedule — weekends, holidays. It is
+	// enforced in Next, i.e. the digest is never *built* on a skipped day rather
+	// than built and withheld: a digest nobody will read costs dozens of GitLab
+	// requests and a Slack directory load.
+	Skip SkipDays
 }
 
 // Compile-time proof that Daily satisfies River's periodic-schedule contract
@@ -114,6 +119,13 @@ var neverTime = time.Unix(1<<63-62135596801, 999999999)
 // hit is guaranteed on day 0 or 1; the extra day is slack for locations whose
 // DST transition shifts a slot's wall time.
 const daySearchSpan = 3
+
+// skipSearchSpan bounds the forward scan when days are skipped. A little over a
+// year, because the annual skip form means a run of skipped days can in
+// principle stretch that far, and because the loop must terminate on a schedule
+// that skips everything — which is a configuration this package deliberately
+// allows (see SkipDays.SkipsEveryWeekday) and answers with neverTime.
+const skipSearchSpan = 370
 
 // Location resolves the schedule's zone. A nil Loc would mean "container local
 // time", which is exactly the dependency this type exists to remove, so it
@@ -134,8 +146,19 @@ func (d Daily) Next(current time.Time) time.Time {
 	}
 	loc := d.Location()
 	cur := current.In(loc)
-	for day := range daySearchSpan {
-		year, month, dayOfMonth := cur.AddDate(0, 0, day).Date()
+	span := daySearchSpan
+	if !d.Skip.Empty() {
+		span = skipSearchSpan
+	}
+	for day := range span {
+		candidate := cur.AddDate(0, 0, day)
+		// Whole days are removed here rather than at delivery, which is what makes
+		// a skipped day cost nothing: River never inserts the job, so nothing is
+		// built and nothing is sent.
+		if d.Skip.Contains(candidate) {
+			continue
+		}
+		year, month, dayOfMonth := candidate.Date()
 
 		var best time.Time
 		for _, c := range d.Times {
@@ -175,6 +198,11 @@ func (d Daily) Next(current time.Time) time.Time {
 // ok is false only when the schedule has no Times and therefore cannot name a
 // slot at all; the returned Slot is then zero. Callers must handle that
 // explicitly instead of persisting a name this type never produced.
+//
+// Skipped days are deliberately not consulted: this answers "which slot does
+// this instant belong to", which a manual `ai-reviewer digest` on a Saturday
+// still needs a correct answer to. Whether a digest fires is Next's question,
+// and Skipped's.
 func (d Daily) SlotAt(t time.Time) (Slot, bool) {
 	if len(d.Times) == 0 {
 		return Slot{}, false
@@ -209,28 +237,56 @@ func (d Daily) SlotAt(t time.Time) (Slot, bool) {
 	return Slot{}, false
 }
 
-// NewDigest builds one digest schedule from the configured slots and zone. Both
-// errors are surfaced rather than panicking so startup validation can report a
-// malformed slot or an unknown zone as a config failure.
+// Skipped reports whether the day t falls on is one the schedule does not fire
+// on, resolved in the schedule's own location.
 //
-// The slots arrive as the strings the operator wrote, not as Clocks, so this is
-// the only place that turns config into a schedule and no caller can assemble a
-// Daily out of values ParseClocks would have rejected.
+// Exported because two callers outside this package need the same answer for
+// their own reasons: the RunOnStart path, which must not fire a slot that Next
+// would have stepped over, and the CLI, which tells an operator that the day
+// they are asking about is a skipped one.
+func (d Daily) Skipped(t time.Time) bool { return d.Skip.Contains(t.In(d.Location())) }
+
+// DigestSpec is one team's schedule as the operator wrote it: the strings, not
+// the parsed values.
+//
+// A struct rather than four positional arguments because two of them are
+// []string and swapping those silently produces a schedule that parses, runs and
+// skips the wrong days.
+type DigestSpec struct {
+	Slots    []string
+	Timezone string
+	// SkipWeekdays are weekday names: mon…sun, long or short.
+	SkipWeekdays []string
+	// SkipDates are YYYY-MM-DD (one day) or MM-DD (every year).
+	SkipDates []string
+}
+
+// NewDigest builds one digest schedule from the configured slots, zone and skip
+// days. Every error is surfaced rather than panicking so startup validation can
+// report a malformed value as a config failure.
+//
+// The values arrive as the strings the operator wrote, not as Clocks and
+// weekdays, so this is the only place that turns config into a schedule and no
+// caller can assemble a Daily out of values the parsers would have rejected.
 //
 // An empty timezone is rejected rather than defaulted: Daily.Location() degrades
 // a nil zone to UTC so the type stays safe, but silently scheduling a team's
 // digest in UTC because a config key was blank would move every slot by hours
 // without anything saying so. The default belongs to the config schema.
-func NewDigest(slots []string, timezone string) (Daily, error) {
-	times, err := ParseClocks(slots)
+func NewDigest(spec DigestSpec) (Daily, error) {
+	times, err := ParseClocks(spec.Slots)
 	if err != nil {
 		return Daily{}, err
 	}
-	loc, err := LoadLocation(timezone)
+	loc, err := LoadLocation(spec.Timezone)
 	if err != nil {
 		return Daily{}, err
 	}
-	return Daily{Times: times, Loc: loc}, nil
+	skip, err := ParseSkipDays(spec.SkipWeekdays, spec.SkipDates)
+	if err != nil {
+		return Daily{}, err
+	}
+	return Daily{Times: times, Loc: loc, Skip: skip}, nil
 }
 
 // LoadLocation resolves a configured IANA zone name. Exported so config

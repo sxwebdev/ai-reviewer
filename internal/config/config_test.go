@@ -174,25 +174,31 @@ func TestDefaultDigestSchedule(t *testing.T) {
 	// and makes "inherit" indistinguishable from "set to the same value", which is
 	// the distinction the whole override rests on.
 	c.Teams = []TeamConfig{{Name: "payments"}}
-	if len(c.Teams[0].Digest.Slots) != 0 || c.Teams[0].Digest.Timezone != "" {
-		t.Errorf("teams[].digest was defaulted (%+v); inheritance can no longer be expressed", c.Teams[0].Digest)
+	d := c.Teams[0].Digest
+	if len(d.Slots) != 0 || d.Timezone != "" || len(d.SkipWeekdays) != 0 || len(d.SkipDates) != 0 {
+		t.Errorf("teams[].digest was defaulted (%+v); inheritance can no longer be expressed", d)
 	}
 }
 
-// The two halves inherit independently, because the two reasons to override are
-// independent: a team in another country keeps the company's slot times, and a
-// team with an unusual rhythm keeps the company's zone.
+// Every half inherits independently, because the reasons to override are
+// independent: a team in another country keeps the company's slot times, a team
+// with an unusual rhythm keeps the company's zone, and a team that works
+// Saturdays keeps the company's holiday list while dropping the weekend rule.
 func TestDigestScheduleInheritance(t *testing.T) {
 	t.Parallel()
 	c := defaultConfig(t)
 	c.Digest.Timezone = "Europe/Moscow"
 	c.Digest.Slots = []string{"09:00", "17:30"}
+	c.Digest.SkipWeekdays = []string{"sat", "sun"}
+	c.Digest.SkipDates = []string{"01-01"}
 
 	for _, tc := range []struct {
-		name     string
-		team     TeamDigestConfig
-		wantSlot []string
-		wantTZ   string
+		name         string
+		team         TeamDigestConfig
+		wantSlot     []string
+		wantTZ       string
+		wantWeekdays []string
+		wantDates    []string
 	}{
 		{name: "inherits both", wantSlot: []string{"09:00", "17:30"}, wantTZ: "Europe/Moscow"},
 		{
@@ -215,15 +221,122 @@ func TestDigestScheduleInheritance(t *testing.T) {
 			team:     TeamDigestConfig{Timezone: "   "},
 			wantSlot: []string{"09:00", "17:30"}, wantTZ: "Europe/Moscow",
 		},
+		{
+			// The case the independence is for: a support team works weekends but
+			// keeps the company holidays.
+			name:         "own weekdays, inherited dates",
+			team:         TeamDigestConfig{SkipWeekdays: []string{"sun"}},
+			wantSlot:     []string{"09:00", "17:30"},
+			wantTZ:       "Europe/Moscow",
+			wantWeekdays: []string{"sun"},
+			wantDates:    []string{"01-01"},
+		},
+		{
+			name:         "own dates, inherited weekdays",
+			team:         TeamDigestConfig{SkipDates: []string{"2026-05-09"}},
+			wantSlot:     []string{"09:00", "17:30"},
+			wantTZ:       "Europe/Moscow",
+			wantWeekdays: []string{"sat", "sun"},
+			wantDates:    []string{"2026-05-09"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			slots, tz := c.DigestScheduleFor(TeamConfig{Name: "payments", Digest: tc.team})
-			if !slices.Equal(slots, tc.wantSlot) || tz != tc.wantTZ {
-				t.Errorf("= (%v, %q), want (%v, %q)", slots, tz, tc.wantSlot, tc.wantTZ)
+			// Every case that does not say otherwise inherits the global skip lists.
+			if tc.wantWeekdays == nil {
+				tc.wantWeekdays = []string{"sat", "sun"}
+			}
+			if tc.wantDates == nil {
+				tc.wantDates = []string{"01-01"}
+			}
+			got := c.DigestScheduleFor(TeamConfig{Name: "payments", Digest: tc.team})
+			if !slices.Equal(got.Slots, tc.wantSlot) || got.Timezone != tc.wantTZ {
+				t.Errorf("= (%v, %q), want (%v, %q)", got.Slots, got.Timezone, tc.wantSlot, tc.wantTZ)
+			}
+			if !slices.Equal(got.SkipWeekdays, tc.wantWeekdays) || !slices.Equal(got.SkipDates, tc.wantDates) {
+				t.Errorf("skip = (%v, %v), want (%v, %v)",
+					got.SkipWeekdays, got.SkipDates, tc.wantWeekdays, tc.wantDates)
 			}
 		})
 	}
+}
+
+// TestValidateDigestSkipDays: a misspelled weekday or a date in the wrong shape
+// does not stop the service — it just fails to skip the day, and nobody notices
+// until a digest lands on a holiday. Refusing it at load time is the only moment
+// anybody sees it.
+func TestValidateDigestSkipDays(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		global   DigestConfig
+		team     TeamDigestConfig
+		wantPart string
+	}{
+		{
+			name:     "global weekday",
+			global:   DigestConfig{SkipWeekdays: []string{"funday"}},
+			wantPart: "digest: skip weekday",
+		},
+		{
+			name:     "global date",
+			global:   DigestConfig{SkipDates: []string{"01.01"}},
+			wantPart: "digest: skip date",
+		},
+		{
+			// Reported against the team, whichever side of the inheritance the bad
+			// value came from: "teams[payments].digest" is what an operator greps.
+			name:     "team weekday",
+			team:     TeamDigestConfig{SkipWeekdays: []string{"вс"}},
+			wantPart: "teams[payments].digest: skip weekday",
+		},
+		{
+			name:     "team date",
+			team:     TeamDigestConfig{SkipDates: []string{"2026-1-1"}},
+			wantPart: "teams[payments].digest: skip date",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := defaultConfig(t)
+			c.GitLab.BaseURL = "https://gitlab.example.com"
+			c.GitLab.Token = "glpat-x"
+			c.Postgres.Username = "ai_reviewer"
+			c.Slack.Token = "xoxb-x"
+			c.Digest.SkipWeekdays = tc.global.SkipWeekdays
+			c.Digest.SkipDates = tc.global.SkipDates
+			c.Teams = []TeamConfig{{
+				Name: "payments", SlackChannel: "C012345678",
+				Repositories: []string{"a/b"}, Digest: tc.team,
+			}}
+
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantPart) {
+				t.Fatalf("Validate() = %v, want it to name %q", err, tc.wantPart)
+			}
+		})
+	}
+
+	// The values that work must keep working, including all seven weekdays: there
+	// is no other way to say "this team wants no scheduled digest", so it is a
+	// configuration doctor warns about rather than one the loader refuses.
+	t.Run("valid values load", func(t *testing.T) {
+		t.Parallel()
+		c := defaultConfig(t)
+		c.GitLab.BaseURL = "https://gitlab.example.com"
+		c.GitLab.Token = "glpat-x"
+		c.Postgres.Username = "ai_reviewer"
+		c.Slack.Token = "xoxb-x"
+		c.Digest.SkipWeekdays = []string{"sat", "Sunday"}
+		c.Digest.SkipDates = []string{"01-01", "2026-05-09"}
+		c.Teams = []TeamConfig{{
+			Name: "payments", SlackChannel: "C012345678", Repositories: []string{"a/b"},
+			Digest: TeamDigestConfig{SkipWeekdays: []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}},
+		}}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
 
 // A schedule the service cannot name has to be refused at load time. Left to the
@@ -901,6 +1014,80 @@ func TestValidateSlackTokenRequiredWhenChannelsConfigured(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+// TestValidateSlackCommands covers the in-chat commands' configuration. Each
+// case is a way to end up with a service that connects to Slack and then answers
+// nothing, which is the failure mode the checks exist for: from a channel, a
+// misconfigured command and an ignored one look identical.
+func TestValidateSlackCommands(t *testing.T) {
+	base := func() *Config {
+		c := defaultConfig(t)
+		c.GitLab.BaseURL = "https://gitlab.example.com"
+		c.GitLab.Token = "glpat-x"
+		c.Postgres.Username = "ai_reviewer"
+		c.Slack.Token = "xoxb-x"
+		c.Teams = []TeamConfig{{Name: "t", SlackChannel: "C012345678", Repositories: []string{"a/b"}}}
+		return c
+	}
+
+	t.Run("the defaults are usable", func(t *testing.T) {
+		c := base()
+		c.Slack.AppToken = "xapp-1-A0-0-secret"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.Slack.Commands.Team != "/all" || c.Slack.Commands.Mine != "/my" {
+			t.Errorf("defaults = %q / %q, want /all and /my", c.Slack.Commands.Team, c.Slack.Commands.Mine)
+		}
+	})
+
+	// The app token opens the socket and cannot answer on it: every command
+	// resolves people through the directory and renders mentions, both the bot
+	// token's work.
+	t.Run("the app token needs the bot token", func(t *testing.T) {
+		c := base()
+		c.Slack.Token = ""
+		c.Slack.AppToken = "xapp-1-A0-0-secret"
+		c.Teams = nil
+		c.Service.SlackSendEnabled = false
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "slack.app_token is set but slack.token is empty") {
+			t.Fatalf("want the pair enforced, got %v", err)
+		}
+	})
+
+	t.Run("a name that is not a command", func(t *testing.T) {
+		c := base()
+		c.Slack.AppToken = "xapp-1-A0-0-secret"
+		c.Slack.Commands.Team = "all"
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "slack.commands.team") {
+			t.Fatalf("want a missing slash rejected, got %v", err)
+		}
+	})
+
+	// Both names the same would force the dispatcher to pick one, and picking the
+	// team digest posts one person's queue to the channel.
+	t.Run("the two commands must differ", func(t *testing.T) {
+		c := base()
+		c.Slack.AppToken = "xapp-1-A0-0-secret"
+		c.Slack.Commands.Team = "/mr"
+		c.Slack.Commands.Mine = "/MR"
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "they must differ") {
+			t.Fatalf("want identical command names rejected, got %v", err)
+		}
+	})
+
+	// Without an app token nothing listens, so the names are inert and must not
+	// fail a deployment that never set them.
+	t.Run("names are not checked without the token", func(t *testing.T) {
+		c := base()
+		c.Slack.Commands.Team = "nonsense"
+		c.Slack.Commands.Mine = "nonsense"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
 
 func TestSecretNeverLeaks(t *testing.T) {

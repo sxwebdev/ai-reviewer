@@ -31,7 +31,7 @@ service:
   ai_review_publish_enabled: false
 
 digest:
-  # The default schedule. Any team may override either half in teams[].digest.
+  # The default schedule. Any team may override any part of it in teams[].digest.
   #
   # slots are wall-clock times in `timezone`, and they are also the values stored
   # in digest_runs.slot — so editing either starts a new series: runs already
@@ -43,6 +43,20 @@ digest:
     - "09:00"
     - "14:00"
     - "17:30"
+  # Days with no digest at all: nothing is built and nothing is sent. The
+  # calendar day is the one in `timezone` — "Saturday" means Saturday where the
+  # team is. Both lists are empty by default, i.e. a digest every day.
+  #
+  #   skip_weekdays: [sat, sun]          # long forms (saturday) are accepted too
+  #
+  # Dates take either form: 2026-05-09 is that one day, 05-09 is the same day
+  # every year. Prefer the annual form for holidays — a list of full dates
+  # silently expires each December, and the failure is a digest that starts
+  # arriving on a holiday again.
+  #
+  #   skip_dates: ["01-01", "01-02", "05-09", "2026-12-31"]
+  skip_weekdays: []
+  skip_dates: []
 
 postgres:
   host: localhost
@@ -88,6 +102,22 @@ linear:
 
 slack:
   token: "" # AI_REVIEWER_SLACK_TOKEN
+  # In-chat commands (optional). The app-level token is the switch: with it the
+  # service opens a Socket Mode connection and answers the two commands below;
+  # without it nothing listens and nothing is exposed. It is a *second* token —
+  # created on the app's Basic Information page with the connections:write scope
+  # — and it cannot replace the bot token above: apps.connections.open is the
+  # only method that accepts it, and the answers need the bot token's directory
+  # and mentions.
+  #
+  # Both commands must also be registered in the app configuration (Features →
+  # Slash Commands). In Socket Mode they need no Request URL.
+  app_token: "" # AI_REVIEWER_SLACK_APP_TOKEN
+  commands:
+    # The whole team's digest, posted to the channel the command was typed in.
+    team: /all # AI_REVIEWER_SLACK_COMMANDS_TEAM
+    # The caller's own rows, shown only to them.
+    mine: /my # AI_REVIEWER_SLACK_COMMANDS_MINE
   directory_ttl: 15m # in-process TTL of the users.list cache
   # Optional override for people the indexes below cannot match. The value may be
   # a Slack user id, an @handle or an email:
@@ -204,10 +234,17 @@ teams:
     ai_review: { enabled: false }
     linear_team_ids: []
     repositories: [platform/auth, platform/gateway]
-    # Either half of the schedule can be overridden on its own, and they inherit
+    # Every part of the schedule can be overridden on its own, and they inherit
     # independently: a team in another country usually keeps the company's slot
-    # times, a team with an unusual rhythm usually keeps the zone. Omit the block
-    # entirely — as `payments` does above — to inherit both.
+    # times, a team with an unusual rhythm usually keeps the zone, and a team that
+    # works weekends keeps the company holidays while dropping the weekend rule.
+    # Omit the block entirely — as `payments` does above — to inherit everything.
+    #
+    # A team's list REPLACES the global one; it cannot subtract from it. A
+    # non-empty list means "these are my skipped days", an empty one means
+    # "inherit", and there is no third value — so a team that must ignore a global
+    # skip list carries its own.
     digest:
       timezone: Europe/Lisbon
       slots: ["10:00", "18:00"]
+      skip_weekdays: [sun]

@@ -81,6 +81,8 @@ Two defaults are worth reading before you trust the table:
 | **Digest schedule**                               |                                      |                     |
 | `AI_REVIEWER_DIGEST_TIMEZONE`                     | `digest.timezone`                    | `Europe/Moscow`     |
 | `AI_REVIEWER_DIGEST_SLOTS`                        | `digest.slots`                       | `09:00,14:00,17:30` |
+| `AI_REVIEWER_DIGEST_SKIP_WEEKDAYS`                | `digest.skip_weekdays`               | — (every day)       |
+| `AI_REVIEWER_DIGEST_SKIP_DATES`                   | `digest.skip_dates`                  | — (every day)       |
 | **PostgreSQL**                                    |                                      |                     |
 | `AI_REVIEWER_POSTGRES_HOST`                       | `postgres.host`                      | `localhost`         |
 | `AI_REVIEWER_POSTGRES_PORT`                       | `postgres.port`                      | `5432`              |
@@ -113,6 +115,9 @@ Two defaults are worth reading before you trust the table:
 | `AI_REVIEWER_LINEAR_MAX_RETRY_AFTER`              | `linear.max_retry_after`             | `60s`               |
 | **Slack**                                         |                                      |                     |
 | ★ `AI_REVIEWER_SLACK_TOKEN`                       | `slack.token`                        | —                   |
+| ★ `AI_REVIEWER_SLACK_APP_TOKEN`                   | `slack.app_token`                    | —                   |
+| `AI_REVIEWER_SLACK_COMMANDS_TEAM`                 | `slack.commands.team`                | `/all`              |
+| `AI_REVIEWER_SLACK_COMMANDS_MINE`                 | `slack.commands.mine`                | `/my`               |
 | `AI_REVIEWER_SLACK_DIRECTORY_TTL`                 | `slack.directory_ttl`                | `15m`               |
 | `AI_REVIEWER_SLACK_USER_MAP_<gitlab_username>`    | `slack.user_map.<gitlab_username>`   | —                   |
 | **LLM**                                           |                                      |                     |
@@ -166,6 +171,10 @@ Two defaults are worth reading before you trust the table:
 | `AI_REVIEWER_TEAMS_N_REPOSITORIES`                | `teams[N].repositories` (comma-separated) | —              |
 | `AI_REVIEWER_TEAMS_N_AI_REVIEW_ENABLED`           | `teams[N].ai_review.enabled`         | —                   |
 | `AI_REVIEWER_TEAMS_N_LINEAR_TEAM_IDS`             | `teams[N].linear_team_ids` (comma-separated UUIDs) | —       |
+| `AI_REVIEWER_TEAMS_N_DIGEST_TIMEZONE`             | `teams[N].digest.timezone`           | inherits            |
+| `AI_REVIEWER_TEAMS_N_DIGEST_SLOTS`                | `teams[N].digest.slots`              | inherits            |
+| `AI_REVIEWER_TEAMS_N_DIGEST_SKIP_WEEKDAYS`        | `teams[N].digest.skip_weekdays`      | inherits            |
+| `AI_REVIEWER_TEAMS_N_DIGEST_SKIP_DATES`           | `teams[N].digest.skip_dates`         | inherits            |
 
 Note the two that break the pattern: the Claude credentials are
 `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN` and `AI_REVIEWER_ANTHROPIC_API_KEY`, not
@@ -174,6 +183,19 @@ Note the two that break the pattern: the Claude credentials are
 recognises it. The unprefixed `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`
 are **not** read from the service's own environment; they are constructed for
 the `claude` subprocess only.
+
+`slack.app_token` is the switch for the in-chat commands, and the only one: it is
+the single credential that can open a Socket Mode connection, so a deployment
+without it cannot listen however else it is configured. It does not replace
+`slack.token` — the app-level token can open the connection and nothing else,
+while the answers need the bot token's directory and mentions, so configuring one
+without the other is refused at startup. `slack.commands.team` and
+`slack.commands.mine` name the two commands; they are configurable because the
+name is claimed workspace-wide and another installed app may already own `/all`.
+Both are also validated only when the app token is set — inert names must not
+fail a deployment that never turned commands on. See
+[installation.md](installation.md#in-chat-commands-optional) for the four steps
+in the Slack app configuration.
 
 `slack.user_map` takes a value in any of three forms, and the form decides how it
 is resolved: a **user id** (`U…`/`W…`, upper case) answers offline and is the one

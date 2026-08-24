@@ -23,9 +23,10 @@ import (
 type jobsAdapter struct{ svc *service.Service }
 
 var (
-	_ jobs.Reviewer = jobsAdapter{}
-	_ jobs.Scanner  = jobsAdapter{}
-	_ jobs.Digester = jobsAdapter{}
+	_ jobs.Reviewer  = jobsAdapter{}
+	_ jobs.Scanner   = jobsAdapter{}
+	_ jobs.Digester  = jobsAdapter{}
+	_ jobs.Commander = jobsAdapter{}
 )
 
 func (a jobsAdapter) RunReview(ctx context.Context, req jobs.ReviewRequest, onPersist jobs.OnPersist) (*jobs.ReviewOutcome, error) {
@@ -137,4 +138,17 @@ func fromServiceDigest(out *service.DigestOutcome) *jobs.DigestOutcome {
 
 func (a jobsAdapter) SendMessage(ctx context.Context, messageID uuid.UUID) error {
 	return a.svc.SendMessage(ctx, messageID)
+}
+
+// RunSlackCommand carries a command across the seam. The scope is re-typed
+// rather than passed through, and the service rejects one it does not know: the
+// value comes from a durable job argument, so "team" and "mine" are a wire
+// format, not an enum shared between the two packages.
+func (a jobsAdapter) RunSlackCommand(ctx context.Context, req jobs.CommandRequest) error {
+	return a.svc.RunSlackCommand(ctx, service.SlackCommandRequest{
+		Team:        req.Team,
+		Scope:       service.CommandScope(req.Scope),
+		SlackUserID: req.SlackUserID,
+		ResponseURL: req.ResponseURL,
+	})
 }

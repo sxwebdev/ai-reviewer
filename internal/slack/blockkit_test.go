@@ -185,15 +185,16 @@ func TestBuildDigestLayout(t *testing.T) {
 	want := []string{
 		"📋 MR Digest — Payments",
 		// Both are hours old, so both are unmarked: the markers are for days.
-		"*<@U123>* · review 2\n" +
-			"▫️ <https://gl/payments/-/merge_requests/481|!481> _payments_ 18h — Add payment retries\n" +
-			"▫️ <https://gl/billing/-/merge_requests/932|!932> _billing_ 5h — Invoice export",
-		"*<@U456>* · yours 1\n" +
-			"🛠 <https://gl/payments/-/merge_requests/475|!475> _payments_ · 💬 3 threads · ⚠️ conflicts · " +
-			"❌ <https://gl/payments/-/pipelines/9001|pipeline> — Cache invalidation",
-		"*<@U789>* · yours 1\n" +
-			"🛠 <https://gl/checkout/-/merge_requests/122|!122> _checkout_ · " +
-			"❌ <https://gl/checkout/-/pipelines/42|pipeline> — Search filters",
+		"*<@U123>* · to review 2\n" +
+			"▫️ review <https://gl/payments/-/merge_requests/481|!481> _payments_ · waiting 18h — Add payment retries\n" +
+			"▫️ review <https://gl/billing/-/merge_requests/932|!932> _billing_ · waiting 5h — Invoice export",
+		"*<@U456>* · your MRs 1\n" +
+			"🛠 your MR <https://gl/payments/-/merge_requests/475|!475> _payments_ · 💬 resolve 3 threads · " +
+			"⚠️ fix merge conflicts · " +
+			"❌ fix the failed <https://gl/payments/-/pipelines/9001|pipeline> — Cache invalidation",
+		"*<@U789>* · your MRs 1\n" +
+			"🛠 your MR <https://gl/checkout/-/merge_requests/122|!122> _checkout_ · " +
+			"❌ fix the failed <https://gl/checkout/-/pipelines/42|pipeline> — Search filters",
 	}
 	got := blockTexts(t, m.Blocks)
 	if len(got) != len(want) {
@@ -234,10 +235,10 @@ func TestSinglePersonSeesBothHalvesTogether(t *testing.T) {
 		t.Fatalf("blocks = %d, want header + one person block:\n%s", len(blocks), strings.Join(blocks, "\n---\n"))
 	}
 	body := blocks[1]
-	if !strings.HasPrefix(body, "*<@U1>* · review 1 · yours 1\n") {
+	if !strings.HasPrefix(body, "*<@U1>* · to review 1 · your MRs 1\n") {
 		t.Errorf("head must state both halves:\n%s", body)
 	}
-	for _, want := range []string{"|!10>", "|!11>", "💬 2 threads"} {
+	for _, want := range []string{"|!10>", "|!11>", "💬 resolve 2 threads"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("%q missing:\n%s", want, body)
 		}
@@ -266,7 +267,7 @@ func TestReviewTailIsListedNotDropped(t *testing.T) {
 	if got := strings.Count(body, " — CHAIN-"); got != 3 {
 		t.Errorf("detailed rows = %d, want 3 (the rest belong in the tail):\n%s", got, body)
 	}
-	if !strings.Contains(body, fmt.Sprintf("+%d more:", total-3)) {
+	if !strings.Contains(body, fmt.Sprintf("+%d more to review:", total-3)) {
 		t.Errorf("tail count missing:\n%s", body)
 	}
 	for i := range total {
@@ -310,7 +311,7 @@ func TestBigReviewTailIsSplitNotTruncated(t *testing.T) {
 	}
 	joined := strings.Join(texts, "\n")
 
-	if !strings.Contains(joined, fmt.Sprintf("+%d more:", total-3)) {
+	if !strings.Contains(joined, fmt.Sprintf("+%d more to review:", total-3)) {
 		t.Errorf("tail count missing:\n%s", joined)
 	}
 	// Every title here is short, so the only thing that can produce an ellipsis
@@ -360,7 +361,7 @@ func TestTailStaysUnambiguous(t *testing.T) {
 	tailOf := func(t *testing.T, d slack.DigestData) string {
 		t.Helper()
 		for _, line := range strings.Split(blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1], "\n") {
-			if strings.Contains(line, "+2 more:") {
+			if strings.Contains(line, "+2 more to review:") {
 				return line
 			}
 		}
@@ -466,11 +467,11 @@ func TestWaitingSuffix(t *testing.T) {
 		want string
 	}{
 		{"omitted when zero", 0, "|!1> — T"},
-		{"minutes", 45 * time.Minute, "|!1> 45m — T"},
-		{"rounds up to a minute", 20 * time.Second, "|!1> 1m — T"},
-		{"hours", 18 * time.Hour, "|!1> 18h — T"},
-		{"days past two", 72 * time.Hour, "|!1> 3d — T"},
-		{"still hours at 47", 47 * time.Hour, "|!1> 47h — T"},
+		{"minutes", 45 * time.Minute, "|!1> · waiting 45m — T"},
+		{"rounds up to a minute", 20 * time.Second, "|!1> · waiting 1m — T"},
+		{"hours", 18 * time.Hour, "|!1> · waiting 18h — T"},
+		{"days past two", 72 * time.Hour, "|!1> · waiting 3d — T"},
+		{"still hours at 47", 47 * time.Hour, "|!1> · waiting 47h — T"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -619,10 +620,10 @@ func TestAuthorFlagOrderIsFixed(t *testing.T) {
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
 
 	// An unmatched reviewer is named without a ping, exactly like everywhere else.
-	if !strings.Contains(body, "🔁 changes requested by <@U9>, Jane Doe (@jane)") {
+	if !strings.Contains(body, "🔁 address changes requested by <@U9>, Jane Doe (@jane)") {
 		t.Errorf("changes-requested flag missing or misrendered:\n%s", body)
 	}
-	wantOrder := []string{"🔁 changes requested by", "💬 1 thread", "⚠️ conflicts", "❌ "}
+	wantOrder := []string{"🔁 address changes requested by", "💬 resolve 1 thread", "⚠️ fix merge conflicts", "❌ "}
 	prev := -1
 	for _, part := range wantOrder {
 		i := strings.Index(body, part)
@@ -647,7 +648,7 @@ func TestAuthorFlagsOmitWhatDoesNotApply(t *testing.T) {
 		}},
 	}
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
-	want := "*<@U1>* · yours 1\n🛠 !1 · ❌ <https://gl/p/1|pipeline>"
+	want := "*<@U1>* · your MRs 1\n🛠 your MR !1 · ❌ fix the failed <https://gl/p/1|pipeline>"
 	if body != want {
 		t.Errorf("body =\n%q\nwant\n%q", body, want)
 	}
@@ -674,7 +675,7 @@ func TestUnmatchedAndAmbiguousPeopleStillAppear(t *testing.T) {
 		},
 	}
 	texts := strings.Join(blockTexts(t, slack.BuildDigest(d)[0].Blocks), "\n")
-	if !strings.Contains(texts, "*John Smith (@john)* · review 1 · yours 1") {
+	if !strings.Contains(texts, "*John Smith (@john)* · to review 1 · your MRs 1") {
 		t.Errorf("unmatched person missing:\n%s", texts)
 	}
 	if !strings.Contains(texts, "Ann Lee (@ann) ❓") {
@@ -890,7 +891,7 @@ func TestOnePersonSplitsAcrossSections(t *testing.T) {
 			t.Fatalf("MR !%d lost", i)
 		}
 	}
-	if !strings.Contains(joined, "*<@U1>* · review 60"+" _(continued)_") {
+	if !strings.Contains(joined, "*<@U1>* · to review 60"+" _(continued)_") {
 		t.Errorf("a continued person must repeat whose merge requests these are:\n%s", joined)
 	}
 }
@@ -1152,3 +1153,199 @@ func blockTexts(t *testing.T, blocks []slack.Block) []string {
 	}
 	return out
 }
+
+// TestEveryRowSaysWhatToDo is the rule the icons alone broke: a reader must be
+// able to act on a row without first learning what ▫️ and 🛠 mean. Every row
+// opens with the action it is asking for, and every flag on it is an imperative
+// — which is what "⚠️ conflicts" and "❌ pipeline" already were, and what
+// nothing else was.
+//
+// Stated as a vocabulary over every segment rather than as a golden string, so
+// a flag added later without a verb fails here rather than shipping as another
+// icon nobody can read.
+func TestEveryRowSaysWhatToDo(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			ToReview: []slack.ReviewItem{
+				{IID: 10, Title: "CHAIN-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour},
+				{IID: 11, Title: "CHAIN-2 b", WebURL: "https://gl/11"},
+			},
+			Own: []slack.AuthorItem{
+				{
+					IID: 20, Title: "CHAIN-3 c", WebURL: "https://gl/20",
+					ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}},
+					UnresolvedThreads:  2, MergeConflicts: true, PipelineFailed: true,
+					PipelineWebURL: "https://gl/p/20",
+				},
+				{
+					IID: 21, Title: "CHAIN-4 d", WebURL: "https://gl/21",
+					MoveLinear: true, LinearIdentifier: "PAY-4", LinearWebURL: "https://linear.app/PAY-4",
+				},
+				{
+					IID: 22, Title: "CHAIN-5 e", WebURL: "https://gl/22",
+					StartLinear: true, LinearIdentifier: "PAY-5",
+					LinearWebURL: "https://linear.app/PAY-5", LinearState: "In Progress",
+				},
+			},
+		}},
+	}
+
+	// Every form a segment may take. The row openers name what the merge request
+	// is to this person; the rest name what to do about it.
+	openers := []string{"review ", "your MR "}
+	imperatives := []string{
+		"waiting ", "address ", "resolve ", "fix ", "move ",
+	}
+	hasAny := func(s string, prefixes []string) bool {
+		for _, p := range prefixes {
+			if strings.Contains(s, p) {
+				return true
+			}
+		}
+		return false
+	}
+
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+	lines := strings.Split(body, "\n")
+	if len(lines) != 6 { // the person head, two reviews, three own merge requests
+		t.Fatalf("lines = %d, want 6:\n%s", len(lines), body)
+	}
+	for _, line := range lines[1:] {
+		segments := strings.Split(line, " · ")
+		if !hasAny(segments[0], openers) {
+			t.Errorf("row does not say what it is: %q", line)
+		}
+		for _, seg := range segments[1:] {
+			if !hasAny(seg, imperatives) {
+				t.Errorf("segment %q of row %q names no action", seg, line)
+			}
+		}
+	}
+}
+
+// TestTailNamesItsActionOnce: the compressed tail is a list of ids under one
+// line that already says what they are. Repeating "review" on every entry is
+// exactly the noise the tail exists to remove.
+func TestTailNamesItsActionOnce(t *testing.T) {
+	t.Parallel()
+
+	p := slack.PersonDigest{Person: slack.Mention{SlackID: "U1"}}
+	for i := range 6 {
+		p.ToReview = append(p.ToReview, slack.ReviewItem{
+			IID: int64(i), Title: "T", WebURL: fmt.Sprintf("https://gl/%d", i),
+			Waiting: time.Duration(6-i) * 24 * time.Hour,
+		})
+	}
+	body := blockTexts(t, slack.BuildDigest(slack.DigestData{
+		Team: "t", Project: "p", People: []slack.PersonDigest{p},
+	})[0].Blocks)[1]
+
+	var tail string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "more to review:") {
+			tail = line
+		}
+	}
+	if tail == "" {
+		t.Fatalf("no tail line:\n%s", body)
+	}
+	if n := strings.Count(tail, "review"); n != 1 {
+		t.Errorf("tail names the action %d times, want once:\n%s", n, tail)
+	}
+}
+
+// TestOnlyPersonKeepsOneQueue is the personal command: the same digest, narrowed
+// to the caller. It is a filter rather than a second classification precisely so
+// the two can never answer differently.
+func TestOnlyPersonKeepsOneQueue(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments", Project: "payments",
+		LinearEnabled: true, LinearInReviewCount: 8,
+		Warnings:    []string{"Partial data: Linear could not be inspected."},
+		FailedRepos: 1,
+		People: []slack.PersonDigest{
+			{
+				Person:   slack.Mention{SlackID: "U1", Display: "Ann"},
+				ToReview: []slack.ReviewItem{{IID: 1, Title: "T1", WebURL: "https://gl/1"}},
+				Own:      []slack.AuthorItem{{IID: 2, Title: "T2", WebURL: "https://gl/2", UnresolvedThreads: 1}},
+			},
+			{
+				Person:   slack.Mention{SlackID: "U2", Display: "Bob"},
+				ToReview: []slack.ReviewItem{{IID: 3, Title: "T3", WebURL: "https://gl/3"}},
+			},
+		},
+	}
+
+	mine, ok := d.OnlyPerson("U1")
+	if !ok {
+		t.Fatal("U1 is in the digest and must be found")
+	}
+	if len(mine.People) != 1 || mine.People[0].Person.SlackID != "U1" {
+		t.Fatalf("people = %+v, want only U1", mine.People)
+	}
+	if len(mine.People[0].ToReview) != 1 || len(mine.People[0].Own) != 1 {
+		t.Error("both halves of one person's workload must survive the filter")
+	}
+	// The board total is the team's, not the caller's: a personal answer opening
+	// with "In Review: 8" invites reading it as their own.
+	if mine.LinearEnabled || mine.LinearInReviewCount != 0 {
+		t.Error("the Linear aggregate must not survive into a personal digest")
+	}
+	// A digest built on half the repositories is exactly as incomplete for one
+	// person as for the team.
+	if len(mine.Warnings) != 1 || mine.FailedRepos != 1 {
+		t.Errorf("partial-data warnings must survive: warnings=%v failed=%d", mine.Warnings, mine.FailedRepos)
+	}
+	if mine.Team != d.Team || mine.Project != d.Project {
+		t.Error("the header must still say whose digest this is")
+	}
+
+	body := blockTexts(t, slack.BuildDigest(mine)[0].Blocks)
+	joined := strings.Join(body, "\n")
+	if strings.Contains(joined, "|!3>") {
+		t.Errorf("another person's merge request leaked into a personal digest:\n%s", joined)
+	}
+}
+
+// TestOnlyPersonMissesQuietlyAndSafely: an unknown or empty id must produce
+// nothing rather than everything. The dangerous failure is the other direction —
+// a filter that fell through to the full digest would post the whole team's
+// queue as an answer meant for one person.
+func TestOnlyPersonMissesQuietlyAndSafely(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments",
+		People: []slack.PersonDigest{
+			{
+				// Named but not matched to a Slack account: nobody can address them,
+				// so no caller can be them either.
+				Person:   slack.Mention{Display: "Ann Author (@ann)"},
+				ToReview: []slack.ReviewItem{{IID: 1, Title: "T", WebURL: "https://gl/1"}},
+			},
+			{
+				Person:   slack.Mention{SlackID: "U2"},
+				ToReview: []slack.ReviewItem{{IID: 2, Title: "T", WebURL: "https://gl/2"}},
+			},
+		},
+	}
+
+	for _, id := range []string{"U404", "", "   ", "u2"} {
+		got, ok := got2(d.OnlyPerson(id))
+		if ok {
+			t.Errorf("OnlyPerson(%q) matched %d person/people, want none", id, len(got.People))
+		}
+		if len(got.People) != 0 {
+			t.Errorf("OnlyPerson(%q) returned %d people alongside false", id, len(got.People))
+		}
+	}
+}
+
+// got2 is a tiny helper so the two-value call above reads as one expression.
+func got2(d slack.DigestData, ok bool) (slack.DigestData, bool) { return d, ok }

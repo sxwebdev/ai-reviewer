@@ -142,6 +142,7 @@ func TestUniqueTaggedFieldsPerKind(t *testing.T) {
 		"publish_review": {jobs.PublishReviewArgs{}, []string{"review_id"}},
 		"digest":         {jobs.DigestArgs{}, []string{"attempt", "run_date", "slot", "team"}},
 		"slack_send":     {jobs.SlackSendArgs{}, []string{"message_id"}},
+		"slack_command":  {jobs.SlackCommandArgs{}, []string{"channel_id", "scope", "slack_user_id", "team"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -284,5 +285,19 @@ func TestPublishReviewArgsCarryTheReviewID(t *testing.T) {
 	}
 	if got.ReviewID != id {
 		t.Errorf("ReviewID = %s, want %s", got.ReviewID, id)
+	}
+}
+
+// TestSlackCommandChannelIsPartOfTheKey guards the delivery, not the dedupe.
+// The answer goes to the response URL of whichever invocation won the unique
+// key, so a key without the channel folds two conversations together: the second
+// caller is acknowledged and then answered somewhere else. It bites on a
+// single-team deployment, where SlackCommandTeam resolves any channel — a DM to
+// the app included — to the one team, so /all in the channel followed by /all in
+// a DM is the same key with two different destinations.
+func TestSlackCommandChannelIsPartOfTheKey(t *testing.T) {
+	t.Parallel()
+	if !slices.Contains(uniqueTaggedFields(t, jobs.SlackCommandArgs{}), "channel_id") {
+		t.Error("slack_command uniqueness omits channel_id; the answer would be delivered to the wrong conversation")
 	}
 }

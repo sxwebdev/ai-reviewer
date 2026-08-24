@@ -3,6 +3,7 @@ module github.com/sxwebdev/ai-reviewer
 go 1.26.5
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/go-playground/validator/v10 v10.30.3
 	github.com/gobeam/stringy v0.0.7
 	github.com/google/uuid v1.6.0

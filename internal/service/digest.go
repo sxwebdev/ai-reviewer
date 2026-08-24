@@ -67,109 +67,24 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 		reuseID = existing.ID
 	}
 
-	snapshots, failedRepos := s.gatherTeam(ctx, team)
-	linearState, linearErr := s.gatherLinear(ctx, team, snapshots)
+	src := s.gatherDigestSources(ctx, team)
+	// Published before the early return below: a run that learned nothing is
+	// still a run, and a source failure that aborts the digest is the one an
+	// operator most wants counted.
+	s.publishDigestMetrics(src)
 
-	gitLabUnavailable := failedRepos > 0 && len(snapshots) == 0 && len(team.Repositories) > 0
-	linearConfigured := len(team.LinearTeamIDs) > 0
-	// Two different questions. linearDegraded asks whether anything failed, and
-	// drives the partial status and the warning; linearState.enabled asks whether
-	// the board total actually arrived, and is the only one allowed to decide
-	// that Linear contributed nothing at all.
-	linearDegraded := linearConfigured && linearErr != nil
-
-	// Every metric this build owns is published here, before the early return
-	// below: a run that learned nothing is still a run, and a source failure that
-	// aborts the digest is the one an operator most wants counted. This is also
-	// the only place that sees a whole team at once, so it is the only place that
-	// can set the per-team gauges honestly — overwritten every pass, including
-	// when every count is zero, because a team that drops to zero must report
-	// zero rather than keep its last non-zero value forever.
-	st := teamState(snapshots, linearState)
-	metrics.SetTeamState(team.Name, st)
-	// Same rule as the count below, for the same reason: the count is a hard zero
-	// whenever the gate could not run, which is the claim "nothing is stuck before
-	// In Review" at exactly the moment the service stopped being able to tell — and
-	// the same build pushes those merge requests back onto reviewers, so
-	// waiting_human_review jumps in the same scrape and the pair reads as work
-	// moving forward.
-	//
-	// **Both** halves have to be known, and gateKnown alone is not enough: it is
-	// decided before the batch lookup, so a failed ListIssuesByNumbers leaves it
-	// true with an empty linksByMR — nothing is linked, nothing grades "not ready",
-	// and the gauge publishes the same false zero by the other door. A team that
-	// dropped Linear must also stop publishing it.
-	if linearConfigured && linearState.gateKnown && linearState.linksKnown {
-		metrics.SetLinearNotReady(team.Name, st.LinearNotReady)
-	} else {
-		metrics.ClearLinearNotReady(team.Name)
-	}
-	if linearState.enabled {
-		metrics.SetLinearIssuesInReview(team.Name, linearState.inReviewCount)
-	} else {
-		// Unknown, so the series goes absent rather than stale or falsely zero —
-		// see metrics.ClearLinearIssuesInReview. Covers both the outage and the
-		// team that no longer declares linear_team_ids.
-		metrics.ClearLinearIssuesInReview(team.Name)
-	}
-	if failedRepos > 0 {
-		metrics.DigestSourceError(team.Name, metrics.SourceGitLab)
-	}
-	if linearDegraded {
-		metrics.DigestSourceError(team.Name, metrics.SourceLinear)
-	}
-
-	if gitLabUnavailable && (!linearConfigured || !linearState.enabled) {
-		// Nothing was learned at all, so there is no digest to build — as
-		// opposed to a partial one, which is a normal result.
-		err := fmt.Errorf("digest for team %q: all configured sources failed (GitLab repositories: %d, Linear configured: %t)", team.Name, failedRepos, linearConfigured)
+	if err := src.unusable(); err != nil {
 		s.recordDigestFailure(ctx, team, slot, day, attempt, reuseID, err)
 		metrics.DigestRun(team.Name, metrics.ResultError)
 		return nil, err
 	}
 
-	data, mrCount := s.digestData(ctx, team, snapshots, failedRepos, linearState)
-	if linearDegraded {
-		// The two warnings are not interchangeable. "could not be inspected"
-		// explains an absent count; with the count present it would read as a
-		// contradiction of the line right above it, and hide which half is stale.
-		// Selected on the specific fact that degraded rather than by elimination: a
-		// fifth failure mode added later must not silently inherit the fourth one's
-		// words. Each string may only claim what actually happened — the version that
-		// announced "every linked merge request was treated as ready for review"
-		// printed that above a row proving the opposite.
-		//
-		// The four arms are exhaustive over the errors gatherLinear can return today,
-		// so the `default` is unreachable. It stays as the landing place for that
-		// fifth mode, because the alternative is an empty warning string appended to
-		// a digest.
-		var warning string
-		switch {
-		case !linearState.enabled:
-			warning = "Partial data: Linear could not be inspected."
-		case !linearState.linksKnown:
-			warning = "Partial data: Linear issue links could not be resolved; the In Review count is current."
-		case linearState.gateDegradedLinks:
-			// "kept notifying reviewers" would be false for an already-approved merge
-			// request on that board: the completion rule reads the status *name*, which
-			// needs no ordering, so it can still silence everyone. "Not graded" is what
-			// actually happened in every case.
-			warning = "Partial data: a Linear board could not be ordered; merge requests linked to it were not graded against it."
-		case !linearState.gateKnown:
-			warning = "Partial data: a Linear board could not be ordered; no merge request in this digest was linked to it."
-		default:
-			warning = "Partial data: Linear could not be fully inspected."
-		}
-		data.Warnings = append(data.Warnings, warning)
-		s.log.Warnw("Linear could not be fully inspected for the digest",
-			"team", team.Name, "count_known", linearState.enabled,
-			"links_known", linearState.linksKnown, "gate_known", linearState.gateKnown,
-			"gate_affected_links", linearState.gateDegradedLinks, "err", linearErr)
-	}
-	messages := slack.BuildDigest(data)
+	// The builder's input is the preview's business; what gets persisted and
+	// delivered is the rendered payload.
+	_, messages, mrCount := s.renderDigest(ctx, src)
 
-	failedSources := failedRepos
-	if linearDegraded {
+	failedSources := src.failedRepos
+	if src.linearDegraded() {
 		failedSources++
 	}
 	status, messageStatus := digestStatuses(s.cfg.SlackSendEnabled, failedSources)
@@ -186,7 +101,7 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 		status:           status,
 		messageStatus:    messageStatus,
 		mrCount:          mrCount,
-		linearIssueCount: linearState.inReviewCount,
+		linearIssueCount: src.linear.inReviewCount,
 		messages:         messages,
 	})
 	if err != nil {
@@ -202,13 +117,205 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 	s.log.Infow("digest built",
 		"team", team.Name, "slot", slot, "run_date", day.Format(time.DateOnly), "attempt", attempt,
 		"status", status, "parts", len(messages), "mrs", mrCount,
-		"linear_issues", linearState.inReviewCount, "failed_repos", failedRepos, "linear_degraded", linearDegraded)
+		"linear_issues", src.linear.inReviewCount, "failed_repos", src.failedRepos,
+		"linear_degraded", src.linearDegraded())
 
-	out := &DigestOutcome{RunID: runID, Status: status, MRCount: mrCount, LinearIssueCount: linearState.inReviewCount}
+	out := &DigestOutcome{RunID: runID, Status: status, MRCount: mrCount, LinearIssueCount: src.linear.inReviewCount}
 	if s.cfg.SlackSendEnabled {
 		out.Messages = ids
 	}
 	return out, nil
+}
+
+// DigestPreview is one team's digest assembled but not recorded: no
+// digest_runs row, no digest_messages, no delivery job, no chat.postMessage.
+// It is what `digest --dry-run` prints.
+type DigestPreview struct {
+	Team domain.Team
+	// Data is the builder's input, kept alongside the rendered messages because
+	// it is the only place a Slack id can be traced back to the person it stands
+	// for — a terminal renders "<@U024BE7LH>", Slack renders a name.
+	Data     slack.DigestData
+	Messages []slack.Message
+	// MRCount is how many distinct merge requests the digest mentions.
+	MRCount          int
+	LinearIssueCount int
+	// FailedRepos and LinearErr are the same degradations BuildDigest turns into
+	// a 'partial' run. A preview has no status column to record them in, so it
+	// reports them instead.
+	FailedRepos int
+	LinearErr   error
+}
+
+// PreviewDigest assembles a team's digest and returns it without writing
+// anything anywhere.
+//
+// It is the same assembly BuildDigest performs — the same two sources, the same
+// classification, the same Block Kit renderer — with the persistence and the
+// delivery removed rather than reimplemented, which is what makes the preview
+// worth trusting: a second renderer would eventually disagree with the one that
+// ships.
+//
+// Two things a build does and a preview must not. It publishes no metrics: the
+// per-team gauges describe the *service's* view of a team, and a CLI process
+// that exits a second later would either report into a registry nobody scrapes
+// or, worse, teach an operator to read a number that a hand-run command moved.
+// And it takes no slot, so it can never collide with the digest_runs unique
+// index that stops two replicas double-sending a slot.
+func (s *Service) PreviewDigest(ctx context.Context, team domain.Team) (*DigestPreview, error) {
+	src := s.gatherDigestSources(ctx, team)
+	if err := src.unusable(); err != nil {
+		return nil, err
+	}
+	data, messages, mrCount := s.renderDigest(ctx, src)
+	return &DigestPreview{
+		Team:             team,
+		Data:             data,
+		Messages:         messages,
+		MRCount:          mrCount,
+		LinearIssueCount: src.linear.inReviewCount,
+		FailedRepos:      src.failedRepos,
+		LinearErr:        src.linearErr,
+	}, nil
+}
+
+// digestSources is everything one digest read before anything was rendered. It
+// exists so the scheduled build and the CLI preview cannot drift: both gather
+// through gatherDigestSources and render through renderDigest, and the only
+// difference between them is what happens to the result.
+type digestSources struct {
+	team        domain.Team
+	snapshots   []domain.MergeRequestSnapshot
+	failedRepos int
+	linear      linearDigestState
+	// linearErr is the failure gatherLinear reported, or nil. It is not itself
+	// the degradation flag — see linearDegraded.
+	linearErr error
+}
+
+// gatherDigestSources reads GitLab and then Linear for one team.
+func (s *Service) gatherDigestSources(ctx context.Context, team domain.Team) digestSources {
+	snapshots, failedRepos := s.gatherTeam(ctx, team)
+	linearState, linearErr := s.gatherLinear(ctx, team, snapshots)
+	return digestSources{
+		team: team, snapshots: snapshots, failedRepos: failedRepos,
+		linear: linearState, linearErr: linearErr,
+	}
+}
+
+// linearConfigured reports whether this team declares any Linear team at all. A
+// deployment without linear_team_ids can neither degrade nor warn.
+func (src digestSources) linearConfigured() bool { return len(src.team.LinearTeamIDs) > 0 }
+
+// linearDegraded asks whether anything about Linear failed, and drives the
+// partial status and the warning. It is a different question from
+// linear.enabled, which asks whether the board total actually arrived and is the
+// only one allowed to decide that Linear contributed nothing at all.
+func (src digestSources) linearDegraded() bool {
+	return src.linearConfigured() && src.linearErr != nil
+}
+
+// unusable reports the one case where there is no digest to build at all, as
+// opposed to a partial one, which is a normal result: every repository failed
+// and Linear either is not configured or did not answer either.
+func (src digestSources) unusable() error {
+	gitLabUnavailable := src.failedRepos > 0 && len(src.snapshots) == 0 && len(src.team.Repositories) > 0
+	if !gitLabUnavailable || (src.linearConfigured() && src.linear.enabled) {
+		return nil
+	}
+	return fmt.Errorf("digest for team %q: all configured sources failed (GitLab repositories: %d, Linear configured: %t)",
+		src.team.Name, src.failedRepos, src.linearConfigured())
+}
+
+// publishDigestMetrics sets everything one build owns.
+//
+// This is the only place that sees a whole team at once, so it is the only place
+// that can set the per-team gauges honestly — overwritten every pass, including
+// when every count is zero, because a team that drops to zero must report zero
+// rather than keep its last non-zero value forever.
+func (s *Service) publishDigestMetrics(src digestSources) {
+	team := src.team
+	st := teamState(src.snapshots, src.linear)
+	metrics.SetTeamState(team.Name, st)
+	// Same rule as the count below, for the same reason: the count is a hard zero
+	// whenever the gate could not run, which is the claim "nothing is stuck before
+	// In Review" at exactly the moment the service stopped being able to tell — and
+	// the same build pushes those merge requests back onto reviewers, so
+	// waiting_human_review jumps in the same scrape and the pair reads as work
+	// moving forward.
+	//
+	// **Both** halves have to be known, and gateKnown alone is not enough: it is
+	// decided before the batch lookup, so a failed ListIssuesByNumbers leaves it
+	// true with an empty linksByMR — nothing is linked, nothing grades "not ready",
+	// and the gauge publishes the same false zero by the other door. A team that
+	// dropped Linear must also stop publishing it.
+	if src.linearConfigured() && src.linear.gateKnown && src.linear.linksKnown {
+		metrics.SetLinearNotReady(team.Name, st.LinearNotReady)
+	} else {
+		metrics.ClearLinearNotReady(team.Name)
+	}
+	if src.linear.enabled {
+		metrics.SetLinearIssuesInReview(team.Name, src.linear.inReviewCount)
+	} else {
+		// Unknown, so the series goes absent rather than stale or falsely zero —
+		// see metrics.ClearLinearIssuesInReview. Covers both the outage and the
+		// team that no longer declares linear_team_ids.
+		metrics.ClearLinearIssuesInReview(team.Name)
+	}
+	if src.failedRepos > 0 {
+		metrics.DigestSourceError(team.Name, metrics.SourceGitLab)
+	}
+	if src.linearDegraded() {
+		metrics.DigestSourceError(team.Name, metrics.SourceLinear)
+	}
+}
+
+// renderDigest classifies the gathered sources and renders the Slack messages,
+// returning the builder's input alongside them and how many distinct merge
+// requests the digest mentions.
+func (s *Service) renderDigest(ctx context.Context, src digestSources) (slack.DigestData, []slack.Message, int) {
+	team := src.team
+	data, mrCount := s.digestData(ctx, team, src.snapshots, src.failedRepos, src.linear)
+	if src.linearDegraded() {
+		data.Warnings = append(data.Warnings, linearWarning(src.linear))
+		s.log.Warnw("Linear could not be fully inspected for the digest",
+			"team", team.Name, "count_known", src.linear.enabled,
+			"links_known", src.linear.linksKnown, "gate_known", src.linear.gateKnown,
+			"gate_affected_links", src.linear.gateDegradedLinks, "err", src.linearErr)
+	}
+	return data, slack.BuildDigest(data), mrCount
+}
+
+// linearWarning names the degradation that actually happened.
+//
+// The four are not interchangeable. "could not be inspected" explains an absent
+// count; with the count present it would read as a contradiction of the line
+// right above it, and hide which half is stale. Selected on the specific fact
+// that degraded rather than by elimination: a fifth failure mode added later must
+// not silently inherit the fourth one's words. Each string may only claim what
+// actually happened — the version that announced "every linked merge request was
+// treated as ready for review" printed that above a row proving the opposite.
+//
+// The four arms are exhaustive over the errors gatherLinear can return today, so
+// the default is unreachable. It stays as the landing place for that fifth mode,
+// because the alternative is an empty warning string appended to a digest.
+func linearWarning(state linearDigestState) string {
+	switch {
+	case !state.enabled:
+		return "Partial data: Linear could not be inspected."
+	case !state.linksKnown:
+		return "Partial data: Linear issue links could not be resolved; the In Review count is current."
+	case state.gateDegradedLinks:
+		// "kept notifying reviewers" would be false for an already-approved merge
+		// request on that board: the completion rule reads the status *name*, which
+		// needs no ordering, so it can still silence everyone. "Not graded" is what
+		// actually happened in every case.
+		return "Partial data: a Linear board could not be ordered; merge requests linked to it were not graded against it."
+	case !state.gateKnown:
+		return "Partial data: a Linear board could not be ordered; no merge request in this digest was linked to it."
+	default:
+		return "Partial data: Linear could not be fully inspected."
+	}
 }
 
 // digestStatuses maps the run's circumstances onto the two status columns.

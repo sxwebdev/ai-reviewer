@@ -742,7 +742,10 @@ func (a *App) checkSlack(ctx context.Context, col *checkCollector) {
 		return
 	}
 
-	client, err := slack.New(slack.Config{Token: a.Config.Slack.Token.Unmask()})
+	client, err := slack.New(slack.Config{
+		Token:    a.Config.Slack.Token.Unmask(),
+		AppToken: a.Config.Slack.AppToken.Unmask(),
+	})
 	if err != nil {
 		col.add("slack", StatusFail, "%s", err)
 		return
@@ -772,6 +775,46 @@ func (a *App) checkSlack(ctx context.Context, col *checkCollector) {
 	}
 
 	checkSlackDirectory(ctx, col, client, a.Config.Slack.UserMap)
+	a.checkSlackCommands(ctx, col, client)
+}
+
+// checkSlackCommands probes the in-chat commands: the app-level token, and the
+// names the workspace has to have registered.
+//
+// Both halves are invisible until somebody types a command and nothing happens.
+// The token is checked by opening a Socket Mode connection URL and not dialling
+// it — apps.connections.open is the only method that accepts an app-level token,
+// so it is also the only way to tell a valid one from a typo. The ticket it hands
+// back expires unused, which costs nothing.
+//
+// The command names cannot be verified from here at all: Slack has no API that
+// lists an app's slash commands, and they are registered in the app
+// configuration rather than by this service. So they are printed — that is what
+// makes "we typed /digest" answerable against "this deployment answers /all".
+func (a *App) checkSlackCommands(ctx context.Context, col *checkCollector, client *slack.Client) {
+	if !a.Config.Slack.AppToken.IsSet() {
+		col.add("slack commands", StatusWarn,
+			"off: slack.app_token is empty, so no Socket Mode connection is opened and %s / %s answer nothing",
+			a.Config.Slack.Commands.Team, a.Config.Slack.Commands.Mine)
+		return
+	}
+	if _, err := client.OpenSocketURL(ctx); err != nil {
+		var apiErr *slack.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "not_allowed_token_type" {
+			// The single most likely mistake: a bot token pasted into app_token.
+			// Both tokens are needed and only one of them opens a socket.
+			col.add("slack commands", StatusFail,
+				"slack.app_token is not an app-level token — Socket Mode needs the xapp-… token "+
+					"from the app's Basic Information page (scope connections:write), not the bot token")
+			return
+		}
+		col.add("slack commands", StatusFail, "apps.connections.open: %s", security.Mask(err.Error()))
+		return
+	}
+	col.add("slack commands", StatusOK,
+		"Socket Mode is reachable; this deployment answers %s (team digest, posted to the channel) "+
+			"and %s (the caller's own rows, shown only to them)",
+		a.Config.Slack.Commands.Team, a.Config.Slack.Commands.Mine)
 }
 
 // checkSlackDirectory reads the workspace directory and resolves every user_map
