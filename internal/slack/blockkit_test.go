@@ -1190,6 +1190,10 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 					StartLinear: true, LinearIdentifier: "PAY-5",
 					LinearWebURL: "https://linear.app/PAY-5", LinearState: "In Progress",
 				},
+				{
+					IID: 23, Title: "CHAIN-6 f", WebURL: "https://gl/23",
+					AddReviewer: true,
+				},
 			},
 		}},
 	}
@@ -1198,7 +1202,7 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 	// is to this person; the rest name what to do about it.
 	openers := []string{"review ", "your MR "}
 	imperatives := []string{
-		"waiting ", "address ", "resolve ", "fix ", "move ",
+		"waiting ", "address ", "resolve ", "fix ", "move ", "add ",
 	}
 	hasAny := func(s string, prefixes []string) bool {
 		for _, p := range prefixes {
@@ -1211,8 +1215,8 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
 	lines := strings.Split(body, "\n")
-	if len(lines) != 6 { // the person head, two reviews, three own merge requests
-		t.Fatalf("lines = %d, want 6:\n%s", len(lines), body)
+	if len(lines) != 7 { // the person head, two reviews, four own merge requests
+		t.Fatalf("lines = %d, want 7:\n%s", len(lines), body)
 	}
 	for _, line := range lines[1:] {
 		segments := strings.Split(line, " · ")
@@ -1349,3 +1353,71 @@ func TestOnlyPersonMissesQuietlyAndSafely(t *testing.T) {
 
 // got2 is a tiny helper so the two-value call above reads as one expression.
 func got2(d slack.DigestData, ok bool) (slack.DigestData, bool) { return d, ok }
+
+// TestAddReviewerRowIsRenderedFirst pins both halves of the untagged-MR row: it
+// says the action in words, and it comes before every other flag. The order is
+// the point — an MR with no reviewer and a failed pipeline is not a pipeline
+// problem, it is work that will still be unreviewed once the pipeline is green.
+func TestAddReviewerRowIsRenderedFirst(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			// Every flag that can share a row with it, so the assertion pins the
+			// position against each one — changes-requested in particular, which is
+			// the nearest neighbour and the one a careless edit would swap it with.
+			Own: []slack.AuthorItem{{
+				IID: 30, Title: "CHAIN-9 z", WebURL: "https://gl/30",
+				AddReviewer:        true,
+				ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}},
+				UnresolvedThreads:  2,
+				MergeConflicts:     true,
+				PipelineFailed:     true,
+				PipelineWebURL:     "https://gl/p/30",
+				MoveLinear:         true,
+				LinearIdentifier:   "PAY-9",
+				LinearWebURL:       "https://linear.app/PAY-9",
+			}},
+		}},
+	}
+
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+	row := strings.Split(body, "\n")[1]
+	segments := strings.Split(row, " · ")
+	if len(segments) < 2 {
+		t.Fatalf("row carries no flags: %q", row)
+	}
+	if !strings.Contains(segments[1], "add a reviewer") {
+		t.Errorf("first flag = %q, want the missing reviewer named first", segments[1])
+	}
+	for _, want := range []string{
+		"address changes requested by", "resolve 2 threads",
+		"fix merge conflicts", "fix the failed", "move ",
+	} {
+		if !strings.Contains(row, want) {
+			t.Errorf("flag %q must survive alongside it: %q", want, row)
+		}
+	}
+}
+
+// TestAddReviewerRowStandsAlone: an untagged merge request has, by definition,
+// nothing else wrong with it, so the flag has to carry a whole row by itself —
+// otherwise the one case the rule exists for renders as a bare link.
+func TestAddReviewerRowStandsAlone(t *testing.T) {
+	t.Parallel()
+
+	d := slack.DigestData{
+		Team: "payments", Project: "payments",
+		People: []slack.PersonDigest{{
+			Person: slack.Mention{SlackID: "U1"},
+			Own:    []slack.AuthorItem{{IID: 31, Title: "CHAIN-10 y", WebURL: "https://gl/31", AddReviewer: true}},
+		}},
+	}
+	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
+	row := strings.Split(body, "\n")[1]
+	if !strings.Contains(row, "your MR ") || !strings.Contains(row, "add a reviewer") {
+		t.Errorf("row = %q, want it to name the MR as the author's and the action to take", row)
+	}
+}

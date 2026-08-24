@@ -186,6 +186,15 @@ var (
 		Help: "Open merge requests with known merge conflicts.",
 	}, []string{"team"})
 
+	// MergeRequestsWithoutReviewers is the queue nobody can see from the queue
+	// metrics: these merge requests are in no reviewer's list, so they never
+	// appear in waiting_human_review however long they sit. A number that stays
+	// up is a team habit, not a backlog.
+	MergeRequestsWithoutReviewers = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "merge_requests_without_reviewers_total",
+		Help: "Open merge requests with no reviewer assigned and no approval.",
+	}, []string{"team"})
+
 	// MergeRequestsLinearNotReady is the answer to "why is nobody reviewing my
 	// merge request": its Linear card is still parked before In Review, so the
 	// digest asked its author to move it instead of asking reviewers to look. It
@@ -402,6 +411,10 @@ type TeamState struct {
 	UnresolvedThreads int
 	Conflicts         int
 	FailedPipeline    int
+	// NoReviewers is merge requests whose author never tagged anybody. Counted
+	// after the Linear readiness gate, so it matches the rows the digest actually
+	// renders rather than the raw GitLab fact.
+	NoReviewers int
 	// LinearNotReady is merge requests the Linear readiness gate parked with their
 	// author because the card has not reached In Review. It is the counterpart of
 	// WaitingHumanReview and the two are mutually exclusive per merge request, so
@@ -431,6 +444,7 @@ func SetTeamState(team string, s TeamState) {
 	MergeRequestsWithUnresolvedThreads.WithLabelValues(team).Set(float64(s.UnresolvedThreads))
 	MergeRequestsWithConflicts.WithLabelValues(team).Set(float64(s.Conflicts))
 	MergeRequestsWithFailedPipeline.WithLabelValues(team).Set(float64(s.FailedPipeline))
+	MergeRequestsWithoutReviewers.WithLabelValues(team).Set(float64(s.NoReviewers))
 	MergeRequestsWithUnknownApprovals.WithLabelValues(team).Set(float64(s.ApprovalsUnknown))
 }
 

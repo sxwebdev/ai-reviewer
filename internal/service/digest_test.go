@@ -1556,3 +1556,70 @@ func TestPreviewDigestFailsWhenEverySourceDid(t *testing.T) {
 		t.Fatal("a preview with no readable source must fail, not render an empty digest")
 	}
 }
+
+// TestDigestNamesAnUntaggedMergeRequest: an MR whose author forgot to tag anyone
+// is in no reviewer's queue, so before this rule it appeared in neither section
+// of the digest — the one list of everything the team owes said nothing about
+// work nobody had been handed.
+func TestDigestNamesAnUntaggedMergeRequest(t *testing.T) {
+	// The matcher goes in as an option: harness options run before the service is
+	// built, and assigning h.matcher afterwards leaves the service holding the
+	// default one.
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }),
+		func(h *harness) {
+			h.matcher = stubMatcher{results: map[string]match.Result{
+				"author": {Status: match.Matched, SlackID: "U01", Display: "Ann"},
+			}}
+		})
+
+	proj := testProject()
+	// No reviewers, no approvals, and nothing else wrong with it: the row exists
+	// only because nobody was asked.
+	seedGitLab(h.fake, proj, testMR(testMRIID))
+
+	p, err := h.svc.PreviewDigest(t.Context(), testTeamConfig())
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	if p.MRCount != 1 {
+		t.Fatalf("mr count = %d, want the untagged merge request counted", p.MRCount)
+	}
+	if len(p.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(p.Messages))
+	}
+	body := renderedText(p.Messages[0])
+	for _, want := range []string{"add a reviewer", "your MR ", "<@U01>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("digest does not contain %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestDigestStaysQuietAboutATaggedMergeRequest is the other half: the rule must
+// not fire on an MR that simply has not been reviewed yet. That one is already
+// in its reviewer's queue, and telling the author to add a reviewer would ask
+// them to fix something that is not broken.
+func TestDigestStaysQuietAboutATaggedMergeRequest(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }),
+		func(h *harness) {
+			h.matcher = stubMatcher{results: map[string]match.Result{
+				"reviewer": {Status: match.Matched, SlackID: "U42", Display: "Rita"},
+				"author":   {Status: match.Matched, SlackID: "U01", Display: "Ann"},
+			}}
+		})
+
+	proj := testProject()
+	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
+	seedGitLab(h.fake, proj, testMR(testMRIID, withReviewers(reviewer)))
+
+	p, err := h.svc.PreviewDigest(t.Context(), testTeamConfig())
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	if len(p.Messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(p.Messages))
+	}
+	if body := renderedText(p.Messages[0]); strings.Contains(body, "add a reviewer") {
+		t.Errorf("a tagged merge request must not ask for a reviewer:\n%s", body)
+	}
+}

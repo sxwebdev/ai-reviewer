@@ -527,6 +527,11 @@ func TestClassifyAuthorActions(t *testing.T) {
 			s.Discussions = c.discussions
 			s.Mergeability = c.mergeability
 			s.Pipeline = c.pipeline
+			// Every case here is about a merge request somebody was asked to look
+			// at; the untagged case is a rule of its own, in TestNoReviewersAssigned.
+			// Without this the whole table would carry NoReviewers: true and say
+			// nothing about the flags it exists to check.
+			s.Reviewers = []Reviewer{{User: reviewerUser, State: ReviewStateReviewed}}
 
 			got := ClassifyAuthorActions(s)
 			if !reflect.DeepEqual(got, c.want) {
@@ -704,5 +709,109 @@ func TestUncommentedVerdictIsReachableAfterAPush(t *testing.T) {
 				t.Error("after the author pushes, the reviewer owes the next look")
 			}
 		})
+	}
+}
+
+// TestNoReviewersAssigned pins the rule that puts an untagged merge request into
+// the digest at all. Before it, such an MR was in neither section: no reviewer
+// means NeedsHumanReview asks nobody, and none of the other author actions
+// describe an MR whose only problem is that nothing has happened to it.
+func TestNoReviewersAssigned(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		mutate  func(*MergeRequestSnapshot)
+		want    bool
+		wantWhy string
+	}{
+		{
+			"nobody was asked and nobody approved",
+			func(*MergeRequestSnapshot) {},
+			true,
+			"the whole point of the rule",
+		},
+		{
+			"a reviewer is assigned",
+			func(s *MergeRequestSnapshot) {
+				s.Reviewers = []Reviewer{{User: reviewerUser, State: ReviewStateUnreviewed}}
+			},
+			false,
+			"somebody was asked; whether they answered is NeedsHumanReview's question",
+		},
+		{
+			// The reviewer is done, but they were still tagged: this MR is not the
+			// one nobody was handed.
+			"a reviewer is assigned and has reviewed",
+			func(s *MergeRequestSnapshot) {
+				s.Reviewers = []Reviewer{{User: reviewerUser, State: ReviewStateReviewed}}
+			},
+			false,
+			"an answered review is not an untagged merge request",
+		},
+		{
+			"approved without ever being assigned",
+			func(s *MergeRequestSnapshot) {
+				s.ApprovedBy = []User{reviewerUser}
+				s.ApprovalsKnown = true
+			},
+			false,
+			"it was reviewed anyway; asking for a reviewer asks for a second review",
+		},
+		{
+			// The unreadable-/approvals case: ApprovedBy is empty because the
+			// question could not be asked. This rule reads that as "no approval" on
+			// purpose — an extra line is visibly wrong to the author, silence is not.
+			"approvals unreadable",
+			func(s *MergeRequestSnapshot) { s.ApprovalsKnown = false },
+			true,
+			"fails open into saying something",
+		},
+		{
+			"draft",
+			func(s *MergeRequestSnapshot) { s.MR.Draft = true },
+			false,
+			"a draft with no reviewer is an author still working",
+		},
+		{
+			"merged",
+			func(s *MergeRequestSnapshot) { s.MR.State = "merged" },
+			false,
+			"the digest lists actions somebody can still take",
+		},
+		{
+			"closed",
+			func(s *MergeRequestSnapshot) { s.MR.State = "closed" },
+			false,
+			"the digest lists actions somebody can still take",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			s := openSnap()
+			c.mutate(&s)
+			if got := NoReviewersAssigned(s); got != c.want {
+				t.Errorf("NoReviewersAssigned = %v, want %v (%s)", got, c.want, c.wantWhy)
+			}
+			// The flag has to reach the digest through the aggregate, which is the
+			// only thing digestData reads.
+			if got := ClassifyAuthorActions(s).NoReviewers; got != c.want {
+				t.Errorf("ClassifyAuthorActions().NoReviewers = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestNoReviewersAloneIsAnAuthorAction: the flag is worthless if it does not put
+// the merge request in the digest by itself — an untagged MR has, by definition,
+// nothing else wrong with it yet.
+func TestNoReviewersAloneIsAnAuthorAction(t *testing.T) {
+	t.Parallel()
+	s := openSnap()
+	s.Mergeability = Mergeability{DetailedStatus: "mergeable", Known: true}
+	if !NeedsAuthorAction(s) {
+		t.Error("an untagged merge request must belong to its author's section on its own")
 	}
 }

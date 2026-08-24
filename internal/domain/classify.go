@@ -307,9 +307,15 @@ func normalizeStatus(s string) string { return strings.ToLower(strings.TrimSpace
 // digest (changes requested → threads → conflicts → pipeline, plan §13.3) so the
 // rendering stays identical from day to day.
 type AuthorActions struct {
+	// NoReviewers is set when nobody was ever asked to look at this merge
+	// request. It is rendered first because it explains the rest: an MR with no
+	// reviewer is not slow, it is not in anyone's queue at all, and every other
+	// flag on the row describes work that will still not be reviewed once it is
+	// done.
+	NoReviewers bool
 	// ChangesRequestedBy are the reviewers whose REQUESTED_CHANGES verdict still
-	// stands. First, because it outranks a thread count: "a reviewer asked for
-	// changes" is the strongest thing the digest can tell an author.
+	// stands. Ahead of a thread count: "a reviewer asked for changes" is the
+	// strongest thing the digest can tell an author about work in flight.
 	ChangesRequestedBy []User
 	UnresolvedThreads  int
 	HasConflicts       bool
@@ -319,7 +325,8 @@ type AuthorActions struct {
 
 // Any reports whether the MR belongs in the digest's "Author actions" section.
 func (a AuthorActions) Any() bool {
-	return len(a.ChangesRequestedBy) > 0 || a.UnresolvedThreads > 0 || a.HasConflicts || a.PipelineFailed
+	return a.NoReviewers || len(a.ChangesRequestedBy) > 0 ||
+		a.UnresolvedThreads > 0 || a.HasConflicts || a.PipelineFailed
 }
 
 // ClassifyAuthorActions runs the author-facing classifiers over one snapshot.
@@ -327,6 +334,7 @@ func (a AuthorActions) Any() bool {
 // reported as "no action" — the digest only ever states things it is sure of.
 func ClassifyAuthorActions(s MergeRequestSnapshot) AuthorActions {
 	a := AuthorActions{
+		NoReviewers:        NoReviewersAssigned(s),
 		ChangesRequestedBy: changesRequestedBy(s),
 		UnresolvedThreads:  UnresolvedThreads(s),
 	}
@@ -371,6 +379,39 @@ func changesRequestedBy(s MergeRequestSnapshot) []User {
 		out = append(out, r.User)
 	}
 	return out
+}
+
+// NoReviewersAssigned reports that this merge request was never handed to
+// anybody: no reviewer is assigned and no approval exists.
+//
+// It is the one author action about work that is *not* stuck — it is work nobody
+// has been asked to start. Without it such an MR appears in neither section of
+// the digest: NeedsHumanReview iterates s.Reviewers and an empty list asks
+// nobody, while every other author action describes a problem the MR does not
+// have yet. So it sat in "opened" indefinitely, and the digest — the list of
+// everything the team owes — said nothing at all about it.
+//
+// Both halves are required by the rule this implements: an MR that was never
+// tagged but *has* an approval was reviewed anyway, by somebody who did not need
+// the assignment, and telling its author to add a reviewer would ask for a
+// second review of finished work.
+//
+// ApprovalsKnown is deliberately not consulted, and the empty ApprovedBy of an
+// unreadable /approvals endpoint therefore reads as "no approval" here. That is
+// the fail-open direction for *this* rule and the opposite of the one
+// needsReviewerAction takes, because the two hide different things: suppressing
+// a reviewer notification hides work, whereas an extra "add a reviewer" on an MR
+// that turns out to be approved costs one line and is visibly wrong to the one
+// person who can check. Silence about an untagged MR is not.
+//
+// Drafts and closed MRs are excluded by the same guard every other author rule
+// opens with: a draft with no reviewer is not a mistake, it is an author still
+// working.
+func NoReviewersAssigned(s MergeRequestSnapshot) bool {
+	if !s.MR.IsOpen() || s.MR.Draft {
+		return false
+	}
+	return len(s.Reviewers) == 0 && len(s.ApprovedBy) == 0
 }
 
 // NeedsAuthorAction is the shorthand predicate for "this MR belongs in

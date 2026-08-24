@@ -119,17 +119,22 @@ type ReviewItem struct {
 }
 
 // AuthorItem is one MR needing action from its author. Rows render in a fixed
-// order — requested changes, threads, conflicts, pipeline, Linear board — so
-// the digest reads the same way every day.
+// order — add a reviewer, requested changes, threads, conflicts, pipeline,
+// Linear board — so the digest reads the same way every day.
 type AuthorItem struct {
 	Project string
 	IID     int64
 	Title   string
 	WebURL  string
+	// AddReviewer is set when nobody was ever asked to look at this merge
+	// request: no reviewer assigned, no approval. Rendered first because it
+	// explains every other flag on the row — none of that work is queued with
+	// anyone until this is fixed.
+	AddReviewer bool
 	// ChangesRequestedBy are the reviewers whose "Request changes" verdict still
-	// stands. Rendered first: it outranks a thread count, and it used to be
-	// invisible — the author saw "3 unresolved threads" and no mention that
-	// somebody had formally asked for changes.
+	// stands. Ahead of a thread count, and it used to be invisible — the author
+	// saw "3 unresolved threads" and no mention that somebody had formally asked
+	// for changes.
 	ChangesRequestedBy []Mention
 	UnresolvedThreads  int
 	MergeConflicts     bool
@@ -589,9 +594,15 @@ func reviewEntry(mr ReviewItem, withProject bool) string {
 }
 
 // authorEntry renders one of the author's own merge requests on a single line,
-// with the flags in a fixed order — changes requested, threads, conflicts,
-// pipeline, advance the Linear card, move the Linear card to In Review — so the
-// digest reads the same way every day.
+// with the flags in a fixed order — add a reviewer, changes requested, threads,
+// conflicts, pipeline, advance the Linear card, move the Linear card to In
+// Review — so the digest reads the same way every day.
+//
+// "Add a reviewer" leads, and that is the one position in this list with an
+// argument behind it rather than a convention: an MR nobody was handed is not a
+// pipeline problem or a thread problem, it is work that will still be unreviewed
+// once those are fixed. Pinned by TestAddReviewerRowIsRenderedFirst, against
+// every flag that can share a row with it.
 //
 // Every flag is the imperative form of what the author has to do. The two that
 // already were ("conflicts", "pipeline") were the only ones a reader could act
@@ -604,11 +615,16 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 	b.WriteString(link(mr.WebURL, mrRef(mr.IID)))
 	if withProject {
 		if p := escape(strings.TrimSpace(mr.Project)); p != "" {
-			b.WriteString(" _" + p + "_")
+			b.WriteString(" _")
+			b.WriteString(p)
+			b.WriteString("_")
 		}
 	}
 
 	var flags []string
+	if mr.AddReviewer {
+		flags = append(flags, "👤 add a reviewer")
+	}
 	if len(mr.ChangesRequestedBy) > 0 {
 		names := make([]string, 0, len(mr.ChangesRequestedBy))
 		for _, m := range mr.ChangesRequestedBy {

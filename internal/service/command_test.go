@@ -147,9 +147,16 @@ func TestSlackCommandMineNamesBothReasonsForAnEmptyAnswer(t *testing.T) {
 func TestSlackCommandOnAQuietTeamSaysSo(t *testing.T) {
 	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
 	proj := testProject()
-	// One merge request that needs nothing from anybody: no reviewers, no
-	// threads, no conflicts, no pipeline.
+	// One merge request that needs nothing from anybody: already approved, no
+	// threads, no conflicts, no pipeline. The approval is what makes it quiet
+	// rather than untagged — a merge request nobody was ever handed is itself an
+	// author action (domain.NoReviewersAssigned), so without it this would test
+	// the empty-answer notice against a digest that is not empty.
 	seedGitLab(h.fake, proj, testMR(testMRIID))
+	setApprovals(h.fake, proj, testMRIID, &gitlab.Approvals{
+		Approved:   true,
+		ApprovedBy: []gitlab.ApprovedBy{{User: gitlab.User{ID: 42, Username: "reviewer"}}},
+	})
 
 	err := h.svc.RunSlackCommand(t.Context(), SlackCommandRequest{
 		Team: testTeamConfig(), Scope: ScopeTeam,

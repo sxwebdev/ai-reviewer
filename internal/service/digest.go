@@ -666,6 +666,12 @@ func teamState(snapshots []domain.MergeRequestSnapshot, linearState linearDigest
 		if actions.PipelineFailed {
 			st.FailedPipeline++
 		}
+		// The gated answer, not actions.NoReviewers: a gauge that counted merge
+		// requests the digest deliberately says nothing about would contradict the
+		// message it is meant to explain.
+		if needsReviewerTag(snap, link, linked) {
+			st.NoReviewers++
+		}
 	}
 	return st
 }
@@ -749,6 +755,11 @@ func (s *Service) digestData(
 		actions := domain.ClassifyAuthorActions(snap)
 		moveLinear := needsLinearMove(snap, link, linked)
 		startLinear := needsLinearStart(snap, link, linked)
+		// The board can withdraw this one flag, and only this one: an MR whose card
+		// has not been offered for review was not forgotten. Whenever it does,
+		// startLinear is true by construction, so the row still exists and still
+		// says what to do — see needsReviewerTag.
+		addReviewer := needsReviewerTag(snap, link, linked)
 		if !actions.Any() && !moveLinear && !startLinear {
 			continue
 		}
@@ -765,6 +776,7 @@ func (s *Service) digestData(
 			IID:                snap.MR.IID,
 			Title:              snap.MR.Title,
 			WebURL:             snap.MR.WebURL,
+			AddReviewer:        addReviewer,
 			ChangesRequestedBy: requested,
 			UnresolvedThreads:  actions.UnresolvedThreads,
 			MergeConflicts:     actions.HasConflicts,

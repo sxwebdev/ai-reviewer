@@ -212,13 +212,15 @@ have not delivered, then their own merge requests that need work.
 🛠 your MR !1378 · 💬 resolve 6 threads — CHAIN-122 Consolidation deposit detection
 🛠 your MR !1366 · 💬 resolve 3 threads · ⚠️ fix merge conflicts — CHAIN-184 Scheduler…
 🛠 your MR !1375 · 🔁 address changes requested by @apyshinskii — CHAIN-203 Delegator…
+🛠 your MR !1741 · 👤 add a reviewer — Document CONCURRENTLY migration pattern in…
 ```
 
 Reading it:
 
 - **Every row names the action it asks for**, and every flag is an imperative:
-  `review`, `your MR`, `resolve N threads`, `fix merge conflicts`,
-  `fix the failed pipeline`, `move CHAIN-N to In Review`. The icons are there to
+  `review`, `your MR`, `add a reviewer`, `resolve N threads`,
+  `fix merge conflicts`, `fix the failed pipeline`,
+  `move CHAIN-N to In Review`. The icons are there to
   make the list scannable once you know them — they are not what carries the
   meaning, because a digest whose rows have to be decoded is one nobody reads
   twice.
@@ -231,8 +233,20 @@ Reading it:
   classify; they do not filter, and the row spells the wait out as
   `waiting 10d` beside them.
 - **Own merge requests** are the `🛠 your MR` rows, with the flags in a fixed
-  order: changes requested → threads → conflicts → pipeline → advance Linear
-  card → move Linear card to In Review.
+  order: add a reviewer → changes requested → threads → conflicts → pipeline →
+  advance Linear card → move Linear card to In Review.
+- **`👤 add a reviewer` is the row for a merge request nobody was ever handed**:
+  open, not a draft, no reviewer assigned and no approval. It comes first because
+  it explains the rest — an MR with no reviewer and a failed pipeline is not a
+  pipeline problem, it is work that will still be unreviewed once the pipeline is
+  green. Such an MR used to appear in *neither* section of the digest: with an
+  empty reviewer list there is nobody to put it in a queue, and it has none of
+  the other problems yet. If the merge request has a Linear card that has not
+  reached In Review the flag is dropped and the row says `move … to In Review`
+  instead — the card was never offered, so nothing was forgotten.
+  `merge_requests_without_reviewers_total{team}` is the same count as a gauge; a
+  number that stays up is a team habit rather than a backlog, and it is invisible
+  in `merge_requests_waiting_human_review_total` by construction.
 - **The project name** sits in the title when the digest covers one repository,
   and moves into each row when it covers several — it is what tells two `!1404`s
   apart.
@@ -491,7 +505,7 @@ Metrics worth alerting on:
 | `ai_reviewer_linear_issues_in_review{team}` | last successfully collected Linear issue count |
 | `ai_reviewer_digest_source_errors_total{team,source}` | source failures that degraded a digest |
 | `merge_requests_scanned_total{team}`               | counter: open MRs inspected                    |
-| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}` | per-team **gauges**, rewritten on every digest build — once per slot, not every scan, because the classification needs a whole team at once. A flat line between two slots is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
+| `merge_requests_waiting_human_review_total{team}`, `merge_requests_with_changes_requested_total{team}`, `merge_requests_with_unresolved_threads_total{team}`, `merge_requests_with_conflicts_total{team}`, `merge_requests_with_failed_pipeline_total{team}`, `merge_requests_without_reviewers_total{team}` | per-team **gauges**, rewritten on every digest build — once per slot, not every scan, because the classification needs a whole team at once. A flat line between two slots is correct. The first two split the queue: waiting-on-reviewers versus waiting-on-authors |
 | `merge_requests_linear_not_ready_total{team}` | gauge, same cadence: merge requests the readiness gate parked with their author because the card has not reached `In Review`. The mutually exclusive counterpart of `waiting_human_review`, so an empty review queue can be read against it. A number that stays up means the team routinely opens merge requests without moving the board |
 | `merge_requests_with_unknown_approvals_total{team}` | gauge, same cadence: merge requests whose approvals GitLab refused to report. Zero is the only healthy value; a value that stays non-zero across slots means the endpoint is refused rather than flaky, and both Linear completion rules are inert |
 | `linear_gate_ambiguous_total{team}` | **counter**: merge requests whose readiness gate was skipped because they named Linear issues at different statuses. Meant to be rare — the identifier match yields candidates, not identifiers, so an ordinary branch name can contribute a second issue when the workspace owns a team with that key |

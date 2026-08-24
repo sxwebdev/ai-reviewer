@@ -204,7 +204,7 @@ example — it is why `internal/service` never imports River).
   and X was never asked to look again. Zero now means "no note of any kind was
   readable", the residual case, and it still parks the MR with the author.
 - **Every digest row names its action, in the imperative.** `review !1369`,
-  `your MR !1366`, `resolve 3 threads`, `fix merge conflicts`,
+  `your MR !1366`, `add a reviewer`, `resolve 3 threads`, `fix merge conflicts`,
   `fix the failed pipeline`, `move CHAIN-184 to In Review`. The icons stay
   because they make a long list scannable, but they may never be the only thing
   a row says: the two kinds of row sit in the same block, one under the other,
@@ -215,6 +215,37 @@ example — it is why `internal/service` never imports River).
   icon. The compressed tail is the one exception and states the rule: it names
   the action once, on the `+8 more to review:` line the ids hang off.
 
+- **An untagged merge request is an author action, and it is the one row that
+  exists because nothing happened.** `domain.NoReviewersAssigned` — open,
+  not draft, no reviewer assigned **and** no approval — puts it in the author's
+  block as `add a reviewer`, rendered first because every other flag on that row
+  describes work that will still be unreviewed once it is done. Before it such an
+  MR was in *neither* section: `NeedsHumanReview` iterates `s.Reviewers` and an
+  empty list asks nobody, while every other author action describes a problem the
+  MR does not have yet — so the one list of everything the team owes said nothing
+  at all about work nobody had been handed. Measured on the first live run: 11 of
+  32 open merge requests, two of which entered the digest for the first time.
+  - **Both halves of the condition are load-bearing.** An MR that was never tagged
+    but *has* an approval was reviewed anyway, by somebody who did not need the
+    assignment; asking its author to add a reviewer asks for a second review of
+    finished work.
+  - **`ApprovalsKnown` is deliberately not consulted, and this is the one rule
+    that fails open the other way.** An unreadable `/approvals` leaves
+    `ApprovedBy` empty, which reads here as "no approval". Suppressing a reviewer
+    notification hides work; an extra `add a reviewer` on an MR that turns out to
+    be approved costs one line and is visibly wrong to the one person who can
+    check. Silence about an untagged MR is not.
+  - **Linear readiness may withdraw this flag, and nothing else may.**
+    `needsReviewerTag` suppresses it when the card has not reached In Review — a
+    card that was never offered is not an MR somebody forgot to tag. That is legal
+    only because the suppressed set is *exactly* `needsLinearStart`'s, so the row
+    survives saying `move CHAIN-184 to In Review`. Drift between the two guards
+    renders an author row whose every flag was suppressed: a bare link with
+    nothing to do about it. Pinned as a property —
+    `TestReviewerTagSuppressionAlwaysLeavesTheRowSaying`.
+  - `merge_requests_without_reviewers_total{team}` gauges the **gated** answer,
+    not the raw GitLab fact: a gauge counting merge requests the digest
+    deliberately says nothing about would contradict the message it explains.
 - **Dedup by fingerprint** — `review.Fingerprint(projectID, mrIID, file,
   category, title)`, sha256, head-SHA-independent. This is the dedupe contract in
   Postgres *and* in the GitLab markers: do not change its inputs or format.

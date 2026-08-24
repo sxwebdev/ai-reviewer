@@ -346,3 +346,68 @@ func TestLinearIssueNumbersAreUniqueAndSorted(t *testing.T) {
 		t.Errorf("numbers = %v, want [9 184 203]", got)
 	}
 }
+
+// TestReviewerTagSuppressionAlwaysLeavesTheRowSaying is the same partition
+// argument as TestReadinessSuppressionAlwaysHandsTheMRToItsAuthor, applied to
+// the one flag the board is allowed to withdraw.
+//
+// needsReviewerTag drops "add a reviewer" when the card has not been offered for
+// review. That is legal only because needsLinearStart is true for exactly that
+// set, so the author still gets a row telling them to move the card. If the two
+// guards ever drift, digestData renders an author row whose every flag was
+// suppressed — a bare link with nothing to do about it.
+func TestReviewerTagSuppressionAlwaysLeavesTheRowSaying(t *testing.T) {
+	t.Parallel()
+
+	stages := []linear.Stage{linear.StageUnknown, linear.StageBeforeReview, linear.StageReviewOrLater}
+	// Counted for the same reason the readiness property counts: a mutation that
+	// makes needsReviewerTag always false empties every assertion below, and a
+	// property test that cannot tell "held" from "never ran" is not a test.
+	suppressed := 0
+	for _, state := range []string{"opened", "merged", "closed"} {
+		for _, draft := range []bool{false, true} {
+			for _, stage := range stages {
+				for _, linked := range []bool{false, true} {
+					for _, approved := range []bool{false, true} {
+						for _, known := range []bool{false, true} {
+							for _, tagged := range []bool{false, true} {
+								snap := domain.MergeRequestSnapshot{
+									MR:             domain.MergeRequest{State: state, Draft: draft},
+									ApprovalsKnown: known,
+								}
+								if tagged {
+									snap.Reviewers = []domain.Reviewer{{
+										User: domain.User{ID: 1, Username: "r"}, State: domain.ReviewStateUnreviewed,
+									}}
+								}
+								if approved {
+									snap.ApprovedBy = []domain.User{{ID: 9}}
+								}
+								link := linearLink{issue: linear.Issue{Identifier: "CHAIN-1"}, stage: stage}
+
+								raw := domain.NoReviewersAssigned(snap)
+								gated := needsReviewerTag(snap, link, linked)
+								if gated && !raw {
+									t.Fatalf("the gate invented a flag GitLab never reported: "+
+										"state=%s draft=%v stage=%v linked=%v", state, draft, stage, linked)
+								}
+								if !raw || gated {
+									continue
+								}
+								suppressed++
+								if !needsLinearStart(snap, link, linked) {
+									t.Fatalf("suppressed the only flag on the row and left nothing to say: "+
+										"state=%s draft=%v stage=%v linked=%v approved=%v known=%v",
+										state, draft, stage, linked, approved, known)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if suppressed == 0 {
+		t.Fatal("no input suppressed the flag; the property was never exercised")
+	}
+}

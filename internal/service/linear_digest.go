@@ -261,6 +261,35 @@ func needsLinearMove(snapshot domain.MergeRequestSnapshot, link linearLink, link
 		strings.EqualFold(strings.TrimSpace(link.issue.State.Name), linear.InReviewState)
 }
 
+// needsReviewerTag applies the Linear readiness gate on top of
+// domain.NoReviewersAssigned: a card the author has not offered for review is
+// not an MR they forgot to tag, it is an MR that is not ready to be tagged.
+//
+// Readiness outranks it for the same reason it outranks a standing
+// REQUESTED_CHANGES verdict in needsReviewerAction — the author's one useful
+// action is moving the card, and a row that asks for two things at once buries
+// the one that unblocks the other.
+//
+// The merge request cannot be lost by this suppression, and the argument is the
+// same partition rule needsLinearStart carries: the guard suppressed on here is
+// exactly needsLinearStart's condition (linked, before In Review, and the same
+// open/non-draft guard NoReviewersAssigned opens with), so every suppression
+// leaves an author row that says "move CHAIN-184 to In Review". There is no
+// input for which this returns false, actions.Any() is otherwise false and
+// startLinear is false — which would be an author row with nothing on it.
+func needsReviewerTag(snapshot domain.MergeRequestSnapshot, link linearLink, linked bool) bool {
+	if !domain.NoReviewersAssigned(snapshot) {
+		return false
+	}
+	// Written as the same early return needsReviewerAction's readiness gate uses,
+	// so the two guards can be read against each other — that they stay identical
+	// is the whole argument above.
+	if linked && link.stage == linear.StageBeforeReview {
+		return false
+	}
+	return true
+}
+
 // needsLinearStart tells the MR author that the linked card is still parked
 // before In Review, which is why the digest asked nobody to review it.
 //
