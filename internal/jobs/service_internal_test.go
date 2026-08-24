@@ -194,7 +194,9 @@ type nopDigester struct{}
 func (nopDigester) BuildDigest(context.Context, domain.Team, string, time.Time, int) (*DigestOutcome, error) {
 	return &DigestOutcome{}, nil
 }
-func (nopDigester) SendMessage(context.Context, uuid.UUID) error { return nil }
+func (nopDigester) SendMessage(context.Context, uuid.UUID) (SendOutcome, error) {
+	return SendOutcome{Delivered: true}, nil
+}
 
 func TestFindTeam(t *testing.T) {
 	t.Parallel()
@@ -509,7 +511,9 @@ func (d *recordingDigester) BuildDigest(_ context.Context, _ domain.Team, _ stri
 	d.runDate = runDate
 	return &DigestOutcome{Status: "built"}, nil
 }
-func (d *recordingDigester) SendMessage(context.Context, uuid.UUID) error { return nil }
+func (d *recordingDigester) SendMessage(context.Context, uuid.UUID) (SendOutcome, error) {
+	return SendOutcome{Delivered: true}, nil
+}
 
 // TestDigestWorkerUsesTheScheduleAccessor: scheduler.Daily.Location() is the
 // nil-safe accessor the package provides, and time.ParseInLocation panics on a
@@ -628,5 +632,70 @@ func TestDigestSlotForNowRefusesASkippedDay(t *testing.T) {
 	}
 	if args.Slot != "09:00" || args.RunDate != "2026-08-21" {
 		t.Errorf("args = %+v, want the 09:00 slot on 2026-08-21", args)
+	}
+}
+
+// TestDigestLogLineAnswersReusedFirst pins an ordering, and the ordering is the
+// whole point: the dry-run branch used to be an early return placed above the
+// reused check, so on a deployment with slack_send_enabled off — what
+// config.example.yaml ships — a run assembled hours earlier was announced as a
+// fresh "digest built (dry run — nothing sent)", and built_at never appeared at
+// all. Whether anything reached Slack and whether anything was assembled are two
+// independent questions.
+func TestDigestLogLineAnswersReusedFirst(t *testing.T) {
+	t.Parallel()
+
+	built := time.Date(2026, 8, 24, 14, 45, 21, 0, time.UTC)
+	cases := []struct {
+		name      string
+		out       *DigestOutcome
+		dryRun    bool
+		wantMsg   string
+		wantField string // a field only this branch may carry
+		denyField string
+	}{
+		{
+			"a fresh build that was delivered",
+			&DigestOutcome{FailedRepos: 1}, false,
+			msgDigestBuilt, "failed_repos", "built_at",
+		},
+		{
+			"a fresh build nobody delivers",
+			&DigestOutcome{}, true,
+			msgDigestDryRun, "failed_repos", "built_at",
+		},
+		{
+			"a reused run",
+			&DigestOutcome{Reused: true, BuiltAt: built}, false,
+			msgDigestReused, "built_at", "failed_repos",
+		},
+		{
+			// The regression: reused AND dry-run at once.
+			"a reused run on a deployment that sends nothing",
+			&DigestOutcome{Reused: true, BuiltAt: built}, true,
+			msgDigestReused, "built_at", "failed_repos",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			msg, extra := digestLogLine(c.out, c.dryRun)
+			if msg != c.wantMsg {
+				t.Errorf("message = %q, want %q", msg, c.wantMsg)
+			}
+			keys := map[string]bool{}
+			for i := 0; i+1 < len(extra); i += 2 {
+				keys[extra[i].(string)] = true
+			}
+			if !keys[c.wantField] {
+				t.Errorf("fields %v carry no %q", extra, c.wantField)
+			}
+			// digest_runs stores neither degradation, so a reused run answering
+			// "failed_repos 0" would be reporting a question it never asked.
+			if keys[c.denyField] {
+				t.Errorf("fields %v must not claim %q on this branch", extra, c.denyField)
+			}
+		})
 	}
 }

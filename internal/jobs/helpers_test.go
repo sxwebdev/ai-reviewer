@@ -365,11 +365,14 @@ func (f *fakeDigester) BuildDigest(_ context.Context, team domain.Team, slot str
 	return f.outcome, nil
 }
 
-func (f *fakeDigester) SendMessage(_ context.Context, messageID uuid.UUID) error {
+func (f *fakeDigester) SendMessage(_ context.Context, messageID uuid.UUID) (jobs.SendOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sent = append(f.sent, messageID)
-	return f.sendErr
+	if f.sendErr != nil {
+		return jobs.SendOutcome{}, f.sendErr
+	}
+	return jobs.SendOutcome{Delivered: true, Status: "pending", Part: 1, Parts: 1, TS: "1700000000.000100"}, nil
 }
 
 func newDeps(rev *fakeReviewer, sc *fakeScanner, dg *fakeDigester) jobs.Deps {

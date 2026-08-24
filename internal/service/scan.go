@@ -32,6 +32,15 @@ type ScanResult struct {
 	// missing from Snapshots. It is a partial result, not an error — the digest
 	// reports "⚠️ Partial data" rather than pretending it saw everything.
 	Failed bool
+	// Open is how many merge requests the listing returned — every one classified,
+	// not only the ones a detail call was spent on. Zero and meaningless when
+	// ReviewDisabled: nobody listed them.
+	Open int
+	// ReviewDisabled marks a pass that never listed the repository's merge
+	// requests because the team's AI review is off. It exists so ScanRepoWorker's
+	// one summary line can say the repository was not looked at, rather than
+	// reporting "inspected 0" — which reads as an empty repository.
+	ReviewDisabled bool
 }
 
 // backoffLadder is the §6.5 wait after N consecutive failed reviews of one head
@@ -59,6 +68,10 @@ const (
 // ScanRepository inspects one repository: it lists the open MRs, classifies
 // them, and decides which need an AI review.
 //
+// Unless the team's AI review is off, in which case it lists nothing — see the
+// guard below. The pass still resolves the project and sweeps stale
+// publications, so a switch flipped off cannot strand work already in flight.
+//
 // Errors and partial results are deliberately different things. Failing to list
 // the repository at all is an error — the job should retry, and a repository
 // silently reporting "no open MRs" would be worse than a retry. Failing to
@@ -79,6 +92,26 @@ func (s *Service) ScanRepository(ctx context.Context, team domain.Team, reposito
 		metrics.ObserveScan(metrics.ResultError, s.now().Sub(start))
 		return nil, fmt.Errorf("get project %s: %w", repository, err)
 	}
+
+	// A team whose AI review is off has nothing to find here: NeedsAIReview
+	// answers ReasonDisabled before it looks at anything else, so every merge
+	// request in the listing would be dropped on the first check. Listing them
+	// anyway is the whole cost of the pass — a paginated GET per repository every
+	// scan interval, plus one database round trip per open merge request looking
+	// up a review that a disabled team can never have produced. Measured on a
+	// deployment running digests only: 333 repository passes in three hours, zero
+	// review jobs, ~5k GitLab requests a day buying nothing.
+	//
+	// The sweep below still runs, and that is the reason this returns through
+	// finishScan rather than early. Turning the switch off does not retract the
+	// reviews already in flight, and their publication is exactly the work that
+	// must not be stranded by a config change; it needs the project id and
+	// nothing else, which is what the call above is still for.
+
+	if !team.AIReview {
+		return s.finishScan(ctx, team, proj, &ScanResult{ReviewDisabled: true}, 0, start)
+	}
+
 	open, err := s.gl.ListOpenMRs(ctx, projectKey(proj.ID, proj.PathWithNamespace))
 	if err != nil {
 		metrics.ObserveScan(metrics.ResultError, s.now().Sub(start))
@@ -184,22 +217,36 @@ func (s *Service) mayNeedReview(ctx context.Context, team domain.Team, proj *git
 // finishScan appends the §6.3 publication sweep and emits the pass's metrics.
 // It is the single exit of ScanRepository so no return path can skip either.
 func (s *Service) finishScan(ctx context.Context, team domain.Team, proj *gitlab.Project, res *ScanResult, open int, start time.Time) (*ScanResult, error) {
+	res.Open = open
 	s.sweepStalePublications(ctx, proj, res)
 
 	// Every open merge request was classified, even the ones no detail call was
-	// spent on — the gauge means "seen", not "fetched".
-	metrics.MergeRequestsScanned(team.Name, open)
+	// spent on — the counter means "seen", not "fetched". Not incremented at all
+	// on a review-disabled pass: nothing was seen, and Add(0) would be a sample
+	// claiming otherwise.
+	if !res.ReviewDisabled {
+		metrics.MergeRequestsScanned(team.Name, open)
+	}
 	result := metrics.ResultOK
 	if res.Failed {
 		result = metrics.ResultPartial
 	}
 	metrics.ObserveScan(result, s.now().Sub(start))
 
-	s.log.Infow("repository scanned",
-		"team", team.Name, "project", proj.PathWithNamespace,
-		"open", open, "inspected", len(res.Snapshots),
-		"candidates", len(res.Candidates), "stale_publish", len(res.StalePublish),
-		"partial", res.Failed)
+	// No line for a review-disabled pass: ScanRepoWorker logs one summary per
+	// repository already, and two lines a millisecond apart — one saying the
+	// repository was not scanned, the next saying it was — is worse than the
+	// ambiguity either of them was meant to remove. ReviewDisabled travels on the
+	// result so that single line can say which pass it was.
+	if res.ReviewDisabled {
+		return res, nil
+	}
+
+	// No line here either: ScanRepoWorker writes the one summary per repository
+	// and now carries the open count too. Two lines both called "repository
+	// scanned" had already drifted — this one said `inspected`, the worker's said
+	// `merge_requests_inspected` — which is the drift the one-line rule exists to
+	// prevent.
 	return res, nil
 }
 

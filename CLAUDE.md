@@ -330,9 +330,11 @@ example — it is why `internal/service` never imports River).
   the coming slot is that slot's. Not theoretical — on 2026-08-24 the 14:00 job
   was inserted at `13:59:59.999745` with `scheduled_at 14:00:00`, named slot
   `09:00`, matched the run RunOnStart had already delivered that morning, and the
-  team's 14:00 digest never arrived. Every layer behaved correctly and the whole
-  chain was silent, which is why `BuildDigest` now logs the already-built path:
-  INFO, not WARN, because the ordinary way there is a restart between two slots.
+  team's 14:00 digest never arrived — every layer behaving correctly, which is
+  what made it invisible until `river_job.created_at` was read against
+  `scheduled_at`. `outcomeForRun` already logged the reuse; it now names
+  `run_date` and `built_at` too, so the line answers "the slot you are missing was
+  delivered three hours ago" rather than only "reused".
 - **A skipped day is a day nothing is built on, not a day something is
   withheld.** `digest.skip_weekdays` / `digest.skip_dates` live in
   `scheduler.Daily.Skip`, and `Next` steps over those days — so River never
@@ -408,6 +410,17 @@ example — it is why `internal/service` never imports River).
   immediately after its POST; then the summary note carrying the review marker;
   then `status='succeeded'`. Nothing may be posted after the summary, so
   `succeeded` can never be a false success.
+- **A wrapper never infers what happened from `err == nil`.** Every worker in
+  `internal/jobs` writes one summary line per job, and the service beneath it
+  returns `nil` on its no-op branches too — they are successes. So the *outcome*
+  carries which branch was taken: `ScanResult.ReviewDisabled`,
+  `DigestOutcome.Reused`, `SendOutcome.Delivered`. Each was added after the log
+  said the opposite of the truth: `repository scanned  inspected=0` under
+  `repository not scanned`, `digest built` under `already built for this slot`,
+  and `digest part delivered` one line under `digest part needs no delivery`.
+  The corollary is the other half of the rule — **one line per job, written by
+  the worker**: a service that logs the same fact as well produces two lines that
+  drift apart the first time either is edited.
 - **All deferred work is a River job** — publishing, Slack delivery, worktree
   sweeping. Never "a goroutine in the background": a goroutine dies with its
   replica and leaves no trace. The flip side: a job's own *reads* stay inside it;
@@ -462,8 +475,15 @@ commands.
   a review killed by **our own shutdown** discards its row (four deploys must not
   blacklist a healthy SHA) while a job *timeout* does count.
 - **Two switches, two different questions.** `teams[].ai_review.enabled` decides
-  whether the LLM runs; `service.ai_review_publish_enabled` decides only whether
-  the result is posted. A dry run costs exactly as much as a published one, so the
+  whether the LLM runs — and, since it can produce no candidates, whether
+  `ScanRepository` lists the repository's merge requests at all: a disabled team's
+  listing is a paginated GET plus a database round trip per open MR, every scan
+  interval, buying a set that `NeedsAIReview` empties on its first check. Measured
+  on a digest-only deployment: 333 repository passes in three hours, zero review
+  jobs. The pass still resolves the project and sweeps stale publications, because
+  turning the switch off does not retract the reviews already in flight, and the
+  sweep needs the project id and nothing else. `service.ai_review_publish_enabled`
+  decides only whether the result is posted. A dry run costs exactly as much as a published one, so the
   publish switch is not a cost control and must never be described as one —
   `config.example.yaml` therefore ships every team with reviewing **off**, and
   `App.logEffectiveMode` prints both at startup because "why is it reviewing?" was

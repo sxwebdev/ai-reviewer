@@ -118,7 +118,7 @@ func (h *harness) setMessageStatus(t *testing.T, id uuid.UUID, status string) {
 func TestSendMessageDelivers(t *testing.T) {
 	h, srv, id := sendHarness(t)
 
-	if err := h.svc.SendMessage(t.Context(), id); err != nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
 	if srv.calls() != 1 {
@@ -163,7 +163,8 @@ func TestSendMessageBranchesOnTheClaimedStatus(t *testing.T) {
 			h, srv, id := sendHarness(t)
 			h.setMessageStatus(t, id, c.before)
 
-			if err := h.svc.SendMessage(t.Context(), id); err != nil {
+			out, err := h.svc.SendMessage(t.Context(), id)
+			if err != nil {
 				t.Fatalf("SendMessage: %v", err)
 			}
 			if srv.calls() != c.wantPosts {
@@ -171,6 +172,21 @@ func TestSendMessageBranchesOnTheClaimedStatus(t *testing.T) {
 			}
 			if status, _, _ := h.messageRow(t, id); status != c.wantStatus {
 				t.Errorf("status = %q, want %q", status, c.wantStatus)
+			}
+			// Every branch here returns nil, which is why the outcome exists: a
+			// caller reading delivery off err == nil reports one for all five.
+			// SlackSendWorker did, one line under the service's "needs no delivery".
+			if want := c.wantPosts > 0; out.Delivered != want {
+				t.Errorf("Delivered = %v, want %v for a row that was %q", out.Delivered, want, c.before)
+			}
+			if out.Status != c.before {
+				t.Errorf("Status = %q, want the status before the claim (%q)", out.Status, c.before)
+			}
+			if out.Delivered && out.TS == "" {
+				t.Error("a delivered part must carry Slack's timestamp")
+			}
+			if !out.Delivered && out.TS != "" {
+				t.Errorf("TS = %q on a part that was never posted", out.TS)
 			}
 		})
 	}
@@ -183,7 +199,7 @@ func TestSendMessageResendIsCounted(t *testing.T) {
 	h.setMessageStatus(t, id, MessageSending)
 
 	before := counterValue(t, metrics.SlackResendUncertainTotal.WithLabelValues(testTeam))
-	if err := h.svc.SendMessage(t.Context(), id); err != nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
 	if got := counterValue(t, metrics.SlackResendUncertainTotal.WithLabelValues(testTeam)); got != before+1 {
@@ -210,7 +226,7 @@ func TestSendMessageRateLimitLeavesTheRowRetryable(t *testing.T) {
 		return http.StatusOK, `{"ok":true,"channel":"C123","ts":"1700000000.0002"}`, nil
 	}
 
-	err := h.svc.SendMessage(t.Context(), id)
+	_, err := h.svc.SendMessage(t.Context(), id)
 	if err == nil {
 		t.Fatal("a rate limit that outlasts the client's retries must reach the job")
 	}
@@ -226,7 +242,7 @@ func TestSendMessageRateLimitLeavesTheRowRetryable(t *testing.T) {
 	// The retry delivers without the digest being rebuilt, and without counting
 	// an uncertain resend.
 	before := counterValue(t, metrics.SlackResendUncertainTotal.WithLabelValues(testTeam))
-	if err := h.svc.SendMessage(t.Context(), id); err != nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if status, ts, _ := h.messageRow(t, id); status != MessageSent || ts != "1700000000.0002" {
@@ -247,7 +263,7 @@ func TestSendMessageTransportFailureKeepsTheClaim(t *testing.T) {
 	// never produces a Slack answer, so nothing can say whether it arrived.
 	srv.srv.Close()
 
-	if err := h.svc.SendMessage(t.Context(), id); err == nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err == nil {
 		t.Fatal("a transport failure must reach the job")
 	}
 	if status, _, _ := h.messageRow(t, id); status != MessageSending {
@@ -300,7 +316,7 @@ func TestSendMessageSettlesTheRun(t *testing.T) {
 						return http.StatusOK, `{"ok":false,"error":"channel_not_found"}`, nil
 					}
 				}
-				err := h.svc.SendMessage(t.Context(), ids[i])
+				_, err := h.svc.SendMessage(t.Context(), ids[i])
 				if ok != (err == nil) {
 					t.Fatalf("part %d: err = %v, want delivered=%v", i, err, ok)
 				}
@@ -368,7 +384,7 @@ func TestSendMessageWithoutASlackClientDoesNotClaimTheRow(t *testing.T) {
 	h.svc.slack = nil
 
 	before := counterValue(t, metrics.SlackResendUncertainTotal.WithLabelValues(testTeam))
-	if err := h.svc.SendMessage(t.Context(), id); err == nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err == nil {
 		t.Fatal("a missing Slack client must be reported")
 	}
 	if status, _, _ := h.messageRow(t, id); status != MessageFailed {
@@ -394,7 +410,7 @@ func TestSendMessageConfigurationErrorIsTerminal(t *testing.T) {
 				return http.StatusOK, fmt.Sprintf(`{"ok":false,"error":%q}`, code), nil
 			}
 
-			err := h.svc.SendMessage(t.Context(), id)
+			_, err := h.svc.SendMessage(t.Context(), id)
 			if err == nil {
 				t.Fatal("a configuration error must be reported")
 			}
@@ -410,7 +426,7 @@ func TestSendMessageConfigurationErrorIsTerminal(t *testing.T) {
 			}
 
 			// A later attempt is a clean no-op rather than a second POST.
-			if err := h.svc.SendMessage(t.Context(), id); err != nil {
+			if _, err := h.svc.SendMessage(t.Context(), id); err != nil {
 				t.Fatalf("second SendMessage: %v", err)
 			}
 			if srv.calls() != 1 {
@@ -441,10 +457,10 @@ func TestSendMessageOnePartFailingDoesNotCancelTheOthers(t *testing.T) {
 		return http.StatusOK, `{"ok":true,"channel":"C123","ts":"1700000000.0003"}`, nil
 	}
 
-	if err := h.svc.SendMessage(t.Context(), first); err == nil {
+	if _, err := h.svc.SendMessage(t.Context(), first); err == nil {
 		t.Fatal("the first part must report its failure")
 	}
-	if err := h.svc.SendMessage(t.Context(), second); err != nil {
+	if _, err := h.svc.SendMessage(t.Context(), second); err != nil {
 		t.Fatalf("the second part must still be delivered: %v", err)
 	}
 	if status, _, _ := h.messageRow(t, first); status != MessageFailed {
@@ -462,7 +478,7 @@ func TestSendMessageWithAnUnreadablePayloadFailsTerminally(t *testing.T) {
 		t.Fatalf("corrupt the payload: %v", err)
 	}
 
-	if err := h.svc.SendMessage(t.Context(), id); err == nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err == nil {
 		t.Fatal("an undecodable payload must be reported")
 	}
 	if srv.calls() != 0 {
@@ -476,7 +492,7 @@ func TestSendMessageWithAnUnreadablePayloadFailsTerminally(t *testing.T) {
 func TestSendMessageWithoutASlackClient(t *testing.T) {
 	h, _, id := sendHarness(t)
 	h.svc.slack = nil
-	if err := h.svc.SendMessage(t.Context(), id); err == nil {
+	if _, err := h.svc.SendMessage(t.Context(), id); err == nil {
 		t.Fatal("SendMessage without a Slack client must fail loudly")
 	}
 }

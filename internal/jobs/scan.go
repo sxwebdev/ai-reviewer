@@ -174,14 +174,33 @@ func (w *ScanRepoWorker) Work(ctx context.Context, job *river.Job[ScanRepoArgs])
 			}
 		}
 
-		w.log.Infow("repository scanned",
+		fields := []any{
 			"operation", "scan_repo", "team", team.Name, "repository", args.Repository,
-			// Inspected, not seen: §9.1's cheap filter skips MRs whose head has
-			// not moved, so this is far below the repository's open-MR count.
+			// Both numbers, because they answer different questions: open is every
+			// merge request the listing returned, inspected only those §9.1's cheap
+			// filter thought worth a detail call. "inspected 0" alone reads as an
+			// empty repository rather than one whose merge requests have not moved.
+			"merge_requests_open", res.Open,
 			"merge_requests_inspected", len(res.Snapshots), "reviews_queued", queued,
 			"reviews_already_queued", alreadyQueued,
 			"publications_requeued", republished, "result", outcome,
-			"duration", time.Since(start).String())
+			"duration", time.Since(start).String(),
+		}
+
+		switch {
+		case !res.ReviewDisabled:
+			w.log.Infow("repository scanned", fields...)
+		case republished > 0 || res.Failed:
+			// The sweep still runs with review off, and a publication it rescued is
+			// worth a line whatever the switch says.
+			w.log.Infow("repository not scanned: ai_review is off for this team", fields...)
+		default:
+			// Debug: nine repositories every five minutes is 2600 lines a day
+			// saying nothing happened, and the reason it did not is already in the
+			// "effective mode" line at startup and in `doctor`. "scan dispatched"
+			// still reports the pass at info.
+			w.log.Debugw("repository not scanned: ai_review is off for this team", fields...)
+		}
 
 		return errors.Join(errs...)
 	})

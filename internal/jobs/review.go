@@ -158,15 +158,27 @@ func (w *SlackSendWorker) Work(ctx context.Context, job *river.Job[SlackSendArgs
 		// The service owns the whole §6.4 claim protocol, including the no-op
 		// branches: a message already 'sent', 'failed' or 'dry_run' returns nil,
 		// so this job is idempotent without knowing why.
-		if err := w.digester.SendMessage(ctx, job.Args.MessageID); err != nil {
+		out, err := w.digester.SendMessage(ctx, job.Args.MessageID)
+		if err != nil {
 			// The service has already marked the row failed for a bad token,
 			// scope or channel; the remaining attempts would only re-claim a
 			// terminal row. Rate limits and Slack's own outages stay retryable.
 			return classify(fmt.Errorf("send digest message %s: %w", job.Args.MessageID, err))
 		}
-		w.log.Infow("digest part delivered",
+		fields := []any{
 			"operation", "slack_send", "team", job.Args.Team,
-			"message_id", job.Args.MessageID, "job_id", job.ID)
+			"message_id", job.Args.MessageID, "job_id", job.ID,
+			"part", out.Part, "parts", out.Parts, "status_before", out.Status,
+		}
+		if !out.Delivered {
+			// Already sent, failed, or a dry run: a success, and nothing reached
+			// Slack. Branching on the outcome rather than on err == nil is the whole
+			// reason SendMessage returns one — this line used to say "delivered" for
+			// every one of these, directly under the service's "needs no delivery".
+			w.log.Infow("digest part needed no delivery", fields...)
+			return nil
+		}
+		w.log.Infow("digest part delivered", append(fields, "ts", out.TS)...)
 		return nil
 	})
 }

@@ -37,6 +37,32 @@ type DigestOutcome struct {
 	Status           string // built | dry_run | partial | failed
 	MRCount          int
 	LinearIssueCount int
+	// Reused marks an outcome that describes a run this call did not build: the
+	// slot was already there. Without it the worker's summary says "digest built"
+	// for one assembled hours earlier, which is the same mistake the log made
+	// about a repository nobody scanned.
+	Reused bool
+	// BuiltAt is when the run was assembled, and is set only when Reused: for a
+	// fresh build the log line's own timestamp already says it. It is what turns
+	// the worker's line from "nothing reassembled" into "the slot you are looking
+	// for went out three hours ago".
+	BuiltAt time.Time
+	// FailedRepos and LinearDegraded are the degradations behind a 'partial'
+	// status. They are reported rather than logged here because the worker writes
+	// the one summary line per job, and a status alone does not say which source
+	// failed.
+	//
+	// Meaningful only when Reused is false. digest_runs stores the status but not
+	// what degraded, so a reused run cannot recover them — and the worker leaves
+	// the fields off that line rather than printing zeros, because "nothing
+	// degraded" and "this call never asked" must not look alike.
+	FailedRepos    int
+	LinearDegraded bool
+	// Parts is how many messages the run holds, from the row rather than from
+	// Messages: Messages is deliberately empty for a dry run, so counting it
+	// reported "parts 0" for a digest that has parts and simply is not being
+	// delivered.
+	Parts int
 }
 
 // BuildDigest assembles one team's digest and persists it. It never calls
@@ -59,22 +85,7 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 	if existing != nil {
 		if existing.Status != DigestFailed {
 			// Already built for this slot and attempt — hand back what is there
-			// rather than assembling a second copy.
-			//
-			// Logged because this is what silence looks like from the outside. When
-			// a job named an already-delivered slot the whole chain behaved
-			// correctly and posted nothing: BuildDigest returned the old run,
-			// slack_send found its message already sent, and the only record that
-			// the slot had fired at all was a row in river_job. "The 14:00 digest
-			// did not arrive" then had no answer short of a database query.
-			//
-			// INFO and not WARN on purpose: the common way here is a restart between
-			// two slots, where RunOnStart correctly finds nothing to do. A warning on
-			// every deploy is a warning nobody reads.
-			s.log.Infow("digest slot was already built; returning the existing run",
-				"team", team.Name, "slot", slot, "run_date", day.Format(time.DateOnly),
-				"attempt", attempt, "existing_status", existing.Status,
-				"built_at", existing.CreatedAt.Format(time.RFC3339))
+			// rather than assembling a second copy. outcomeForRun logs it.
 			return s.outcomeForRun(ctx, existing)
 		}
 		// A failed attempt left a row but no messages; the unique index means
@@ -129,13 +140,17 @@ func (s *Service) BuildDigest(ctx context.Context, team domain.Team, slot string
 		result = metrics.ResultPartial
 	}
 	metrics.DigestRun(team.Name, result)
-	s.log.Infow("digest built",
-		"team", team.Name, "slot", slot, "run_date", day.Format(time.DateOnly), "attempt", attempt,
-		"status", status, "parts", len(messages), "mrs", mrCount,
-		"linear_issues", src.linear.inReviewCount, "failed_repos", src.failedRepos,
-		"linear_degraded", src.linearDegraded())
 
-	out := &DigestOutcome{RunID: runID, Status: status, MRCount: mrCount, LinearIssueCount: src.linear.inReviewCount}
+	// No line here: DigestWorker writes one per job and it carries everything
+	// this one did, plus the job id. Two lines for one build drift apart the first
+	// time either is edited — which is exactly how "digest built" ended up
+	// underneath "already built for this slot".
+	out := &DigestOutcome{
+		RunID: runID, Status: status, MRCount: mrCount,
+		LinearIssueCount: src.linear.inReviewCount,
+		FailedRepos:      src.failedRepos, LinearDegraded: src.linearDegraded(),
+		Parts: len(messages),
+	}
 	if s.cfg.SlackSendEnabled {
 		out.Messages = ids
 	}
@@ -379,14 +394,15 @@ func (s *Service) outcomeForRun(ctx context.Context, run *models.DigestRun) (*Di
 	out := &DigestOutcome{
 		RunID: run.ID, Status: run.Status, MRCount: int(run.MrCount),
 		LinearIssueCount: int(run.LinearIssueCount),
+		Reused:           true,
+		BuiltAt:          run.CreatedAt,
+		Parts:            int(run.Parts),
 	}
 	if run.Status != DigestDryRun {
 		for _, m := range msgs {
 			out.Messages = append(out.Messages, m.ID)
 		}
 	}
-	s.log.Infow("digest already built for this slot; reusing it",
-		"team", run.Team, "slot", run.Slot, "attempt", run.Attempt, "status", run.Status)
 	return out, nil
 }
 

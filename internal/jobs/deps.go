@@ -75,6 +75,13 @@ type ScanResult struct {
 	// Failed marks a repository that could not be fully inspected. It is a
 	// normal partial result, not an error: the digest reports "⚠️ Partial data".
 	Failed bool
+	// Open is every merge request the listing returned, classified or not — the
+	// honest "how many were seen". Zero and meaningless when ReviewDisabled.
+	Open int
+	// ReviewDisabled marks a pass that never listed the repository's merge
+	// requests because the team's ai_review switch is off. The worker's summary
+	// line reads on it: "inspected 0" without it says the repository is empty.
+	ReviewDisabled bool
 }
 
 // DigestOutcome is one built (not yet delivered) digest.
@@ -86,6 +93,23 @@ type DigestOutcome struct {
 	Status           string // built | dry_run | partial | failed
 	MRCount          int
 	LinearIssueCount int
+	// Reused marks a run the service found rather than built — a retried job, or
+	// RunOnStart landing on a slot that already went out. The worker's line reads
+	// on it; "digest built" for a digest assembled three hours ago is a lie the
+	// wrapper cannot otherwise avoid telling.
+	Reused bool
+	// BuiltAt is when a reused run was assembled; the zero time on a fresh build,
+	// whose own log line is the timestamp.
+	BuiltAt time.Time
+	// FailedRepos and LinearDegraded name the degradations behind a 'partial'
+	// status, which the status alone does not. Meaningful only when Reused is
+	// false — digest_runs does not store them, so a reused run cannot answer, and
+	// the worker omits the fields there rather than logging zeros.
+	FailedRepos    int
+	LinearDegraded bool
+	// Parts is the run's message count, taken from the row: Messages is empty on
+	// a dry run, so counting it reported "parts 0" for a digest that has them.
+	Parts int
 }
 
 // StatusDryRun is the DigestOutcome/ReviewOutcome status that means "everything
@@ -117,8 +141,23 @@ type Digester interface {
 	BuildDigest(ctx context.Context, team domain.Team, slot string, runDate time.Time, attempt int) (*DigestOutcome, error)
 	// SendMessage implements the §6.4 claim protocol end to end: claim, branch on
 	// the previous status, POST, record. It returns nil for the no-op branches
-	// (already sent, failed, dry-run), because those are successes.
-	SendMessage(ctx context.Context, messageID uuid.UUID) error
+	// (already sent, failed, dry-run), because those are successes — which is
+	// exactly why it also returns an outcome: a nil error alone cannot tell the
+	// worker whether anything reached Slack.
+	SendMessage(ctx context.Context, messageID uuid.UUID) (SendOutcome, error)
+}
+
+// SendOutcome is what one SendMessage call did.
+type SendOutcome struct {
+	// Delivered is true only when this call posted to Slack.
+	Delivered bool
+	// Status is the row's status before the claim, which is what names the no-op
+	// branch the call took.
+	Status string
+	Part   int
+	Parts  int
+	// TS is Slack's message timestamp, set only when Delivered.
+	TS string
 }
 
 // CommandRequest is one in-chat command to answer.

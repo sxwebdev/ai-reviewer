@@ -1651,3 +1651,63 @@ func TestDigestStaysQuietAboutATaggedMergeRequest(t *testing.T) {
 		t.Errorf("a tagged merge request must not ask for a reviewer:\n%s", body)
 	}
 }
+
+// TestBuildDigestReportsAReusedRun: every branch of BuildDigest returns a
+// DigestOutcome and a nil error, so a caller cannot tell "assembled just now"
+// from "found the one delivered three hours ago". DigestWorker's summary line
+// reads on Reused; without it, it announced "digest built" directly under the
+// service's own "already built for this slot; reusing it".
+func TestBuildDigestReportsAReusedRun(t *testing.T) {
+	h := digestHarness(t)
+
+	first, err := h.svc.BuildDigest(t.Context(), testTeamConfig(), "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if first.Reused {
+		t.Error("the first build of a slot assembled it; Reused must be false")
+	}
+
+	second, err := h.svc.BuildDigest(t.Context(), testTeamConfig(), "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest (again): %v", err)
+	}
+	if !second.Reused {
+		t.Error("the second call found the run rather than building it; Reused must be true")
+	}
+	if second.RunID != first.RunID {
+		t.Errorf("run id = %v, want the first run %v", second.RunID, first.RunID)
+	}
+	// BuiltAt is the field that makes the worker's line an answer: at 17:03,
+	// "the 14:00 slot was assembled at 14:45". Zero on a fresh build, where the
+	// log line's own timestamp already says it.
+	if second.BuiltAt.IsZero() {
+		t.Error("a reused run must carry when it was built")
+	}
+	if !first.BuiltAt.IsZero() {
+		t.Errorf("BuiltAt = %v on a fresh build, want the zero time", first.BuiltAt)
+	}
+	// Parts comes from the row, not from Messages: Messages is deliberately empty
+	// on a dry run, so counting it reported "parts 0" for a digest that has them.
+	if first.Parts != 1 || second.Parts != 1 {
+		t.Errorf("parts = %d then %d, want 1 both times", first.Parts, second.Parts)
+	}
+}
+
+// TestBuildDigestReportsPartsForADryRun is the half the reuse test cannot see:
+// a dry run persists its parts and leaves Messages empty on purpose, so a caller
+// counting Messages reports a digest with no parts.
+func TestBuildDigestReportsPartsForADryRun(t *testing.T) {
+	h := digestHarness(t, withConfig(func(c *Config) { c.SlackSendEnabled = false }))
+
+	out, err := h.svc.BuildDigest(t.Context(), testTeamConfig(), "09:00", digestDay, 0)
+	if err != nil {
+		t.Fatalf("BuildDigest: %v", err)
+	}
+	if len(out.Messages) != 0 {
+		t.Fatalf("messages = %d, want none queued for a dry run", len(out.Messages))
+	}
+	if out.Parts != 1 {
+		t.Errorf("parts = %d, want 1: the run has a part, it is simply not being delivered", out.Parts)
+	}
+}

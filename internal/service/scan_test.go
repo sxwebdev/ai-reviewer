@@ -443,12 +443,76 @@ func TestScanRepositoryHonoursTheTeamSwitch(t *testing.T) {
 	}
 	// §9.1: the detail endpoint is only for merge requests that passed the cheap
 	// filter. A team with ai_review off has none, so a scan of it costs exactly
-	// one GitLab request.
+	// one GitLab request — and that is now asserted rather than described.
 	if len(res.Snapshots) != 0 {
 		t.Errorf("snapshots = %d, want 0: nothing may be fetched for a team with ai_review off", len(res.Snapshots))
 	}
 	if h.gl.discussionCalls != 0 {
 		t.Errorf("the scan made %d discussion calls, want 0", h.gl.discussionCalls)
+	}
+	// The listing is the cost of the pass, and a disabled team's listing buys
+	// nothing: every merge request in it would be dropped by NeedsAIReview on the
+	// first check. Measured on a digest-only deployment before this: 333 passes in
+	// three hours, zero review jobs.
+	if h.gl.openMRCalls != 0 {
+		t.Errorf("the scan listed merge requests %d time(s) for a team with ai_review off, want 0",
+			h.gl.openMRCalls)
+	}
+	if !res.ReviewDisabled {
+		t.Error("the result must say the listing was skipped, or the log claims the repository is empty")
+	}
+	if res.Open != 0 {
+		t.Errorf("Open = %d without a listing; nobody counted them", res.Open)
+	}
+}
+
+// TestScanRepositoryReportsTheOpenCount: the service stopped logging its own
+// "repository scanned" line, so the open count reaches the operator only through
+// the result. "inspected 0" alone reads as an empty repository rather than one
+// whose merge requests have not moved since the last pass.
+func TestScanRepositoryReportsTheOpenCount(t *testing.T) {
+	h := newHarness(t, withDB)
+	proj := testProject()
+	seedGitLab(h.fake, proj, testMR(101), testMR(102), testMR(103))
+
+	res, err := h.svc.ScanRepository(t.Context(), testTeamConfig(), "backend/payments")
+	if err != nil {
+		t.Fatalf("ScanRepository: %v", err)
+	}
+	if res.Open != 3 {
+		t.Errorf("Open = %d, want every merge request the listing returned (3)", res.Open)
+	}
+}
+
+// TestScanRepositoryStillSweepsWhenReviewIsOff is why the disabled pass returns
+// through finishScan instead of returning early. Turning the switch off does not
+// retract the reviews already in flight, and a publication stranded by a config
+// change is the one thing this sweep exists to rescue.
+func TestScanRepositoryStillSweepsWhenReviewIsOff(t *testing.T) {
+	h := newHarness(t, withDB)
+	proj := testProject()
+	seedGitLab(h.fake, proj, testMR(testMRIID))
+
+	// A review that finished and whose publication never did, backdated past the
+	// threshold against the harness's frozen clock — the sweep compares with
+	// s.now(), not the database's.
+	rev := h.seedReview(t, "stale00", StatusReviewed)
+	if _, err := h.pool.Exec(t.Context(),
+		`UPDATE mr_reviews SET created_at = $1 WHERE id = $2`, testNow.Add(-time.Hour), rev); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+
+	team := testTeamConfig()
+	team.AIReview = false
+	res, err := h.svc.ScanRepository(t.Context(), team, "backend/payments")
+	if err != nil {
+		t.Fatalf("ScanRepository: %v", err)
+	}
+	if h.gl.openMRCalls != 0 {
+		t.Errorf("listed merge requests %d time(s), want 0", h.gl.openMRCalls)
+	}
+	if len(res.StalePublish) != 1 || res.StalePublish[0] != rev {
+		t.Errorf("stale publications = %v, want the one review %v", res.StalePublish, rev)
 	}
 }
 

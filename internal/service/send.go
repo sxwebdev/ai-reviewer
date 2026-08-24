@@ -32,14 +32,20 @@ import (
 //	                  never learns something is waiting for them. The warning
 //	                  and slack_resend_uncertain_total make the duplicate
 //	                  visible.
-func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) error {
+//
+// The outcome says which of those happened, because "returned nil" cannot: the
+// no-op branches are successes too, and a caller that logs delivery on err ==
+// nil reports one for every one of them. SlackSendWorker used to, one line below
+// the service's own "needs no delivery" — two lines a millisecond apart, the
+// second contradicting the first.
+func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) (SendOutcome, error) {
 	msg, err := s.st.DigestMessage().GetByID(ctx, messageID)
 	if err != nil {
-		return fmt.Errorf("load digest message %s: %w", messageID, err)
+		return SendOutcome{}, fmt.Errorf("load digest message %s: %w", messageID, err)
 	}
 	run, err := s.st.DigestRun().GetByID(ctx, msg.DigestRunID)
 	if err != nil {
-		return fmt.Errorf("load digest run %s: %w", msg.DigestRunID, err)
+		return SendOutcome{}, fmt.Errorf("load digest run %s: %w", msg.DigestRunID, err)
 	}
 	team := run.Team
 
@@ -55,20 +61,19 @@ func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) error {
 		s.markSendFailed(ctx, messageID, err)
 		metrics.SlackSendError(team, metrics.SlackErrAPI)
 		s.settleRun(ctx, msg.DigestRunID, team)
-		return err
+		return SendOutcome{}, err
 	}
 
 	claim, err := s.st.DigestMessage().ClaimForSend(ctx, messageID)
 	if err != nil {
-		return fmt.Errorf("claim digest message %s: %w", messageID, err)
+		return SendOutcome{}, fmt.Errorf("claim digest message %s: %w", messageID, err)
 	}
 	if !claim.Claimed {
 		// Every status outside ('pending','sending') means the message is done
 		// with, one way or another. The CHECK constraint on the column is what
-		// makes this branch total.
-		s.log.Infow("digest part needs no delivery",
-			"team", team, "message_id", messageID, "status", claim.StatusBefore)
-		return nil
+		// makes this branch total. Reported, not logged: the worker writes one
+		// line per job and this is one of the things it can say.
+		return SendOutcome{Status: claim.StatusBefore, Part: int(msg.PartNo), Parts: int(msg.PartsTotal)}, nil
 	}
 	if claim.StatusBefore == MessageSending {
 		s.log.Warnw("resending a digest part whose previous delivery outcome is unknown; the channel may show it twice",
@@ -83,7 +88,7 @@ func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) error {
 		s.markSendFailed(ctx, messageID, err)
 		metrics.SlackSendError(team, metrics.SlackErrAPI)
 		s.settleRun(ctx, msg.DigestRunID, team)
-		return err
+		return SendOutcome{}, err
 	}
 
 	res, err := s.slack.PostMessage(ctx, req)
@@ -107,7 +112,7 @@ func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) error {
 		// A transport failure or a 5xx leaves the row 'sending' on purpose: the
 		// POST may have been received, and the resend branch above is what makes
 		// trying again safe and visible.
-		return fmt.Errorf("post digest part %d/%d: %w", msg.PartNo, msg.PartsTotal, err)
+		return SendOutcome{}, fmt.Errorf("post digest part %d/%d: %w", msg.PartNo, msg.PartsTotal, err)
 	}
 
 	// Detached: the message is in the channel now, and losing this write is
@@ -115,13 +120,30 @@ func (s *Service) SendMessage(ctx context.Context, messageID uuid.UUID) error {
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := s.st.DigestMessage().MarkSent(writeCtx, res.TS, messageID); err != nil {
-		return fmt.Errorf("record digest part %s as sent: %w", messageID, err)
+		return SendOutcome{}, fmt.Errorf("record digest part %s as sent: %w", messageID, err)
 	}
 	metrics.SlackSent(team)
-	s.log.Infow("digest part delivered",
-		"team", team, "message_id", messageID, "part", msg.PartNo, "parts", msg.PartsTotal, "ts", res.TS)
 	s.settleRun(ctx, msg.DigestRunID, team)
-	return nil
+	return SendOutcome{
+		Delivered: true, Status: claim.StatusBefore,
+		Part: int(msg.PartNo), Parts: int(msg.PartsTotal), TS: res.TS,
+	}, nil
+}
+
+// SendOutcome is what one SendMessage call did. It exists so the worker's single
+// summary line can name the branch instead of inferring delivery from a nil
+// error — every no-op branch returns nil too.
+type SendOutcome struct {
+	// Delivered is true only when this call posted to Slack.
+	Delivered bool
+	// Status is the row's status before the claim: 'sent', 'failed' or 'dry_run'
+	// on a no-op, 'pending' or 'sending' on a delivery. Empty when the call never
+	// reached the claim.
+	Status string
+	Part   int
+	Parts  int
+	// TS is Slack's message timestamp, set only when Delivered.
+	TS string
 }
 
 // settleRun recomputes the run's status once this part has stopped moving

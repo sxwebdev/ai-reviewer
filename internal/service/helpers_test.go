@@ -194,6 +194,7 @@ type countingGitLab struct {
 	discussionCalls int
 	versionCalls    int
 	approvalCalls   int
+	openMRCalls     int
 
 	failProject   map[string]error
 	failMR        map[int64]error
@@ -219,6 +220,7 @@ func (c *countingGitLab) GetProject(ctx context.Context, pk string) (*gitlab.Pro
 }
 
 func (c *countingGitLab) ListOpenMRs(ctx context.Context, pk string) ([]gitlab.MergeRequest, error) {
+	c.openMRCalls++
 	if c.failOpenMRs != nil {
 		return nil, c.failOpenMRs
 	}

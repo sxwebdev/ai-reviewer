@@ -79,7 +79,7 @@ func (w *DigestWorker) Work(ctx context.Context, job *river.Job[DigestArgs]) err
 		fields := []any{
 			"operation", "digest", "team", team.Name, "slot", args.Slot,
 			"run_date", args.RunDate, "attempt", args.Attempt,
-			"run_id", out.RunID, "parts", len(out.Messages),
+			"run_id", out.RunID, "parts", out.Parts,
 			"merge_requests", out.MRCount, "linear_issues", out.LinearIssueCount,
 			"result", out.Status, "job_id", job.ID,
 		}
@@ -88,21 +88,55 @@ func (w *DigestWorker) Work(ctx context.Context, job *river.Job[DigestArgs]) err
 		// digest_messages row with status='dry_run', and nothing is queued for
 		// Slack. Gated on both the config switch and the status the service
 		// reported, so neither side alone can leak a message into a channel.
-		if !w.svc.cfg.SlackSendEnabled || out.Status == StatusDryRun {
-			w.log.Infow("digest built (dry run — nothing sent)", fields...)
-			return nil
-		}
+		dryRun := !w.svc.cfg.SlackSendEnabled || out.Status == StatusDryRun
 
 		var errs []error
-		for _, id := range out.Messages {
-			if _, err := w.svc.EnqueueSlackSend(ctx, SlackSendArgs{MessageID: id, Team: team.Name}); err != nil {
-				// One part failing to enqueue must not cancel the ones that did:
-				// a digest missing its second half is still worth having.
-				errs = append(errs, err)
+		if !dryRun {
+			for _, id := range out.Messages {
+				if _, err := w.svc.EnqueueSlackSend(ctx, SlackSendArgs{MessageID: id, Team: team.Name}); err != nil {
+					// One part failing to enqueue must not cancel the ones that did:
+					// a digest missing its second half is still worth having.
+					errs = append(errs, err)
+				}
 			}
 		}
 
-		w.log.Infow("digest built", fields...)
+		msg, extra := digestLogLine(out, dryRun)
+		w.log.Infow(msg, append(fields, extra...)...)
 		return errors.Join(errs...)
 	})
+}
+
+// Messages a digest job's summary line can carry.
+const (
+	msgDigestBuilt  = "digest built"
+	msgDigestDryRun = "digest built (dry run — nothing sent)"
+	msgDigestReused = "digest slot was already built; nothing reassembled"
+)
+
+// digestLogLine names what the pass did and returns the fields only that branch
+// can answer.
+//
+// A function rather than a switch inside Work because the ordering is the whole
+// content and it is otherwise testable only by capturing log output. Reused is
+// answered FIRST, and that is the bug this replaced: the dry-run return used to
+// come before it, so on a deployment with slack_send_enabled off — which is what
+// config.example.yaml ships — every pass took that branch, and a run assembled
+// hours earlier was announced as a fresh "digest built (dry run)". Whether
+// anything was queued for Slack and whether anything was assembled are two
+// different questions.
+func digestLogLine(out *DigestOutcome, dryRun bool) (string, []any) {
+	if out.Reused {
+		// built_at is what makes the line an answer rather than a note — at 17:03,
+		// "the 14:00 slot you are missing was assembled at 14:45" is the whole
+		// question. failed_repos and linear_degraded are deliberately absent:
+		// digest_runs does not store them, so printing zeros would report "nothing
+		// degraded" for a question this pass never asked.
+		return msgDigestReused, []any{"built_at", out.BuiltAt.Format(time.RFC3339)}
+	}
+	degradations := []any{"failed_repos", out.FailedRepos, "linear_degraded", out.LinearDegraded}
+	if dryRun {
+		return msgDigestDryRun, degradations
+	}
+	return msgDigestBuilt, degradations
 }

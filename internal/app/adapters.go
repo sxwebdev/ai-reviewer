@@ -94,9 +94,11 @@ func fromServiceScan(res *service.ScanResult) *jobs.ScanResult {
 		return nil
 	}
 	out := &jobs.ScanResult{
-		StalePublish: res.StalePublish,
-		Snapshots:    res.Snapshots,
-		Failed:       res.Failed,
+		StalePublish:   res.StalePublish,
+		Snapshots:      res.Snapshots,
+		Failed:         res.Failed,
+		Open:           res.Open,
+		ReviewDisabled: res.ReviewDisabled,
 	}
 	out.Candidates = make([]jobs.ReviewRequest, 0, len(res.Candidates))
 	for _, c := range res.Candidates {
@@ -133,11 +135,20 @@ func fromServiceDigest(out *service.DigestOutcome) *jobs.DigestOutcome {
 		Status:           out.Status,
 		MRCount:          out.MRCount,
 		LinearIssueCount: out.LinearIssueCount,
+		Reused:           out.Reused,
+		BuiltAt:          out.BuiltAt,
+		FailedRepos:      out.FailedRepos,
+		LinearDegraded:   out.LinearDegraded,
+		Parts:            out.Parts,
 	}
 }
 
-func (a jobsAdapter) SendMessage(ctx context.Context, messageID uuid.UUID) error {
-	return a.svc.SendMessage(ctx, messageID)
+func (a jobsAdapter) SendMessage(ctx context.Context, messageID uuid.UUID) (jobs.SendOutcome, error) {
+	out, err := a.svc.SendMessage(ctx, messageID)
+	return jobs.SendOutcome{
+		Delivered: out.Delivered, Status: out.Status,
+		Part: out.Part, Parts: out.Parts, TS: out.TS,
+	}, err
 }
 
 // RunSlackCommand carries a command across the seam. The scope is re-typed
