@@ -1271,23 +1271,51 @@ func TestWaitingFor(t *testing.T) {
 	}
 }
 
-// TestOrderedPeopleRanksBusiestFirst pins the order the digest's people are
-// assembled in: workload descending, key ascending as the tiebreak. The busiest
-// queue is the one a reader is looking for (alphabetical order buried it), and a
-// tie has to break the same way every run or two slots that saw identical work
-// would reshuffle the digest between them.
-func TestOrderedPeopleRanksBusiestFirst(t *testing.T) {
+// TestOrderedPeopleSortsByDisplayName pins the order the digest's people are
+// assembled in: alphabetical by the name the reader sees, workload ignored.
+//
+// The display name and not the map key, because the key is the GitLab username
+// and the digest renders Slack mentions — an order derived from a string the
+// reader never sees looks like no order at all. Workload used to decide this;
+// the cost was that a person's position moved every slot, so nobody could find
+// their own block without reading the whole digest.
+func TestOrderedPeopleSortsByDisplayName(t *testing.T) {
 	t.Parallel()
 	people := map[string]*slack.PersonDigest{
-		"quiet": {ToReview: []slack.ReviewItem{{}}},
-		// Both halves count towards the workload: three merge requests owed.
-		"busy": {ToReview: []slack.ReviewItem{{}, {}}, Own: []slack.AuthorItem{{}}},
-		"anna": {Own: []slack.AuthorItem{{}}},
+		// The busiest person, and last alphabetically: workload must not rescue them
+		// to the top.
+		"zz": {
+			Person:   slack.Mention{SlackID: "U3", Display: "Zoe Zimmer"},
+			ToReview: []slack.ReviewItem{{}, {}}, Own: []slack.AuthorItem{{}},
+		},
+		// Lower-cased before comparing, so casing does not split the alphabet in two.
+		"bb": {Person: slack.Mention{SlackID: "U2", Display: "bob Brown"}, ToReview: []slack.ReviewItem{{}}},
+		"aa": {Person: slack.Mention{SlackID: "U1", Display: "Anna Adams"}, Own: []slack.AuthorItem{{}}},
 	}
 	got := orderedPeople(people)
-	want := []string{"busy", "anna", "quiet"}
+	want := []string{"aa", "bb", "zz"}
 	if !slices.Equal(got, want) {
-		t.Errorf("orderedPeople = %v, want %v (workload desc, key asc on a tie)", got, want)
+		t.Errorf("orderedPeople = %v, want %v (display name ascending)", got, want)
+	}
+}
+
+// TestOrderedPeopleFallsBackToTheKey: Display is empty only if the matcher
+// returned nothing usable, and an order that collapsed those people into one
+// bucket would reshuffle them between runs — the map is a map.
+func TestOrderedPeopleFallsBackToTheKey(t *testing.T) {
+	t.Parallel()
+	people := map[string]*slack.PersonDigest{
+		"nobody-c": {Person: slack.Mention{SlackID: "U3"}, Own: []slack.AuthorItem{{}}},
+		"nobody-a": {Person: slack.Mention{SlackID: "U1"}, Own: []slack.AuthorItem{{}}},
+		"nobody-b": {Person: slack.Mention{SlackID: "U2"}, Own: []slack.AuthorItem{{}}},
+	}
+	want := []string{"nobody-a", "nobody-b", "nobody-c"}
+	// Repeated, because a single pass cannot tell a stable order from a lucky one:
+	// Go randomises map iteration and the slice starts life in that order.
+	for range 20 {
+		if got := orderedPeople(people); !slices.Equal(got, want) {
+			t.Fatalf("orderedPeople = %v, want %v (key ascending when no name resolved)", got, want)
+		}
 	}
 }
 

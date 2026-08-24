@@ -811,18 +811,42 @@ func (s *Service) digestData(
 	return data, len(counted)
 }
 
-// orderedPeople sorts the digest's people by how much they owe, most first, and
-// falls back to the key so a tie is stable from one run to the next. The busiest
-// queue is the one a reader is looking for; alphabetical order buried it.
+// orderedPeople sorts the digest's people alphabetically by the name the reader
+// sees, with the map key as the tiebreak so a run is reproducible.
+//
+// By display name and not by the key, which is the GitLab username: the key is
+// what the service calls a person, the display name is what Slack draws, and on
+// a digest full of `<@U024BE7LH>` an order derived from the username reads as no
+// order at all. Mention.Display carries the resolved Slack name for a matched
+// person and the "John Smith (@john)" fallback for everyone else, so the sort key
+// is the rendered text in both cases.
+//
+// This replaces workload-descending. Ranking the busiest first put the longest
+// queue where a reader looks first, and the cost was that nobody could find
+// *themselves*: a person's position moved every slot, so reading the digest meant
+// scanning the whole thing. A digest is read far more often to answer "what do I
+// owe" than "who is drowning" — and the per-person counts in the header
+// (`· to review 11`) still answer the second question without an ordering that
+// reshuffles between slots.
 func orderedPeople(people map[string]*slack.PersonDigest) []string {
 	keys := make([]string, 0, len(people))
 	for k := range people {
 		keys = append(keys, k)
 	}
+	// Lower-cased so "anna" and "Anna" sort together, which is what alphabetical
+	// means to a reader. Byte order beyond that, so a Cyrillic name sorts after
+	// every Latin one rather than interleaved — a full Unicode collation would
+	// mean a new dependency to settle an order nobody is looking up by letter.
+	sortKey := func(k string) string {
+		if d := strings.ToLower(strings.TrimSpace(people[k].Person.Display)); d != "" {
+			return d
+		}
+		return k
+	}
 	sort.SliceStable(keys, func(i, j int) bool {
-		ti, tj := people[keys[i]].Total(), people[keys[j]].Total()
-		if ti != tj {
-			return ti > tj
+		si, sj := sortKey(keys[i]), sortKey(keys[j])
+		if si != sj {
+			return si < sj
 		}
 		return keys[i] < keys[j]
 	})

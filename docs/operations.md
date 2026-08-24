@@ -224,8 +224,11 @@ Reading it:
   make the list scannable once you know them — they are not what carries the
   meaning, because a digest whose rows have to be decoded is one nobody reads
   twice.
-- **People are ordered by how much they owe**, most first. The biggest queue is
-  the one worth looking at, and alphabetical order buried it.
+- **People are ordered alphabetically** by the name Slack draws, so a reader
+  finds their own block in the same place every slot. Workload used to decide
+  this and the position moved from digest to digest; the per-person counts in
+  each header (`· to review 11`) still say who is drowning, without an order that
+  reshuffles.
 - **Reviews:** the three oldest get a full row; the rest are the
   `+N more to review:` line. Every merge request is linked — nothing is dropped,
   only shortened, and the tail names the action once rather than on every entry.
