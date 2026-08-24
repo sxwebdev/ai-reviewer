@@ -112,12 +112,16 @@ func (c *Config) Validate() error {
 	if c.Slack.AppToken.IsSet() {
 		team := strings.TrimSpace(c.Slack.Commands.Team)
 		mine := strings.TrimSpace(c.Slack.Commands.Mine)
-		for field, name := range map[string]string{
-			"slack.commands.team": team,
-			"slack.commands.mine": mine,
+		// A slice, not a map: Validate returns one numbered list and every other
+		// check contributes to it in source order, so ranging a map would reorder
+		// these two against each other between runs on a config that gets both
+		// wrong — which makes the output undiffable for no reason at all.
+		for _, cmd := range []struct{ field, name string }{
+			{"slack.commands.team", team},
+			{"slack.commands.mine", mine},
 		} {
-			if !validSlashCommand(name) {
-				add("%s %q is not a slash command (expected e.g. /all)", field, name)
+			if !validSlashCommand(cmd.name) {
+				add("%s %q is not a slash command (expected e.g. /all)", cmd.field, cmd.name)
 			}
 		}
 		// Same name for both is not a naming quibble: the dispatcher would have to

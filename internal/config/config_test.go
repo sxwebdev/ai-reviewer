@@ -1078,6 +1078,35 @@ func TestValidateSlackCommands(t *testing.T) {
 		}
 	})
 
+	// Validate returns one numbered list, so the same broken config must produce
+	// the same text every run: an operator diffing two runs, or a test asserting
+	// on the message, cannot work against an order that comes from map iteration.
+	t.Run("both names wrong report in a fixed order", func(t *testing.T) {
+		c := base()
+		c.Slack.AppToken = "xapp-1-A0-0-secret"
+		c.Slack.Commands.Team = "all"
+		c.Slack.Commands.Mine = "my"
+		first := c.Validate()
+		if first == nil {
+			t.Fatal("want both names rejected")
+		}
+		teamAt := strings.Index(first.Error(), "slack.commands.team")
+		mineAt := strings.Index(first.Error(), "slack.commands.mine")
+		if teamAt < 0 || mineAt < 0 {
+			t.Fatalf("both names must be named: %v", first)
+		}
+		if teamAt > mineAt {
+			t.Errorf("team is reported after mine; the order must follow the source: %v", first)
+		}
+		// Repeated rather than reasoned about: Go randomises map iteration per
+		// range, so a single run cannot tell a fixed order from a lucky one.
+		for range 50 {
+			if got := c.Validate(); got.Error() != first.Error() {
+				t.Fatalf("validation text is not stable:\n%v\n%v", first, got)
+			}
+		}
+	})
+
 	// Without an app token nothing listens, so the names are inert and must not
 	// fail a deployment that never set them.
 	t.Run("names are not checked without the token", func(t *testing.T) {
