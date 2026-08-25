@@ -1,0 +1,123 @@
+# ai-reviewer — a complete, runnable deployment: PostgreSQL and the service.
+#
+#   cp .env.example .env    # fill in the tokens
+#   cp config.example.yaml config.yaml    # list your teams and repositories
+#   docker compose up -d
+#
+# There is no migrations step. `postgres.migrate_on_start` is on by default, so
+# the service applies the schema itself at startup — its own migrations first,
+# then River's. Scaling out does not need a second thought: App.Migrate holds one
+# session advisory lock across both migrators, so replicas starting together
+# serialise, and every one after the first finds nothing pending.
+#
+# Copy config.example.yaml to config.yaml BEFORE the first `up`. The bind mount
+# below has no source to bind if you do not, and Docker's response to that is to
+# create a *directory* at that path — the service then dies with
+# "read /etc/ai-reviewer/config.yaml: is a directory", which reads like a bug in
+# the service and is not one.
+#
+# Both write paths (`service.slack_send_enabled`, `service.ai_review_publish_enabled`)
+# are off in config.example.yaml, so a first run observes and records without
+# posting anything. Switch them on once `ai-reviewer doctor` is green and the
+# persisted dry runs look right.
+
+name: ai-reviewer
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AI_REVIEWER_POSTGRES_USERNAME:-ai_reviewer}
+      POSTGRES_PASSWORD: ${AI_REVIEWER_POSTGRES_PASSWORD:?set it in .env}
+      POSTGRES_DB: ${AI_REVIEWER_POSTGRES_DATABASE:-ai_reviewer}
+      # Deterministic collation, so index ordering does not depend on the host locale.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AI_REVIEWER_POSTGRES_USERNAME:-ai_reviewer}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Not published to the host: nothing outside this network needs it. Add a
+    # `ports:` mapping only if you want to inspect the database yourself.
+
+  ai-reviewer:
+    image: ai-reviewer:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["start"]
+    environment:
+      # Set as an environment variable rather than a --config flag so that every
+      # command finds the file, not just the one in `command:` above:
+      # `docker compose exec ai-reviewer ai-reviewer doctor` would otherwise look
+      # for ./config.yaml in the workdir and report an empty configuration.
+      AI_REVIEWER_CONFIG: /etc/ai-reviewer/config.yaml
+
+      AI_REVIEWER_POSTGRES_HOST: postgres
+      AI_REVIEWER_POSTGRES_USERNAME: ${AI_REVIEWER_POSTGRES_USERNAME:-ai_reviewer}
+      AI_REVIEWER_POSTGRES_PASSWORD: ${AI_REVIEWER_POSTGRES_PASSWORD:?set it in .env}
+      AI_REVIEWER_POSTGRES_DATABASE: ${AI_REVIEWER_POSTGRES_DATABASE:-ai_reviewer}
+      # The database is reachable only over this compose network.
+      AI_REVIEWER_POSTGRES_SSL_MODE: disable
+
+      AI_REVIEWER_GITLAB_TOKEN: ${AI_REVIEWER_GITLAB_TOKEN:?set it in .env}
+      # Optional: required only when config.yaml declares linear_team_ids.
+      # A null Compose value forwards it only when present, so an absent value
+      # does not overwrite YAML/Vault with an empty environment variable.
+      AI_REVIEWER_LINEAR_API_KEY:
+      AI_REVIEWER_SLACK_TOKEN: ${AI_REVIEWER_SLACK_TOKEN:?set it in .env}
+      # Optional: the app-level token (xapp-…) that switches the in-chat
+      # commands on. Forwarded only when present, like the Linear key above — an
+      # empty value here would look like "commands configured" to config
+      # validation while nothing could ever connect.
+      AI_REVIEWER_SLACK_APP_TOKEN:
+
+      # `existing-login` cannot work in a container — it inherits a login from
+      # the host keychain, which is not here. Use a token.
+      AI_REVIEWER_LLM_CLAUDE_AUTH_MODE: oauth-token
+      AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN: ${AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN:?set it in .env}
+    volumes:
+      - ./config.yaml:/etc/ai-reviewer/config.yaml:ro
+      # review.workdir: git mirrors and per-review worktrees. A named volume
+      # rather than the image layer — one mirror can be gigabytes — and it comes
+      # up owned by the image's non-root user. The cleanup job sweeps it.
+      #
+      # config.example.yaml sets `review.workdir: /work`, and that file is what
+      # decides: the image sets no AI_REVIEWER_REVIEW_WORKDIR, because the
+      # environment outranks the file and the variable would make the key inert
+      # in here. Drop the key and the relative default ./data resolves against
+      # the image's WORKDIR /work, i.e. /work/data — still inside this volume.
+      #
+      # Pointing the key somewhere else works, but mount the volume on that path
+      # AND make the path writable by uid 10001: /work is the one directory the
+      # image creates and chowns, so a named volume mounted anywhere else comes up
+      # root-owned and the service refuses to start (loudly — `doctor` says so too).
+      - work:/work
+    ports:
+      # ops only: /livez, /readyz, /metrics. The service has no other listener.
+      - "10000:10000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:10000/livez || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    # Claude Code wants 4 GB+ per concurrent review, and `review.max_parallel`
+    # of them run in this one container. Raise both together or neither.
+    mem_limit: 10g
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Scaling out is safe: River makes one head SHA reviewable once and elects a
+    # single leader for the periodic jobs, and mirror fetches in a shared `work`
+    # volume are serialised per repository by a Postgres advisory lock. Give each
+    # replica its 4 GB+ per concurrent review before raising this.
+    # deploy: { replicas: 1 }
+
+volumes:
+  pgdata:
+  work:

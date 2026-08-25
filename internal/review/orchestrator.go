@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +12,7 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/tkcrm/mx/logger"
 )
 
 // ReviewInput is everything the engine needs to review one MR at a head sha.
@@ -46,9 +47,6 @@ type ReviewInput struct {
 	// re-review focuses on the interdiff and honours prior dispositions.
 	PriorReview *PriorReview
 
-	// RelatedFiles are FTS-suggested investigation leads (agent mode).
-	RelatedFiles []RelatedFile
-
 	// Risk is the deterministic risk assessment (nil when disabled); it points
 	// the passes at hot spots and is persisted alongside the review.
 	Risk *RiskReport
@@ -57,21 +55,11 @@ type ReviewInput struct {
 	// opt-in measurement did not run); facts for the passes and the skeptic.
 	Coverage *coverage.Report
 
-	Memory  []MemoryRule
 	Profile *Profile
 
 	ExistingFingerprints map[string]bool
 	PipelineStatus       string
 	ExistingDiscussions  int
-
-	// UserContext is free-form reviewer-supplied context typed at run time. It is
-	// rendered verbatim into a dedicated prompt section (it is the user's own
-	// input to their own LLM, so it is not scrubbed; it is not written to logs).
-	UserContext string
-
-	// Skills are Claude skill names the reviewer selected for this run. They are
-	// named in the prompt and enabled on the CLI (agent mode only).
-	Skills []string
 
 	// Agent mode.
 	WorkDir      string
@@ -91,22 +79,28 @@ type Result struct {
 	Recommendation string
 	Findings       []ValidatedFinding
 	Suppressed     []SuppressedFinding // dropped-but-surfaced findings (informational, never published)
-	MissingTests   []llm.MissingTest
-	Questions      []llm.Question
-	Raw            string
-	CostUSD        float64
-	PassReports    []PassReport
-	Completeness   *CompletenessReport
+	// SuppressedCounts is how many findings each Suppress* stage dropped, counted
+	// BEFORE Suppressed is ranked and capped at maxSuppressed. Reading the counts
+	// off the capped slice would understate a noisy run, which is exactly the run
+	// worth understanding. It answers "the review found nothing — why?" without a
+	// database query.
+	SuppressedCounts map[string]int
+	MissingTests     []llm.MissingTest
+	Questions        []llm.Question
+	Raw              string
+	CostUSD          float64
+	PassReports      []PassReport
+	Completeness     *CompletenessReport
 }
 
 // Engine runs the LLM review pipeline.
 type Engine struct {
 	client llm.Client
-	log    *slog.Logger
+	log    logger.Logger
 }
 
 // NewEngine builds an Engine.
-func NewEngine(client llm.Client, log *slog.Logger) *Engine {
+func NewEngine(client llm.Client, log logger.Logger) *Engine {
 	return &Engine{client: client, log: log}
 }
 
@@ -154,7 +148,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 			r, cost, err := e.checkCompleteness(complCtx, in)
 			complCost, complDur, complErr = cost, time.Since(start), err
 			if err != nil {
-				e.log.Warn("completeness audit failed", "err", err)
+				e.log.Warnw("completeness audit failed", "err", err)
 			} else {
 				completeness = r
 			}
@@ -180,7 +174,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		start := time.Now()
 		reflected, reflectCost, err := e.selfReflect(ctx, in, merged)
 		if err != nil {
-			e.log.Warn("self-reflection failed; keeping original findings", "err", err)
+			e.log.Warnw("self-reflection failed; keeping original findings", "err", err)
 		} else {
 			merged = applyReflect(merged, reflected, e.log)
 		}
@@ -224,11 +218,19 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		suppressed = append(suppressed, verifierDropped...)
 	}
 
-	// Stage 6: finalize.
+	// Stage 6: finalize. The cap records what it cuts (SuppressMaxComments) —
+	// findings that survived every gate and only ranked too low are still findings
+	// the review paid for and discarded, and this is the drop an operator can undo
+	// by raising review.max_comments.
 	rankFindings(findings)
-	if len(findings) > maxComments {
-		findings = findings[:maxComments]
-	}
+	findings, capped := capFindings(findings, maxComments,
+		fmt.Sprintf("ranked outside the %d comments review.max_comments allows", maxComments))
+	suppressed = append(suppressed, capped...)
+
+	// Counted before the cap: the truncated slice is for display, the counts are
+	// for explaining the outcome, and a run noisy enough to be truncated is the one
+	// most in need of explaining.
+	suppressedCounts := countSuppressed(suppressed)
 	// Suppressed items are informational only — rank by severity and bound the
 	// list so a noisy run can't bloat the stored review.
 	suppressed = rankSuppressed(suppressed)
@@ -246,14 +248,55 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 		reports = append(reports, rep)
 	}
 
-	e.log.Info("review complete",
+	// The suppression breakdown is the difference between "found nothing" and
+	// "found something and threw it away", which used to be invisible: the reasons
+	// existed only inside pipeline_json, so explaining a $5 review that published
+	// nothing meant querying the database.
+	e.log.Infow("review complete",
 		"passes", len(specs), "raw_findings", len(merged.Findings), "validated", len(findings),
+		"suppressed", formatSuppressedCounts(suppressedCounts),
 		"risk", merged.RiskLevel, "cost_usd", merged.CostUSD)
 
 	res := assembleResult(merged, findings, reports)
 	res.Suppressed = suppressed
+	res.SuppressedCounts = suppressedCounts
 	res.Completeness = completeness
 	return res, nil
+}
+
+// countSuppressed tallies suppressions by stage.
+func countSuppressed(fs []SuppressedFinding) map[string]int {
+	if len(fs) == 0 {
+		return nil
+	}
+	counts := make(map[string]int, len(fs))
+	for _, f := range fs {
+		counts[f.Stage]++
+	}
+	return counts
+}
+
+// formatSuppressedCounts renders the tally as "not_in_diff=2 threshold=1" —
+// stage order fixed so two log lines from different runs can be compared by eye.
+// Empty when nothing was suppressed, so the quiet case stays quiet.
+func formatSuppressedCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	stages := make([]string, 0, len(counts))
+	for stage := range counts {
+		stages = append(stages, stage)
+	}
+	sort.Strings(stages)
+
+	var b strings.Builder
+	for _, stage := range stages {
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s=%d", stage, counts[stage])
+	}
+	return b.String()
 }
 
 // applyReflect merges a self-reflection result back into the review response
@@ -269,7 +312,7 @@ func (e *Engine) Review(ctx context.Context, in ReviewInput) (*Result, error) {
 //     add — post findings whose file+title key was not in the pre-reflect set
 //     (hallucinated additions, reworded titles) are dropped in Go, not trusted
 //     to the prompt instruction.
-func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewResponse {
+func applyReflect(pre, post *llm.ReviewResponse, log logger.Logger) *llm.ReviewResponse {
 	key := func(f llm.Finding) string {
 		return strings.ToLower(strings.TrimSpace(f.FilePath)) + "\x00" + normalizeTitle(f.Title)
 	}
@@ -288,7 +331,7 @@ func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewRe
 	for _, f := range post.Findings {
 		k := key(f)
 		if !preKeys[k] {
-			log.Warn("self-reflection added a new finding; dropping (verification may only remove or demote)",
+			log.Warnw("self-reflection added a new finding; dropping (verification may only remove or demote)",
 				"file", f.FilePath, "title", f.Title)
 			continue
 		}
@@ -304,7 +347,7 @@ func applyReflect(pre, post *llm.ReviewResponse, log *slog.Logger) *llm.ReviewRe
 		if SeverityRank(NormalizeSeverity(f.Severity)) < SeverityRank("blocking") || postKeys[key(f)] {
 			continue
 		}
-		log.Warn("self-reflection removed a blocking finding; restoring demoted for human check",
+		log.Warnw("self-reflection removed a blocking finding; restoring demoted for human check",
 			"file", f.FilePath, "title", f.Title)
 		f.Confidence = min(f.Confidence, 0.5)
 		f.RequiresHumanCheck = true

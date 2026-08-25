@@ -1,0 +1,133 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/tkcrm/pgxgen/master/schemas/pgxgen-schema.json
+version: "2"
+
+schemas:
+  - name: main
+    engine: postgresql
+    schema_dir: migrations
+
+    models:
+      output_dir: ../internal/models
+      output_file_name: models_gen.go
+      package_name: models
+      package_path: github.com/sxwebdev/ai-reviewer/internal/models
+      emit_json_tags: true
+      emit_db_tags: true
+      # database/sql here (rather than pgx/v5) so nullable columns become the
+      # sql.Null* wrappers instead of pgtype.*; the sqlc overrides below map the
+      # same SQL types identically, which is what keeps the shared models
+      # package scannable by the generated pgx queries.
+      sql_package: database/sql
+      type_overrides:
+        - sql_type: jsonb
+          go_type: dbtypes.JSON
+          import: github.com/sxwebdev/ai-reviewer/internal/dbtypes
+        - sql_type: uuid
+          go_type: uuid.UUID
+          import: github.com/google/uuid
+        # numeric would otherwise be a string in the models package and a
+        # pgtype.Numeric in the queries. decimal.Decimal is exact: cost_usd is
+        # numeric(12,6) and money summed over thousands of reviews must not
+        # accumulate binary-float error. pgx v5 needs no codec registered for
+        # it — decimal.Decimal is a driver.Valuer and a sql.Scanner, which pgx
+        # falls back to; verified round-tripping 12.345678 in binary format
+        # against the real column by TestReviewCostRoundTrip.
+        - sql_type: numeric
+          go_type: decimal.Decimal
+          import: github.com/shopspring/decimal
+
+    sqlc:
+      defaults:
+        sql_package: pgx/v5
+        emit_prepared_queries: false
+        emit_json_tags: true
+        emit_db_tags: true
+        emit_exported_queries: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        emit_result_struct_pointers: true
+        emit_params_struct_pointers: false
+        emit_enum_valid_method: true
+        emit_all_enum_values: true
+        query_parameter_limit: 2
+      overrides:
+        types:
+          - db_type: jsonb
+            go_type: "github.com/sxwebdev/ai-reviewer/internal/dbtypes.JSON"
+          - db_type: jsonb
+            nullable: true
+            go_type: "github.com/sxwebdev/ai-reviewer/internal/dbtypes.JSON"
+          - db_type: uuid
+            go_type: github.com/google/uuid.UUID
+          - db_type: uuid
+            nullable: true
+            go_type: github.com/google/uuid.NullUUID
+          - db_type: timestamptz
+            go_type: "time.Time"
+          - db_type: timestamptz
+            nullable: true
+            go_type: "database/sql.NullTime"
+          - db_type: date
+            go_type: "time.Time"
+          - db_type: pg_catalog.numeric
+            go_type: "github.com/shopspring/decimal.Decimal"
+          - db_type: pg_catalog.numeric
+            nullable: true
+            go_type: "github.com/shopspring/decimal.NullDecimal"
+          # mr_findings.note_id is the only nullable integer; sql.NullInt64 keeps
+          # it in the same family as the sql.NullTime above.
+          - db_type: pg_catalog.int8
+            nullable: true
+            go_type: "database/sql.NullInt64"
+
+    defaults:
+      crud:
+        auto_clean: true
+        exclude_table_name: true
+      constants:
+        include_column_names: true
+
+    tables:
+      # mr_findings has no generated CRUD on purpose: every insert must carry
+      # ON CONFLICT DO NOTHING (see sql/queries/finding/findings.sql), and a
+      # generated Create would be a footgun sitting next to it.
+      mr_findings:
+        primary_column: id
+        queries_dir: queries/finding
+        output_dir: ../internal/store/repos/repo_finding
+
+      mr_reviews:
+        primary_column: id
+        queries_dir: queries/review
+        output_dir: ../internal/store/repos/repo_review
+        crud:
+          methods:
+            create:
+              skip_columns: [id, created_at]
+              returning: "*"
+            get:
+              name: GetByID
+
+      digest_runs:
+        primary_column: id
+        queries_dir: queries/digestrun
+        output_dir: ../internal/store/repos/repo_digestrun
+        crud:
+          methods:
+            create:
+              skip_columns: [id, created_at]
+              returning: "*"
+            get:
+              name: GetByID
+
+      digest_messages:
+        primary_column: id
+        queries_dir: queries/digestmessage
+        output_dir: ../internal/store/repos/repo_digestmessage
+        crud:
+          methods:
+            create:
+              skip_columns: [id, created_at]
+              returning: "*"
+            get:
+              name: GetByID

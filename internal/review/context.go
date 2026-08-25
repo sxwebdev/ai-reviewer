@@ -19,8 +19,6 @@ type ContextBudget struct {
 
 	IncludePriorReview bool // include the previous review + interdiff on re-review
 	MaxInterdiffBytes  int  // budget for the interdiff section
-
-	MaxRelatedFiles int // FTS-suggested related files listed for investigation (0 = off)
 }
 
 // DefaultContextBudget returns the default enrichment budget.
@@ -35,15 +33,7 @@ func DefaultContextBudget() ContextBudget {
 		MaxDiscussionBytes: 4 << 10,
 		IncludePriorReview: true,
 		MaxInterdiffBytes:  32 << 10,
-		MaxRelatedFiles:    5,
 	}
-}
-
-// RelatedFile is a likely-related repository file suggested to the model as an
-// investigation lead (agent mode).
-type RelatedFile struct {
-	Path   string
-	Reason string
 }
 
 // CommitInfo is one MR commit shown to the model (intent context the MR
@@ -65,16 +55,31 @@ type DiscussionNote struct {
 	OwnBot   bool // authored by this tool's reviewer identity
 }
 
-// PriorFinding is one finding from the previous review of this MR, with its
-// human disposition, so a re-review does not re-raise settled topics.
+// PriorFinding is one finding from the previous review of this MR, so a
+// re-review does not spend tokens re-deriving what was already said.
+//
+// Status is the team-service disposition, and there are only two: a finding
+// either reached the merge request or it did not. The old personal-workflow
+// vocabulary (proposed/approved/rejected/drafted) described a human approving
+// each comment in a local UI before it was posted; that workflow no longer
+// exists, and the human's reaction now arrives through DiscussionNote instead —
+// a thread they resolved or replied to is visible there as a settled topic.
 type PriorFinding struct {
-	Title           string
-	FilePath        string
-	Line            int
-	Severity        string
-	Status          string // proposed|approved|rejected|drafted|published|failed
-	RejectionReason string
+	Title    string
+	FilePath string
+	Line     int
+	Severity string
+	Status   string // published | pending
 }
+
+// Prior-finding dispositions.
+const (
+	// PriorPublished — the finding is hanging on the merge request right now.
+	PriorPublished = "published"
+	// PriorPending — computed but never posted: a dry run, or a publication that
+	// has not finished.
+	PriorPending = "pending"
+)
 
 // PriorReview is the previous review of this MR (at an older head SHA) plus
 // the interdiff between that head and the current one.

@@ -1,0 +1,250 @@
+# ai-reviewer — example configuration.
+#
+# Sources, in increasing priority: this file → environment (AI_REVIEWER_*) →
+# Vault. Every field below can be set from the environment; the variable name is
+# AI_REVIEWER_ + the field's `env:` tag (see internal/config/config.go).
+#
+# Vault keys are those SAME full names, prefix included: xconfigvault looks a
+# field up by the name the env plugin stamped on it, so gitlab.token lives in
+# Vault under AI_REVIEWER_GITLAB_TOKEN.
+#
+# Secrets are left empty here on purpose: put them in the environment or Vault,
+# never in a file that lives in git.
+
+log:
+  level: info # debug | info | warn | error | fatal | panic
+  format: json # json | console
+
+ops: # mx ops server: /livez, /readyz, /metrics
+  enabled: true
+  healthy: { enabled: true, port: "10000" }
+  metrics: { enabled: true, port: "10000" }
+  # /debug/pprof is off by default and stays that way until something in front of
+  # the ops port restricts it: this port carries no authentication of its own, so
+  # a profiler here hands heap and goroutine dumps to anything that can reach it.
+  profiler: { enabled: false, port: "10000" }
+
+service:
+  # Both switches are off by default: a fresh deployment observes and records
+  # without writing anything to GitLab or Slack until an operator opts in.
+  slack_send_enabled: false
+  ai_review_publish_enabled: false
+
+digest:
+  # The default schedule. Any team may override any part of it in teams[].digest.
+  #
+  # slots are wall-clock times in `timezone`, and they are also the values stored
+  # in digest_runs.slot — so editing either starts a new series: runs already
+  # filed under a slot you remove keep their old name, and on the day of the
+  # change a replica that starts after a newly added slot has passed will build
+  # that slot too. One extra digest, once.
+  timezone: Europe/Moscow
+  slots:
+    - "09:00"
+    - "14:00"
+    - "17:30"
+  # Days with no digest at all: nothing is built and nothing is sent. The
+  # calendar day is the one in `timezone` — "Saturday" means Saturday where the
+  # team is. Both lists are empty by default, i.e. a digest every day.
+  #
+  #   skip_weekdays: [sat, sun]          # long forms (saturday) are accepted too
+  #
+  # Dates take either form: 2026-05-09 is that one day, 05-09 is the same day
+  # every year. Prefer the annual form for holidays — a list of full dates
+  # silently expires each December, and the failure is a digest that starts
+  # arriving on a holiday again.
+  #
+  #   skip_dates: ["01-01", "01-02", "05-09", "2026-12-31"]
+  skip_weekdays: []
+  skip_dates: []
+
+postgres:
+  host: localhost
+  port: "5432"
+  database: ai_reviewer
+  username: "" # AI_REVIEWER_POSTGRES_USERNAME (env and Vault key alike)
+  password: "" # AI_REVIEWER_POSTGRES_PASSWORD
+  ssl_mode: require
+  # Apply pending migrations (this schema, then River's) at startup. Safe with
+  # any number of replicas — one advisory lock is held across both migrators, so
+  # they serialise. Set false only if something else applies the schema.
+  migrate_on_start: true
+
+jobs:
+  # Graceful River drain on shutdown. It covers publication and Slack delivery;
+  # in-flight reviews are cancelled at once instead — one cannot finish inside any
+  # sane window, so waiting would only keep paying for output nobody reads.
+  drain_timeout: 60s
+  queues: # worker pool size per queue
+    default: 2
+    # The `review` queue is deliberately absent: its size is review.max_parallel,
+    # so review concurrency has one knob rather than two that can drift apart.
+    publish: 1 # serial publication is more predictable against rate limits
+    slack: 1
+  cleanup_interval: 1h
+
+gitlab:
+  base_url: https://gitlab.example.com # AI_REVIEWER_GITLAB_BASE_URL
+  token: "" # AI_REVIEWER_GITLAB_TOKEN
+  timeout: 30s
+  graphql_enabled: true # exact reviewer review states in one call per project
+  max_attempts: 4
+  max_retry_after: 60s
+
+linear:
+  # Optional read-only digest source. The key is required only when at least one
+  # teams[].linear_team_ids list is non-empty. Keep it in env or Vault.
+  endpoint: https://api.linear.app/graphql
+  api_key: "" # AI_REVIEWER_LINEAR_API_KEY
+  timeout: 15s
+  max_attempts: 4
+  max_retry_after: 60s
+
+slack:
+  token: "" # AI_REVIEWER_SLACK_TOKEN
+  # In-chat commands (optional). The app-level token is the switch: with it the
+  # service opens a Socket Mode connection and answers the two commands below;
+  # without it nothing listens and nothing is exposed. It is a *second* token —
+  # created on the app's Basic Information page with the connections:write scope
+  # — and it cannot replace the bot token above: apps.connections.open is the
+  # only method that accepts it, and the answers need the bot token's directory
+  # and mentions.
+  #
+  # Both commands must also be registered in the app configuration (Features →
+  # Slash Commands). In Socket Mode they need no Request URL.
+  app_token: "" # AI_REVIEWER_SLACK_APP_TOKEN
+  commands:
+    # The whole team's digest, posted to the channel the command was typed in.
+    team: /all # AI_REVIEWER_SLACK_COMMANDS_TEAM
+    # The caller's own rows, shown only to them.
+    mine: /my # AI_REVIEWER_SLACK_COMMANDS_MINE
+  directory_ttl: 15m # in-process TTL of the users.list cache
+  # Optional override for people the indexes below cannot match. The value may be
+  # a Slack user id, an @handle or an email:
+  #
+  #   user_map:
+  #     jsmith: U01ABCDEF      # id — resolved without calling users.list
+  #     adoe: "@adoe"          # handle
+  #     bkim: bkim@acme.io     # email
+  #
+  # An id is the only form that keeps working while users.list is unavailable,
+  # which is the case the override exists for; the other two are the forms you can
+  # actually look up by hand. `ai-reviewer doctor` resolves every entry and prints
+  # what it became, so a wrong one is caught before a digest goes out.
+  user_map: {}
+
+llm:
+  provider: claude-cli
+  timeout: 15m
+  claude:
+    bin: claude
+    model: sonnet
+    auth:
+      mode: existing-login # existing-login | oauth-token | api-key
+      # Note the names: the env tags are the bare variables claude itself
+      # understands, so prefixed they read AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN /
+      # AI_REVIEWER_ANTHROPIC_API_KEY rather than AI_REVIEWER_LLM_CLAUDE_AUTH_*.
+      oauth_token: "" # AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN
+      api_key: "" # AI_REVIEWER_ANTHROPIC_API_KEY
+    permission_mode: dontAsk
+    agent_mode: true
+    # Read-only and scoped: ${worktree} is substituted per review with the
+    # detached checkout claude runs in, which makes the worktree a boundary
+    # rather than just a working directory.
+    #
+    # There are deliberately no Bash(git …) rules. A rule is a prefix match, and
+    # every git subcommand that takes diff options accepts --output=<path> (an
+    # arbitrary-file write, which can manufacture a "clean build" verdict for the
+    # deterministic verifiers) and --no-index <any file> (an arbitrary-file read
+    # that walks around the path scope). History and the interdiff already reach
+    # the model through the prompt, assembled by Go from the mirror.
+    allowed_tools:
+      ["Read(${worktree}/**)", "Grep(${worktree}/**)", "Glob(${worktree}/**)"]
+    # Extra parent-environment variables the subprocess may inherit, on top of
+    # the built-in allowlist (PATH, HOME, TZ, LANG/LC_*, proxy and CA settings,
+    # claude's own switches). The service's secrets are never inherited.
+    passthrough_env: []
+
+review:
+  scan_interval: 5m
+  max_parallel: 2 # the only review concurrency knob; sizes the review queue
+  max_comments: 12
+  severity_threshold: medium
+  preferred_comment_language: auto
+  # Ephemeral mirrors and worktrees. The default is the relative ./data, which is
+  # what makes a local run work with no config at all. In a container it resolves
+  # against WORKDIR (/work), i.e. inside the mounted volume — and THIS key is what
+  # puts it at /work itself. The image deliberately sets no
+  # AI_REVIEWER_REVIEW_WORKDIR: the environment outranks the file, so the variable
+  # would make this line unsettable.
+  workdir: /work
+  # Excluded from the prompt AND from the finding-eligible set, on both sides of
+  # a rename. This is the default; setting the key replaces the list rather than
+  # adding to it.
+  ignore_globs:
+    [
+      vendor/**,
+      node_modules/**,
+      dist/**,
+      build/**,
+      "*.generated.*",
+      "*.pb.go",
+      "*.min.js",
+    ]
+  pipeline:
+    mode: standard # cheap | standard | deep | custom
+    max_parallel: 2
+    verify_mode: skeptic # skeptic | reflect | off
+    verify_max_findings: 24
+    # go_build/go_vet/py_syntax never execute repository code. tsc and go_test
+    # do, so they stay an explicit opt-in.
+    verifiers: [go_build, go_vet, py_syntax]
+    completeness: auto
+  context:
+    include_full_files: true
+    max_file_lines: 500
+    hunk_window_lines: 60
+    max_total_kb: 256
+    include_commits: true
+    include_discussions: true
+    max_discussion_kb: 4
+    prior_review: true
+    interdiff_max_kb: 32
+  risk:
+    enabled: true
+    history_commits: 500
+  coverage:
+    enabled: false # runs the reviewed repository's tests — explicit opt-in
+
+teams:
+  # ai_review.enabled is the switch that spends money: every open MR is reviewed
+  # once per head sha, at a few dollars each, and service.ai_review_publish_enabled
+  # above does NOT gate that — with it off the reviews still run and simply post
+  # nothing. So both start off here: bring up the digest, get `doctor` green, then
+  # turn reviewing on one team at a time.
+  - name: payments
+    slack_channel: C012345678
+    ai_review: { enabled: false }
+    # Linear team UUIDs: open the team in Linear, Cmd/Ctrl+K → Copy model UUID.
+    linear_team_ids: []
+    repositories: [backend/payments, backend/billing, frontend/checkout]
+
+  - name: platform
+    slack_channel: C987654321
+    ai_review: { enabled: false }
+    linear_team_ids: []
+    repositories: [platform/auth, platform/gateway]
+    # Every part of the schedule can be overridden on its own, and they inherit
+    # independently: a team in another country usually keeps the company's slot
+    # times, a team with an unusual rhythm usually keeps the zone, and a team that
+    # works weekends keeps the company holidays while dropping the weekend rule.
+    # Omit the block entirely — as `payments` does above — to inherit everything.
+    #
+    # A team's list REPLACES the global one; it cannot subtract from it. A
+    # non-empty list means "these are my skipped days", an empty one means
+    # "inherit", and there is no third value — so a team that must ignore a global
+    # skip list carries its own.
+    digest:
+      timezone: Europe/Lisbon
+      slots: ["10:00", "18:00"]
+      skip_weekdays: [sun]

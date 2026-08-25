@@ -1,423 +1,481 @@
 // Package config defines the ai-reviewer configuration schema and loading.
 //
-// Configuration is loaded from a YAML file (default ~/.ai-reviewer/config.yaml)
-// via the xconfig library, with environment-variable overrides (prefix
-// AI_REVIEWER_). Defaults come from DefaultConfig() rather than xconfig's
-// `default` struct tags: tag-based defaults reset any zero-valued field, which
-// silently flips an explicit `false` back to a `true` default — so we start
-// from a fully-populated struct and let the file/env only override present
-// fields (see loader.go, WithSkipDefaults).
+// Sources, in increasing priority: YAML file(s) → environment (AI_REVIEWER_*) →
+// Vault. See load.go.
 //
-// Secrets (the GitLab token) are never stored in the file or the struct: they
-// are resolved on demand from the environment variable named by the config, so
-// they never leak into logs or a config dump.
+// # Which tag does what
+//
+// `yaml:` is the one tag every field must carry. It names the key in the file,
+// and xconfig's defaults plugin resolves it a second time to decide whether a
+// field was *explicitly present* in the file: a field that was is never
+// overwritten by its default, which is what keeps an explicit `false` in the
+// YAML from being flipped back to a `true` default (plugins/defaults/rescan.go
+// in xconfig). Drop the yaml tag and that protection goes with it.
+//
+// `default:` carries the value. Sources are applied in order file → defaults →
+// env → Vault, so env and Vault still win over a default. The embedded
+// third-party configs (logger.Config, ops.Config) bring their own `default:`
+// tags and are deliberately not re-listed here — including the ops switches,
+// which mx defaults to off: what the ops server exposes is the deployment's
+// call, not this package's.
+//
+// `env:` is only for fields whose *derived* name is not the name we want.
+// xconfig builds it by word-splitting the Go field path, which is right for
+// almost everything (Review.SeverityThreshold → AI_REVIEWER_REVIEW_SEVERITY_-
+// THRESHOLD) and wrong for acronyms: "GitLab" splits into Git+Lab, so every
+// GitLabConfig field needs a tag, as do Review.WorkDir (REVIEW_WORK_DIR) and the
+// two auth secrets whose names are deliberately Anthropic's own. Adding a tag
+// that merely restates the derived name is noise. Note these names double as
+// Vault keys — xconfigvault reads Meta["env"] — so changing one moves the secret.
 package config
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
+	"net"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/sxwebdev/xconfig"
+	"github.com/tkcrm/mx/launcher/ops"
+	"github.com/tkcrm/mx/logger"
+
+	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/sxwebdev/ai-reviewer/internal/scheduler"
 )
 
-// Config is the root configuration for ai-reviewer.
+// EnvPrefix is prepended to every environment variable name (xconfig's
+// WithEnvPrefix). It is exported so tests and diagnostics can name the exact
+// variable an operator must set.
+const EnvPrefix = "AI_REVIEWER"
+
+// Config is the root configuration for the ai-reviewer team service.
 type Config struct {
-	App     AppConfig     `yaml:"app"`
-	GitLab  GitLabConfig  `yaml:"gitlab"`
-	LLM     LLMConfig     `yaml:"llm"`
-	Review  ReviewConfig  `yaml:"review"`
-	Watch   WatchConfig   `yaml:"watch"`
-	Index   IndexConfig   `yaml:"index"`
-	Storage StorageConfig `yaml:"storage"`
+	Log      logger.Config  `yaml:"log"`
+	Ops      ops.Config     `yaml:"ops"`
+	Service  ServiceConfig  `yaml:"service"`
+	Digest   DigestConfig   `yaml:"digest"`
+	Postgres PostgresConfig `yaml:"postgres"`
+	Jobs     JobsConfig     `yaml:"jobs"`
+	GitLab   GitLabConfig   `yaml:"gitlab"`
+	Linear   LinearConfig   `yaml:"linear"`
+	Slack    SlackConfig    `yaml:"slack"`
+	LLM      LLMConfig      `yaml:"llm"`
+	Review   ReviewConfig   `yaml:"review"`
+	Teams    []TeamConfig   `yaml:"teams" validate:"dive"`
 }
 
-// AppConfig holds process-wide/UI settings.
-type AppConfig struct {
-	DataDir     string `yaml:"data_dir" usage:"Base data directory"`
-	BindHost    string `yaml:"bind_host" env:"BIND_HOST" usage:"Web UI bind host (localhost only by default)"`
-	Port        int    `yaml:"port" env:"PORT" usage:"Web UI port (0 = random free port)"`
-	OpsPort     int    `yaml:"ops_port" env:"OPS_PORT" usage:"mx ops (health/metrics) port (0 = disabled)"`
-	OpenBrowser bool   `yaml:"open_browser" usage:"Open the browser on serve"`
-	UI          string `yaml:"ui" usage:"Primary UI: web"`
+// ServiceConfig holds the two global dry-run switches. Both default to false so
+// a fresh deployment observes and reports without writing anything to GitLab or
+// Slack until an operator opts in.
+type ServiceConfig struct {
+	SlackSendEnabled       bool `yaml:"slack_send_enabled" usage:"Actually deliver digests to Slack (off = dry-run, messages are only persisted)"`
+	AIReviewPublishEnabled bool `yaml:"ai_review_publish_enabled" usage:"Actually publish review findings to GitLab (off = dry-run)"`
 }
 
-// GitLabConfig holds GitLab connection settings. The token is read from the
-// Token field, stored in config.yaml (which `init` writes with 0600 perms). If
-// Token is empty it falls back to the environment variable named by TokenEnv
-// (default GITLAB_TOKEN), so the older env-only workflow keeps working.
+// DigestConfig is the default digest schedule, used by every team that does not
+// override it in `teams[].digest`.
+//
+// Both halves used to be Go constants, on the reasoning that they are a product
+// requirement. They are — but they are a product requirement that *changes*, and
+// every change was a rebuild plus an edit to whatever comments had restated the
+// values. This block and the per-team override are now the only places either is
+// written down.
+type DigestConfig struct {
+	// Timezone is the IANA zone the slots are wall-clock times in. Distributed
+	// teams are the reason it is not one global constant: a slot means "09:00
+	// where the team is", and expressing one team's morning in another's zone is
+	// the mistake that is hardest to notice, because the digest still arrives.
+	Timezone string `yaml:"timezone" default:"Europe/Moscow" usage:"IANA timezone the digest slots are expressed in"`
+
+	// Slots are the daily digest times, "HH:MM" in Timezone.
+	//
+	// They are also the values written to digest_runs.slot, which is what makes
+	// editing this list a schema-ish change rather than a cosmetic one: rows filed
+	// under a slot that is no longer listed keep their old name — correct history,
+	// no migration — but on the day of the change a replica that starts after a
+	// newly added slot has passed will build that slot too, so a team can see one
+	// extra digest. Once.
+	//
+	// Changing the *zone* has the same effect for the same reason: the slot names
+	// stay, the instants they mean move.
+	Slots []string `yaml:"slots" default:"09:00,14:00,17:30" usage:"Daily digest times, HH:MM in the digest timezone"`
+
+	// SkipWeekdays and SkipDates remove whole days from the schedule: the digest
+	// is not built and nothing is sent. Both are empty by default — a deployment
+	// that does not configure them keeps sending every day, which is what it did
+	// before these existed.
+	//
+	// The calendar day is the one in Timezone, like everything else about a slot:
+	// "Saturday" means Saturday where the team is.
+	SkipWeekdays []string `yaml:"skip_weekdays" usage:"Weekdays with no digest: mon|tue|wed|thu|fri|sat|sun (long forms accepted)"`
+	// SkipDates take either form: 2026-01-01 is that one day, 01-01 is the same
+	// day every year. The annual form is the one holidays want — a list of full
+	// dates silently expires each December, and the failure is a digest that
+	// starts arriving on a holiday again.
+	SkipDates []string `yaml:"skip_dates" usage:"Dates with no digest: YYYY-MM-DD for one day, MM-DD for every year"`
+}
+
+// TeamDigestConfig overrides the global schedule for one team. Both fields are
+// optional and inherit independently — a team in another zone usually keeps the
+// company's slot times, and a team with an unusual rhythm usually keeps the zone.
+//
+// Deliberately no `default:` tags: a default here would fill every team and make
+// "not set" indistinguishable from "set to the same value as the global", which
+// is exactly the distinction inheritance needs.
+type TeamDigestConfig struct {
+	Timezone string   `yaml:"timezone" usage:"Override the digest timezone for this team"`
+	Slots    []string `yaml:"slots" usage:"Override the digest times for this team"`
+	// SkipWeekdays and SkipDates replace the global lists for this team. Each
+	// inherits on its own, like the two above, so a team that works Saturdays can
+	// keep the company holiday list while dropping the weekend rule.
+	//
+	// Replace, never merge, and a non-empty global list therefore cannot be turned
+	// off from here — an empty list is how a team says "inherit", and there is no
+	// third value to mean "inherit nothing". Teams that differ this way are meant
+	// to carry their own list; the global block is a default, not a floor.
+	SkipWeekdays []string `yaml:"skip_weekdays" usage:"Override the skipped weekdays for this team"`
+	SkipDates    []string `yaml:"skip_dates" usage:"Override the skipped dates for this team"`
+}
+
+// DigestScheduleFor resolves one team's effective schedule: its own values where
+// set, the global block otherwise.
+//
+// It is a method on Config rather than a helper in app because both Validate and
+// the config→domain mapping need the answer, and two copies of an inheritance
+// rule is how a service comes to validate one schedule and run another.
+func (c *Config) DigestScheduleFor(t TeamConfig) scheduler.DigestSpec {
+	spec := scheduler.DigestSpec{
+		Slots:        t.Digest.Slots,
+		Timezone:     strings.TrimSpace(t.Digest.Timezone),
+		SkipWeekdays: t.Digest.SkipWeekdays,
+		SkipDates:    t.Digest.SkipDates,
+	}
+	if len(spec.Slots) == 0 {
+		spec.Slots = c.Digest.Slots
+	}
+	if spec.Timezone == "" {
+		spec.Timezone = strings.TrimSpace(c.Digest.Timezone)
+	}
+	if len(spec.SkipWeekdays) == 0 {
+		spec.SkipWeekdays = c.Digest.SkipWeekdays
+	}
+	if len(spec.SkipDates) == 0 {
+		spec.SkipDates = c.Digest.SkipDates
+	}
+	return spec
+}
+
+// PostgresConfig is the operational store. Username/password are Vault-backed:
+// in production they never appear in YAML or env.
+type PostgresConfig struct {
+	Host     string `yaml:"host" default:"localhost" validate:"required" usage:"PostgreSQL host"`
+	Port     string `yaml:"port" default:"5432" validate:"required" usage:"PostgreSQL port"`
+	Database string `yaml:"database" default:"ai_reviewer" validate:"required" usage:"PostgreSQL database name"`
+	// Required, but checked in Validate() rather than by a `validate:"required"`
+	// tag — see the secret-validation note there.
+	Username Secret `yaml:"username" secret:"true" vault:"true" usage:"PostgreSQL user"`
+	// Password is not `required`: local development and IAM/peer authentication
+	// legitimately run without one. An empty password simply produces a DSN
+	// without one.
+	Password Secret `yaml:"password" secret:"true" vault:"true" usage:"PostgreSQL password"`
+	SSLMode  string `yaml:"ssl_mode" default:"require" validate:"required,oneof=disable allow prefer require verify-ca verify-full" usage:"PostgreSQL sslmode"`
+	// MigrateOnStart applies pending migrations at startup — both the
+	// application's schema and River's own, in that order.
+	//
+	// On by default, and safe with any number of replicas: App.Migrate holds one
+	// session advisory lock across BOTH migrators, so replicas starting together
+	// serialise and every one after the first finds nothing pending. Turn it off
+	// only if your deployment applies the schema somewhere else (an init
+	// container, a release job) and you want a replica that refuses to start
+	// rather than one that migrates.
+	MigrateOnStart bool `yaml:"migrate_on_start" default:"true" usage:"Apply pending migrations (application + River) on start"`
+}
+
+// DSN returns a pgx v5 compatible connection URL.
+func (c PostgresConfig) DSN() string {
+	user := url.User(c.Username.Unmask())
+	if c.Password.IsSet() {
+		user = url.UserPassword(c.Username.Unmask(), c.Password.Unmask())
+	}
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     user,
+		Host:     net.JoinHostPort(c.Host, c.Port),
+		Path:     c.Database,
+		RawQuery: url.Values{"sslmode": {c.SSLMode}}.Encode(),
+	}
+	return u.String()
+}
+
+// JobsConfig tunes the River runtime.
+type JobsConfig struct {
+	// DrainTimeout is River's SoftStopTimeout: on shutdown in-flight jobs get
+	// this long to finish before the rest are hard-cancelled. Keep it below the
+	// jobs service ShutdownTimeout and the pod's terminationGracePeriodSeconds.
+	DrainTimeout    time.Duration `yaml:"drain_timeout" default:"60s" usage:"Graceful drain window for in-flight jobs on shutdown"`
+	Queues          QueuesConfig  `yaml:"queues"`
+	CleanupInterval time.Duration `yaml:"cleanup_interval" default:"1h" usage:"Cadence of the retention/cleanup periodic job"`
+}
+
+// QueuesConfig sizes the River worker pools. There is deliberately no `review`
+// entry: that pool is sized by review.max_parallel, so review concurrency has
+// one knob rather than two that can drift apart.
+type QueuesConfig struct {
+	Default int `yaml:"default" default:"2" validate:"min=1" usage:"Worker pool size for the default queue (scan, digest, cleanup)"`
+	Publish int `yaml:"publish" default:"1" validate:"min=1" usage:"Worker pool size for publishing findings (1 = serial, predictable for rate limits)"`
+	Slack   int `yaml:"slack" default:"1" validate:"min=1" usage:"Worker pool size for Slack delivery"`
+}
+
+// GitLabConfig holds the service account's GitLab connection.
+//
+// This is the one struct where every field keeps an explicit `env:` tag: the Go
+// field name "GitLab" word-splits into Git+Lab, so the derived names would all
+// read AI_REVIEWER_GIT_LAB_*. Tagging the parent field instead does not help —
+// xconfig then snake-cases the leaf character by character and BaseURL becomes
+// BASE_U_R_L.
 type GitLabConfig struct {
-	Host               string        `yaml:"host" env:"GITLAB_HOST" usage:"GitLab base URL, e.g. https://gitlab.example.com"`
-	Token              string        `yaml:"token" usage:"GitLab personal access token (scope: api), stored locally in config.yaml"`
-	TokenEnv           string        `yaml:"token_env" usage:"Optional: read the token from this env var when 'token' is empty (default GITLAB_TOKEN)"`
-	Username           string        `yaml:"username" env:"GITLAB_USERNAME" usage:"Your GitLab username (reviewer identity)"`
-	Timeout            time.Duration `yaml:"timeout" usage:"Per-request timeout"`
-	InsecureSkipVerify bool          `yaml:"insecure_skip_verify" usage:"Skip TLS verification (self-managed only, explicit opt-in)"`
-	CACertPath         string        `yaml:"ca_cert_path" usage:"Optional custom CA bundle path"`
+	BaseURL string `yaml:"base_url" env:"GITLAB_BASE_URL" validate:"required,url" usage:"GitLab base URL, e.g. https://gitlab.example.com"`
+	// Required, but checked in Validate() — see the secret-validation note there.
+	Token   Secret        `yaml:"token" env:"GITLAB_TOKEN" secret:"true" vault:"true" usage:"Service-account PAT (scope: api)"`
+	Timeout time.Duration `yaml:"timeout" env:"GITLAB_TIMEOUT" default:"30s" usage:"Per-request timeout"`
+	// GraphQLEnabled turns on the one-call-per-project reviewer review-state
+	// query. When it is off (or unsupported by the instance) the service falls
+	// back to the REST heuristic.
+	GraphQLEnabled     bool          `yaml:"graphql_enabled" env:"GITLAB_GRAPHQL_ENABLED" default:"true" usage:"Use GraphQL for exact reviewer review states"`
+	MaxAttempts        int           `yaml:"max_attempts" env:"GITLAB_MAX_ATTEMPTS" default:"4" validate:"min=1" usage:"Retry budget per request (429/5xx/transport)"`
+	MaxRetryAfter      time.Duration `yaml:"max_retry_after" env:"GITLAB_MAX_RETRY_AFTER" default:"60s" usage:"Upper bound on an honoured Retry-After header"`
+	InsecureSkipVerify bool          `yaml:"insecure_skip_verify" env:"GITLAB_INSECURE_SKIP_VERIFY" usage:"Skip TLS verification (self-managed only, explicit opt-in)"`
+	CACertPath         string        `yaml:"ca_cert_path" env:"GITLAB_CA_CERT_PATH" usage:"Optional custom CA bundle path"`
 }
 
-// LLMConfig selects and configures the LLM provider.
+// LinearConfig holds the read-only Linear GraphQL connection used by digests.
+// The feature is enabled per application team by teams[].linear_team_ids; an
+// unused Linear block therefore needs no credential.
+type LinearConfig struct {
+	Endpoint      string        `yaml:"endpoint" default:"https://api.linear.app/graphql" validate:"required,url" usage:"Linear GraphQL endpoint"`
+	APIKey        Secret        `yaml:"api_key" env:"LINEAR_API_KEY" secret:"true" vault:"true" usage:"Linear personal API key used for read-only digest queries"`
+	Timeout       time.Duration `yaml:"timeout" default:"15s" usage:"Per-request timeout"`
+	MaxAttempts   int           `yaml:"max_attempts" default:"4" validate:"min=1" usage:"Retry budget per request (rate limit/5xx/transport)"`
+	MaxRetryAfter time.Duration `yaml:"max_retry_after" default:"60s" usage:"Upper bound on an honoured Retry-After header"`
+}
+
+// SlackConfig holds the digest delivery settings.
+type SlackConfig struct {
+	Token Secret `yaml:"token" secret:"true" vault:"true" usage:"Slack bot token (users:read, users:read.email, chat:write, channels:read; groups:read for private channels)"`
+	// AppToken switches the in-chat commands on, and it is the only switch they
+	// have: it is the one credential that can open a Socket Mode connection, so a
+	// deployment that does not set it cannot listen however it is otherwise
+	// configured. A separate `enabled` boolean would only add a way for the two to
+	// disagree.
+	AppToken Secret `yaml:"app_token" secret:"true" vault:"true" usage:"Slack app-level token (xapp-…, connections:write) — enables the in-chat commands over Socket Mode"`
+	// Commands names the two slash commands. They are configurable because the
+	// name is claimed workspace-wide: another installed app may already own /all,
+	// and that must cost a config line rather than a release.
+	Commands     SlackCommandsConfig `yaml:"commands"`
+	DirectoryTTL time.Duration       `yaml:"directory_ttl" default:"15m" usage:"In-process TTL of the users.list directory cache"`
+	// UserMap is an optional gitlab_username → Slack identity override, in any of
+	// three forms: a user id (U…/W…), an @handle or bare handle, or an email.
+	// match.ParseOverride owns that grammar — doctor and the matcher both drive it,
+	// so the map cannot mean one thing when it is checked and another when it is
+	// used.
+	//
+	// Only the id form answers offline; it is therefore the form to reach for when
+	// users.list is unavailable, and the only one that keeps working then. A handle
+	// or an email is resolved against the directory like any other probe, and an
+	// override that resolves to nothing is a configuration error rather than a
+	// fallback to the name-matching ladder — `doctor` names the entry.
+	UserMap map[string]string `yaml:"user_map" env:"SLACK_USER_MAP" usage:"Override: gitlab_username -> Slack id, @handle or email"`
+}
+
+// SlackCommandsConfig names the two in-chat commands.
+//
+// Team is the digest everybody sees, posted to the channel it was asked in;
+// Mine is the same digest narrowed to the caller and shown only to them. They
+// are two commands rather than one with an argument because the difference is
+// who reads the answer, and a mistyped argument would post one person's queue to
+// the whole channel.
+type SlackCommandsConfig struct {
+	Team string `yaml:"team" default:"/all" usage:"Slash command that posts the whole team digest to the channel"`
+	Mine string `yaml:"mine" default:"/my" usage:"Slash command that shows the caller their own rows only"`
+}
+
+// LLMConfig selects and configures the LLM provider. claude-cli is the only
+// implementation; the field exists so a second one can be added without a
+// config break.
 type LLMConfig struct {
-	Provider string        `yaml:"provider" usage:"LLM provider: claude-cli | anthropic-api"`
-	Model    string        `yaml:"model" usage:"Model name/alias"`
-	Timeout  time.Duration `yaml:"timeout" usage:"Overall LLM call timeout"`
+	Provider string        `yaml:"provider" default:"claude-cli" validate:"required,oneof=claude-cli" usage:"LLM provider: claude-cli"`
+	Timeout  time.Duration `yaml:"timeout" default:"15m" usage:"Overall timeout for one LLM call"`
 	Claude   ClaudeConfig  `yaml:"claude"`
 }
 
-// ClaudeConfig configures the Claude CLI subprocess provider.
+// ClaudeConfig configures the Claude CLI subprocess provider. Every flag is
+// config-driven so the wrapper survives CLI version drift.
 type ClaudeConfig struct {
-	Bin            string   `yaml:"bin" usage:"Path to the claude binary"`
-	AuthMode       string   `yaml:"auth_mode" usage:"existing-login | oauth-token | api-key"`
-	OAuthTokenEnv  string   `yaml:"oauth_token_env" usage:"Env var with Claude Code OAuth token"`
-	APIKeyEnv      string   `yaml:"api_key_env" usage:"Env var with Anthropic API key"`
-	PermissionMode string   `yaml:"permission_mode" usage:"claude --permission-mode value"`
-	AgentMode      bool     `yaml:"agent_mode" usage:"Allow read-only repo inspection during review"`
-	ReadOnly       bool     `yaml:"read_only" usage:"Deny all write/destructive tools"`
-	AllowedTools   []string `yaml:"allowed_tools" usage:"Allowed tool permission rules"`
-	SkillTools     []string `yaml:"skill_tools" usage:"Tool permission rules granted when a review selects skills (union with allowed_tools)"`
-	ExtraArgs      []string `yaml:"extra_args" usage:"Extra raw CLI args appended to every invocation"`
+	Bin            string           `yaml:"bin" default:"claude" validate:"required" usage:"Path to the claude binary"`
+	Model          string           `yaml:"model" default:"sonnet" usage:"Model alias or full id (sonnet, opus, claude-sonnet-5, ...)"`
+	Auth           ClaudeAuthConfig `yaml:"auth"`
+	PermissionMode string           `yaml:"permission_mode" default:"dontAsk" validate:"required" usage:"claude --permission-mode value"`
+	AgentMode      bool             `yaml:"agent_mode" default:"true" usage:"Allow read-only repo inspection during review"`
+	// The default is read-only and scoped to the worktree: llm.WorktreePlaceholder
+	// ("${worktree}") is substituted per review with the checkout claude runs in.
+	// It is spelled out here because a struct tag cannot reference the constant;
+	// TestDefaultAllowedToolsAreReadOnlyAndWorktreeScoped compares the two.
+	//
+	// There are deliberately no Bash(git …) rules. An allow rule is a prefix
+	// match, and `git diff` accepts both `--output=<path>` (an arbitrary-file
+	// write, which manufactures a "clean build" verdict for the deterministic
+	// verifiers and violates plan §1) and `--no-index <any file>` (an
+	// arbitrary-file read that walks straight around the path scope on the Read
+	// rule). `git show` and `git log` take the same diff options. Reproduced
+	// against claude 2.1.222 with the shipped flags: the write succeeded with
+	// permission_denials: []. History and interdiff already reach the model
+	// through the prompt, built by Go from the mirror, so the rules bought context
+	// we were paying for twice.
+	AllowedTools []string `yaml:"allowed_tools" default:"Read(${worktree}/**),Grep(${worktree}/**),Glob(${worktree}/**)" usage:"Tool permission rules granted in agent mode"`
+	ExtraArgs    []string `yaml:"extra_args" usage:"Extra raw CLI args appended to every invocation"`
+	// ExtraEnv is the operator's explicit opt-in for provider variables the auth
+	// layer otherwise strips (CLAUDE_CODE_USE_BEDROCK and friends).
+	ExtraEnv map[string]string `yaml:"extra_env" usage:"Extra environment variables passed to the claude subprocess"`
+	// PassthroughEnv extends the subprocess environment allowlist with variables
+	// that must keep the value they have in the service's own environment. The
+	// default allowlist covers what a headless claude needs; this is the seam for
+	// a deployment that needs more (an entry may end in '*').
+	PassthroughEnv []string `yaml:"passthrough_env" usage:"Extra parent-environment variables the claude subprocess may inherit (trailing '*' allowed)"`
 }
 
-// ReviewConfig controls review behaviour and safety defaults.
-type ReviewConfig struct {
-	DefaultMode              string   `yaml:"default_mode" usage:"full | changed-only"`
-	MaxComments              int      `yaml:"max_comments" usage:"Max findings surfaced per review"`
-	SeverityThreshold        string   `yaml:"severity_threshold" usage:"Drop findings below this severity"`
-	CreateDrafts             bool     `yaml:"create_drafts" usage:"Auto-create GitLab draft notes (off by default)"`
-	AutoReview               bool     `yaml:"auto_review" usage:"Watch-mode auto-runs review (local report only)"`
-	AutoDraft                bool     `yaml:"auto_draft" usage:"Watch-mode may create drafts (explicit opt-in)"`
-	AutoPublish              bool     `yaml:"auto_publish" usage:"DANGER: watch-mode may publish (hard-disabled default)"`
-	FullRepoContext          bool     `yaml:"full_repo_context" usage:"Include relevant repo context beyond the diff"`
-	AgentMode                bool     `yaml:"agent_mode" usage:"Enable agentic deep-analysis stage"`
-	IncludeTests             bool     `yaml:"include_tests"`
-	IncludeSecurity          bool     `yaml:"include_security"`
-	IncludePerformance       bool     `yaml:"include_performance"`
-	IncludeObservability     bool     `yaml:"include_observability"`
-	IncludeStyle             bool     `yaml:"include_style"`
-	PreferredCommentLanguage string   `yaml:"preferred_comment_language" usage:"ru | en | auto"`
-	IgnoreGlobs              []string `yaml:"ignore_globs" usage:"Globs excluded from context/LLM"`
+// ClaudeAuthConfig selects how the claude subprocess authenticates. The env tags
+// are deliberately the bare variable names claude itself understands: prefixed,
+// they read AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN / AI_REVIEWER_ANTHROPIC_API_KEY,
+// which is what the *service* reads. The unprefixed variables are never part of
+// the service's own environment — ClaudeAuth sets them only for the subprocess.
+type ClaudeAuthConfig struct {
+	Mode       llm.AuthMode `yaml:"mode" default:"existing-login" validate:"required" usage:"existing-login | oauth-token | api-key"`
+	OAuthToken Secret       `yaml:"oauth_token" env:"CLAUDE_CODE_OAUTH_TOKEN" secret:"true" vault:"true" usage:"Claude Code OAuth token minted by 'claude setup-token' (mode: oauth-token)"`
+	APIKey     Secret       `yaml:"api_key" env:"ANTHROPIC_API_KEY" secret:"true" vault:"true" usage:"Anthropic API key (mode: api-key)"`
+}
 
-	Context  ContextConfig  `yaml:"context"`
+// ReviewConfig controls scanning cadence and review behaviour.
+type ReviewConfig struct {
+	ScanInterval time.Duration `yaml:"scan_interval" default:"5m" usage:"How often every configured repository is scanned"`
+	// MaxParallel is the single concurrency knob for reviews: it sizes the River
+	// `review` queue pool.
+	MaxParallel              int    `yaml:"max_parallel" default:"2" validate:"min=1" usage:"Concurrent MR reviews across the service"`
+	MaxComments              int    `yaml:"max_comments" default:"12" validate:"min=1" usage:"Max findings published per review"`
+	SeverityThreshold        string `yaml:"severity_threshold" default:"medium" validate:"required,oneof=blocking high medium low nit" usage:"Drop findings below this severity"`
+	PreferredCommentLanguage string `yaml:"preferred_comment_language" default:"auto" validate:"required,oneof=en ru auto" usage:"Comment language: en | ru | auto"`
+	// The env tag stays: the derived name would be REVIEW_WORK_DIR.
+	//
+	// The default is relative on purpose, so a local `start` works with no config
+	// at all. The image overrides it to the absolute /work it mounts a volume on
+	// (Dockerfile), because inside the container a relative path would resolve
+	// against WORKDIR and land in /work/data.
+	WorkDir     string   `yaml:"workdir" env:"REVIEW_WORKDIR" default:"./data" validate:"required" usage:"Ephemeral directory for mirrors and worktrees"`
+	IgnoreGlobs []string `yaml:"ignore_globs" default:"vendor/**,node_modules/**,dist/**,build/**,*.generated.*,*.pb.go,*.min.js" usage:"Globs excluded from context and from the LLM"`
+
 	Pipeline PipelineConfig `yaml:"pipeline"`
+	Context  ContextConfig  `yaml:"context"`
 	Risk     RiskConfig     `yaml:"risk"`
 	Coverage CoverageConfig `yaml:"coverage"`
 }
 
 // PipelineConfig controls the multi-pass review pipeline.
 type PipelineConfig struct {
-	Mode              string   `yaml:"mode" usage:"cheap | standard | deep | custom"`
+	Mode              string   `yaml:"mode" default:"standard" validate:"required,oneof=cheap standard deep custom" usage:"cheap | standard | deep | custom"`
 	Passes            []string `yaml:"passes" usage:"custom mode: pass names (general, correctness, concurrency, security, contracts)"`
-	MaxParallel       int      `yaml:"max_parallel" usage:"Concurrent LLM review passes"`
-	VerifyMode        string   `yaml:"verify_mode" usage:"skeptic | reflect | off"`
-	VerifyMaxFindings int      `yaml:"verify_max_findings" usage:"Max findings sent to the skeptic pass"`
-	Verifiers         []string `yaml:"verifiers" usage:"Deterministic checks: go_build, go_vet, py_syntax, tsc, go_test"`
-	Completeness      string   `yaml:"completeness" usage:"on | off | auto (auto: on except cheap mode)"`
-}
-
-// RiskConfig controls the deterministic risk score.
-type RiskConfig struct {
-	Enabled        bool     `yaml:"enabled" usage:"Compute the deterministic risk score"`
-	HistoryCommits int      `yaml:"history_commits" usage:"Mirror commits scanned for churn/bug-fix factors"`
-	SensitiveGlobs []string `yaml:"sensitive_globs" usage:"Paths whose changes raise risk"`
-}
-
-// CoverageConfig controls changed-line test coverage measurement. Running it
-// executes the repository's test code — explicit opt-in.
-type CoverageConfig struct {
-	Enabled   bool          `yaml:"enabled" usage:"Run repo tests to measure changed-line coverage (executes repository code)"`
-	Providers []string      `yaml:"providers" usage:"Coverage providers: go, node"`
-	Timeout   time.Duration `yaml:"timeout" usage:"Per-provider test run timeout"`
-	Node      NodeCoverage  `yaml:"node"`
-}
-
-// NodeCoverage holds node-specific coverage settings.
-type NodeCoverage struct {
-	Install bool `yaml:"install" usage:"Allow dependency install (npm ci / pnpm / yarn) when node_modules is missing (runs lifecycle scripts)"`
+	MaxParallel       int      `yaml:"max_parallel" default:"2" validate:"min=1" usage:"Concurrent LLM passes within one review"`
+	VerifyMode        string   `yaml:"verify_mode" default:"skeptic" validate:"required,oneof=skeptic reflect off" usage:"skeptic | reflect | off"`
+	VerifyMaxFindings int      `yaml:"verify_max_findings" default:"24" usage:"Max findings handed to the verification pass"`
+	// Verifiers listed here must never execute repository code by default;
+	// tsc and go_test do and stay an explicit opt-in.
+	Verifiers    []string `yaml:"verifiers" default:"go_build,go_vet,py_syntax" usage:"Deterministic checks: go_build, go_vet, py_syntax, tsc, go_test"`
+	Completeness string   `yaml:"completeness" default:"auto" validate:"required,oneof=on off auto" usage:"Acceptance-criteria audit: on | off | auto"`
 }
 
 // ContextConfig bounds the enrichment context added to review prompts beyond
 // the diffs themselves.
 type ContextConfig struct {
-	IncludeFullFiles   bool `yaml:"include_full_files" usage:"Include changed files' content (full or windowed) in the prompt"`
-	MaxFileLines       int  `yaml:"max_file_lines" usage:"Files longer than this fall back to windows around hunks"`
-	HunkWindowLines    int  `yaml:"hunk_window_lines" usage:"Context lines around each hunk when windowing"`
-	MaxTotalKB         int  `yaml:"max_total_kb" usage:"Total budget (KB) for all enrichment sections"`
-	IncludeCommits     bool `yaml:"include_commits" usage:"Include the MR's commit messages in the prompt"`
-	IncludeDiscussions bool `yaml:"include_discussions" usage:"Include existing discussion content in the prompt"`
-	MaxDiscussionKB    int  `yaml:"max_discussion_kb" usage:"Budget (KB) for the discussions section"`
-	PriorReview        bool `yaml:"prior_review" usage:"On re-review, include the previous review + interdiff"`
-	InterdiffMaxKB     int  `yaml:"interdiff_max_kb" usage:"Budget (KB) for the interdiff section"`
-	RelatedFiles       int  `yaml:"related_files" usage:"Max FTS-suggested related files listed as investigation leads (0 = off)"`
+	IncludeFullFiles   bool `yaml:"include_full_files" default:"true" usage:"Include changed files' content (full or windowed)"`
+	MaxFileLines       int  `yaml:"max_file_lines" default:"500" usage:"Files longer than this fall back to windows around hunks"`
+	HunkWindowLines    int  `yaml:"hunk_window_lines" default:"60" usage:"Context lines around each hunk when windowing"`
+	MaxTotalKB         int  `yaml:"max_total_kb" default:"256" usage:"Total budget (KB) for all enrichment sections"`
+	IncludeCommits     bool `yaml:"include_commits" default:"true" usage:"Include the MR's commit messages"`
+	IncludeDiscussions bool `yaml:"include_discussions" default:"true" usage:"Include existing discussion content"`
+	MaxDiscussionKB    int  `yaml:"max_discussion_kb" default:"4" usage:"Budget (KB) for the discussions section"`
+	PriorReview        bool `yaml:"prior_review" default:"true" usage:"On re-review, include the previous review and the interdiff"`
+	InterdiffMaxKB     int  `yaml:"interdiff_max_kb" default:"32" usage:"Budget (KB) for the interdiff section"`
 }
 
-// WatchConfig controls the background daemon.
-type WatchConfig struct {
-	Enabled          bool          `yaml:"enabled"`
-	Interval         time.Duration `yaml:"interval"`
-	MaxParallel      int           `yaml:"max_parallel"`
-	ReviewNewMRs     bool          `yaml:"review_new_mrs"`
-	ReviewNewCommits bool          `yaml:"review_new_commits"`
+// RiskConfig controls the deterministic risk score.
+type RiskConfig struct {
+	Enabled        bool `yaml:"enabled" default:"true" usage:"Compute the deterministic risk score"`
+	HistoryCommits int  `yaml:"history_commits" default:"500" validate:"min=0" usage:"Mirror commits scanned for churn / bug-fix factors"`
+	// The lockfiles are named explicitly: a "*lock*" glob would also match
+	// ordinary files like block.go or clock.ts.
+	SensitiveGlobs []string `yaml:"sensitive_globs" default:"**/auth/**,**/crypto/**,**/security/**,**/migrations/**,**/*.sql,.gitlab-ci.yml,.github/**,Dockerfile*,go.mod,go.sum,package.json,requirements*.txt,pyproject.toml,package-lock.json,yarn.lock,pnpm-lock.yaml,Cargo.lock,Gemfile.lock,poetry.lock,composer.lock" usage:"Paths whose changes raise the risk score"`
 }
 
-// IndexConfig controls repository indexing features.
-type IndexConfig struct {
-	Enabled      bool `yaml:"enabled"`
-	FTS          bool `yaml:"fts"`
-	TreeSitter   bool `yaml:"tree_sitter"`
-	LSP          bool `yaml:"lsp"`
-	VectorSearch bool `yaml:"vector_search"`
+// CoverageConfig controls changed-line test coverage measurement. Running it
+// executes the reviewed repository's test code on a shared host, so it is off by
+// default and an explicit opt-in.
+type CoverageConfig struct {
+	Enabled   bool          `yaml:"enabled" usage:"Run repo tests to measure changed-line coverage (executes repository code)"`
+	Providers []string      `yaml:"providers" default:"go,node" usage:"Coverage providers: go, node"`
+	Timeout   time.Duration `yaml:"timeout" default:"5m" usage:"Per-provider test run timeout"`
+	Node      NodeCoverage  `yaml:"node"`
 }
 
-// StorageConfig controls on-disk locations.
-type StorageConfig struct {
-	DBPath   string `yaml:"db_path" usage:"SQLite database path"`
-	CacheDir string `yaml:"cache_dir" usage:"Git cache directory"`
+// NodeCoverage holds node-specific coverage settings.
+type NodeCoverage struct {
+	Install bool `yaml:"install" usage:"Allow dependency install when node_modules is missing (runs lifecycle scripts)"`
 }
 
-// DefaultConfig returns a fully-populated Config with all defaults applied. It
-// is the single source of truth for defaults; the loader overlays file and env
-// values on top of it.
-func DefaultConfig() *Config {
-	return &Config{
-		App: AppConfig{
-			DataDir:     "~/.ai-reviewer",
-			BindHost:    "127.0.0.1",
-			Port:        0,
-			OpsPort:     0,
-			OpenBrowser: true,
-			UI:          "web",
-		},
-		GitLab: GitLabConfig{
-			TokenEnv: "GITLAB_TOKEN",
-			Timeout:  30 * time.Second,
-		},
-		LLM: LLMConfig{
-			Provider: "claude-cli",
-			Model:    "claude-sonnet-5",
-			Timeout:  15 * time.Minute,
-			Claude: ClaudeConfig{
-				Bin:            "claude",
-				AuthMode:       "existing-login",
-				OAuthTokenEnv:  "CLAUDE_CODE_OAUTH_TOKEN",
-				APIKeyEnv:      "ANTHROPIC_API_KEY",
-				PermissionMode: "dontAsk",
-				AgentMode:      true,
-				ReadOnly:       true,
-				AllowedTools: []string{
-					"Read", "Grep", "Glob",
-					"Bash(git diff *)", "Bash(git log *)", "Bash(git show *)",
-				},
-				// Granted only when a review explicitly selects skills. Skills may
-				// run arbitrary tooling (incl. Bash), so this is broader than the
-				// default read-only review set — an explicit per-run opt-in.
-				SkillTools: []string{"Skill", "Read", "Grep", "Glob", "Bash"},
-			},
-		},
-		Review: ReviewConfig{
-			DefaultMode:              "full",
-			MaxComments:              12,
-			SeverityThreshold:        "medium",
-			CreateDrafts:             false,
-			AutoReview:               true,
-			AutoDraft:                false,
-			AutoPublish:              false,
-			FullRepoContext:          true,
-			AgentMode:                true,
-			IncludeTests:             true,
-			IncludeSecurity:          true,
-			IncludePerformance:       true,
-			IncludeObservability:     true,
-			IncludeStyle:             false,
-			PreferredCommentLanguage: "auto",
-			IgnoreGlobs: []string{
-				"vendor/**", "node_modules/**", "dist/**", "build/**",
-				"*.generated.*", "*.pb.go", "*.min.js",
-			},
-			Context: ContextConfig{
-				IncludeFullFiles:   true,
-				MaxFileLines:       500,
-				HunkWindowLines:    60,
-				MaxTotalKB:         256,
-				IncludeCommits:     true,
-				IncludeDiscussions: true,
-				MaxDiscussionKB:    4,
-				PriorReview:        true,
-				InterdiffMaxKB:     32,
-				RelatedFiles:       5,
-			},
-			Pipeline: PipelineConfig{
-				Mode:              "standard",
-				MaxParallel:       2,
-				VerifyMode:        "skeptic",
-				VerifyMaxFindings: 24,
-				Verifiers:         []string{"go_build", "go_vet", "py_syntax"},
-				Completeness:      "auto",
-			},
-			Risk: RiskConfig{
-				Enabled:        true,
-				HistoryCommits: 500,
-				SensitiveGlobs: []string{
-					"**/auth/**", "**/crypto/**", "**/security/**",
-					"**/migrations/**", "**/*.sql",
-					".gitlab-ci.yml", ".github/**", "Dockerfile*",
-					"go.mod", "go.sum", "package.json", "requirements*.txt", "pyproject.toml",
-					// Explicit lockfile names — a "*lock*" glob would also match
-					// ordinary files like block.go or clock.ts.
-					"package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-					"Cargo.lock", "Gemfile.lock", "poetry.lock", "composer.lock",
-				},
-			},
-			Coverage: CoverageConfig{
-				Enabled:   false, // executes repository test code — explicit opt-in
-				Providers: []string{"go", "node"},
-				Timeout:   5 * time.Minute,
-			},
-		},
-		Watch: WatchConfig{
-			Enabled:          true,
-			Interval:         10 * time.Minute,
-			MaxParallel:      2,
-			ReviewNewMRs:     true,
-			ReviewNewCommits: true,
-		},
-		Index: IndexConfig{
-			Enabled: true,
-			FTS:     true,
-		},
-		Storage: StorageConfig{
-			DBPath:   "~/.ai-reviewer/state.db",
-			CacheDir: "~/.ai-reviewer/cache",
-		},
-	}
+// TeamConfig binds a set of repositories to a Slack channel. Leaf fields carry
+// no `env:` tag on purpose: inside a slice element xconfig builds the name from
+// the expanded path (AI_REVIEWER_TEAMS_0_NAME), and an explicit leaf tag would
+// drop the index and collide across elements.
+type TeamConfig struct {
+	Name          string             `yaml:"name" validate:"required" usage:"Team name (unique, case-insensitive)"`
+	SlackChannel  string             `yaml:"slack_channel" validate:"required" usage:"Slack channel id the digest is posted to"`
+	AIReview      TeamAIReviewConfig `yaml:"ai_review"`
+	LinearTeamIDs []string           `yaml:"linear_team_ids" usage:"Linear team UUIDs whose In Review issues are included in the digest"`
+	Repositories  []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
+	Digest        TeamDigestConfig   `yaml:"digest"`
 }
 
-// GitLabToken resolves the GitLab token. It prefers the token stored in the
-// config file (GitLab.Token); if that is empty it falls back to the environment
-// variable named by TokenEnv (default GITLAB_TOKEN).
-func (c *Config) GitLabToken() string {
-	if c.GitLab.Token != "" {
-		return c.GitLab.Token
-	}
-	env := c.GitLab.TokenEnv
-	if env == "" {
-		env = "GITLAB_TOKEN"
-	}
-	return os.Getenv(env)
+// TeamAIReviewConfig toggles automated review for one team; the digest is
+// unaffected by it.
+type TeamAIReviewConfig struct {
+	Enabled bool `yaml:"enabled" usage:"Run AI review for this team's repositories"`
 }
 
-// GitLabConfigured reports whether the minimum GitLab settings are present: a
-// host and a resolvable token. It is the single definition of "configured"
-// shared by the web setup gate and the headless entrypoint guards.
-func (c *Config) GitLabConfigured() bool {
-	return c.GitLab.Host != "" && c.GitLabToken() != ""
-}
-
-// IsValidEnvName reports whether s is a syntactically valid POSIX environment
-// variable name ([A-Za-z_][A-Za-z0-9_]*). It is used to detect when token_env
-// was mistakenly set to a literal token (which contains '-'/'.') instead of an
-// env var name.
-func IsValidEnvName(s string) bool {
-	if s == "" {
-		return false
+// Default returns a Config with every default applied: this package's from the
+// `default:` tags above, the embedded mx configs from their own. Nothing is
+// hand-written here.
+//
+// Load takes it as the seed, and it is what the CLI hands `doctor` and
+// `migrations` when there is no file to read. Applying the tag pass twice (once
+// here, once inside Load) is harmless: defaults only ever fill a zero value.
+//
+// Note what this means for the ops server: mx defaults `ops.enabled`,
+// `ops.metrics.enabled` and `ops.healthy.enabled` to false, so /livez, /readyz
+// and /metrics exist only when the deployment asks for them. config.example.yaml
+// turns them on and the compose file mounts it; a deployment configured purely
+// through env sets AI_REVIEWER_OPS_* itself.
+//
+// The only way it can fail is a malformed `default:` tag in this file, which
+// TestDefaultTagsAreWellFormed catches. It still returns an error rather than
+// panicking, and it returns the config it did manage to build alongside it: a
+// diagnostic like `doctor` has to keep running and report the problem, which it
+// cannot do if the process is already gone.
+func Default() (*Config, error) {
+	c := &Config{}
+	if _, err := xconfig.Load(c,
+		xconfig.WithSkipFiles(),
+		xconfig.WithSkipEnv(),
+		xconfig.WithSkipFlags(),
+	); err != nil {
+		return c, fmt.Errorf("apply config default tags: %w", err)
 	}
-	for i, r := range s {
-		switch {
-		case r == '_':
-		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
-		case i > 0 && r >= '0' && r <= '9':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// ExpandPaths resolves ~ and makes storage paths absolute. Called after load.
-func (c *Config) ExpandPaths() error {
-	for _, p := range []*string{&c.App.DataDir, &c.Storage.DBPath, &c.Storage.CacheDir} {
-		expanded, err := expandPath(*p)
-		if err != nil {
-			return err
-		}
-		*p = expanded
-	}
-	return nil
-}
-
-// Validate performs structural validation. It intentionally does NOT require
-// gitlab.host/username so that `init` and `doctor` work on a fresh install;
-// capability checks live in the doctor command and the services that need them.
-func (c *Config) Validate() error {
-	if c.App.Port < 0 || c.App.Port > 65535 {
-		return fmt.Errorf("app.port out of range: %d", c.App.Port)
-	}
-	if c.App.BindHost == "" {
-		return fmt.Errorf("app.bind_host must not be empty")
-	}
-	switch c.LLM.Provider {
-	case "claude-cli", "anthropic-api":
-	default:
-		return fmt.Errorf("llm.provider must be claude-cli or anthropic-api, got %q", c.LLM.Provider)
-	}
-	switch c.Review.SeverityThreshold {
-	case "blocking", "high", "medium", "low", "nit":
-	default:
-		return fmt.Errorf("review.severity_threshold invalid: %q", c.Review.SeverityThreshold)
-	}
-	switch c.Review.PreferredCommentLanguage {
-	case "", "en", "ru", "auto":
-	default:
-		return fmt.Errorf("review.preferred_comment_language must be en, ru, or auto, got %q", c.Review.PreferredCommentLanguage)
-	}
-	if c.Review.Context.MaxFileLines < 0 || c.Review.Context.HunkWindowLines < 0 || c.Review.Context.MaxTotalKB < 0 {
-		return fmt.Errorf("review.context sizes must not be negative")
-	}
-	switch c.Review.Pipeline.Mode {
-	case "", "cheap", "standard", "deep", "custom":
-	default:
-		return fmt.Errorf("review.pipeline.mode must be cheap, standard, deep, or custom, got %q", c.Review.Pipeline.Mode)
-	}
-	switch c.Review.Pipeline.VerifyMode {
-	case "", "skeptic", "reflect", "off":
-	default:
-		return fmt.Errorf("review.pipeline.verify_mode must be skeptic, reflect, or off, got %q", c.Review.Pipeline.VerifyMode)
-	}
-	switch c.Review.Pipeline.Completeness {
-	case "", "on", "off", "auto":
-	default:
-		return fmt.Errorf("review.pipeline.completeness must be on, off, or auto, got %q", c.Review.Pipeline.Completeness)
-	}
-	if c.Review.Risk.HistoryCommits < 0 {
-		return fmt.Errorf("review.risk.history_commits must not be negative")
-	}
-	if c.Review.Coverage.Timeout < 0 {
-		return fmt.Errorf("review.coverage.timeout must not be negative")
-	}
-	if c.Storage.DBPath == "" {
-		return fmt.Errorf("storage.db_path must not be empty")
-	}
-	return nil
-}
-
-// expandPath expands a leading ~ to the user's home directory and returns an
-// absolute, cleaned path.
-func expandPath(p string) (string, error) {
-	if p == "" {
-		return "", nil
-	}
-	if p == "~" || strings.HasPrefix(p, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("resolve home dir: %w", err)
-		}
-		p = filepath.Join(home, strings.TrimPrefix(p, "~"))
-	}
-	if !filepath.IsAbs(p) {
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return "", err
-		}
-		p = abs
-	}
-	return filepath.Clean(p), nil
+	return c, nil
 }

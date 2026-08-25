@@ -1,0 +1,39 @@
+# Local development infrastructure.
+#
+# Production runs PostgreSQL 17; dev intentionally runs 18 so that anything
+# depending on version-specific behaviour (notably the `uuidv7()` shim in
+# migration 0000, which is a no-op shadow of the built-in on 18) is exercised
+# against the newer server too.
+#
+#   make infra-up     # start
+#   make infra-stop   # stop, keep the volume
+#   make infra-down   # stop and drop the volume
+
+name: ai-reviewer-dev
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: ai-reviewer-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_reviewer
+      POSTGRES_PASSWORD: ai_reviewer
+      POSTGRES_DB: ai_reviewer
+      # Deterministic collation so index ordering matches CI regardless of host locale.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      # 5433 on the host: 5432 is commonly taken by another project's database.
+      - "5433:5432"
+    volumes:
+      # PG 18+ images expect the mount one level up from `data` so that
+      # pg_upgrade --link can cross major versions inside one mount point.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_reviewer -d ai_reviewer"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

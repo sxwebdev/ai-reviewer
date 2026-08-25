@@ -3,17 +3,17 @@ package coverage
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
+	"github.com/tkcrm/mx/logger"
 )
 
 // BuiltinProviders instantiates the named providers. Unknown names are
 // skipped with a warning, never fatal (mirrors review.BuiltinVerifiers).
-func BuiltinProviders(names []string, run Runner, opts Options, log *slog.Logger) []Provider {
+func BuiltinProviders(names []string, run Runner, opts Options, log logger.Logger) []Provider {
 	if run == nil {
 		run = ExecRunner
 	}
@@ -25,7 +25,7 @@ func BuiltinProviders(names []string, run Runner, opts Options, log *slog.Logger
 		case "node":
 			out = append(out, NewNodeProvider(run, opts.NodeInstall, log))
 		default:
-			log.Warn("unknown coverage provider skipped", "provider", n)
+			log.Warnw("unknown coverage provider skipped", "provider", n)
 		}
 	}
 	return out
@@ -35,7 +35,7 @@ func BuiltinProviders(names []string, run Runner, opts Options, log *slog.Logger
 // detected provider once per root, and merges the profiles rekeyed to
 // repo-relative paths. One root's failure or timeout becomes a SkipNote and
 // never fails the collection.
-func Collect(ctx context.Context, workDir string, changedFiles []string, providers []Provider, opts Options, log *slog.Logger) (Profile, []SkipNote, []string) {
+func Collect(ctx context.Context, workDir string, changedFiles []string, providers []Provider, opts Options, log logger.Logger) (Profile, []SkipNote, []string) {
 	opts = opts.withDefaults()
 	merged := Profile{}
 	var skips []SkipNote
@@ -75,7 +75,7 @@ func Collect(ctx context.Context, workDir string, changedFiles []string, provide
 				if timedOut {
 					reason = "timed out after " + opts.Timeout.String()
 				}
-				log.Warn("coverage run failed", "provider", prov.Name(), "root", root, "reason", reason)
+				log.Warnw("coverage run failed", "provider", prov.Name(), "root", root, "reason", reason)
 				skips = append(skips, SkipNote{Root: root, Provider: prov.Name(), Reason: reason})
 				continue
 			}

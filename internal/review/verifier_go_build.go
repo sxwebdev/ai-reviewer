@@ -2,10 +2,11 @@ package review
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 // buildVerifyTimeout bounds a single `go build` used to verify a finding's
@@ -52,11 +53,11 @@ func claimsCompileFailure(f ValidatedFinding) bool {
 // exclude them entirely). Monorepo-aware: the module root is resolved per
 // finding. Packages are built at most once per (root, pkg, test) — cached.
 type goBuildVerifier struct {
-	log      *slog.Logger
+	log      logger.Logger
 	compiles map[string]bool
 }
 
-func newGoBuildVerifier(log *slog.Logger) *goBuildVerifier {
+func newGoBuildVerifier(log logger.Logger) *goBuildVerifier {
 	return &goBuildVerifier{log: log, compiles: map[string]bool{}}
 }
 

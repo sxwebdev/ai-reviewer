@@ -2,7 +2,8 @@ package review
 
 import (
 	"context"
-	"log/slog"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 // VerifierVerdict is a deterministic verifier's judgement of one finding.
@@ -40,7 +41,7 @@ type Verifier interface {
 // BuiltinVerifiers instantiates the named verifiers (fresh per review so their
 // per-package caches have review lifetime). Unknown names are skipped with a
 // warning.
-func BuiltinVerifiers(names []string, log *slog.Logger) []Verifier {
+func BuiltinVerifiers(names []string, log logger.Logger) []Verifier {
 	var out []Verifier
 	for _, n := range names {
 		switch n {
@@ -55,7 +56,7 @@ func BuiltinVerifiers(names []string, log *slog.Logger) []Verifier {
 		case "py_syntax":
 			out = append(out, newPySyntaxVerifier(log))
 		default:
-			log.Warn("unknown verifier skipped", "verifier", n)
+			log.Warnw("unknown verifier skipped", "verifier", n)
 		}
 	}
 	return out
@@ -64,7 +65,7 @@ func BuiltinVerifiers(names []string, log *slog.Logger) []Verifier {
 // runVerifiers applies each verifier to each finding it covers. A VerdictDrop
 // removes the finding immediately; VerdictAnnotate appends the note to the
 // finding's validation error trail.
-func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings []ValidatedFinding, log *slog.Logger) ([]ValidatedFinding, []SuppressedFinding) {
+func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings []ValidatedFinding, log logger.Logger) ([]ValidatedFinding, []SuppressedFinding) {
 	if workDir == "" || len(vs) == 0 || len(findings) == 0 {
 		return findings, nil
 	}
@@ -79,7 +80,7 @@ func runVerifiers(ctx context.Context, workDir string, vs []Verifier, findings [
 			res := v.Verify(ctx, workDir, f)
 			switch res.Verdict {
 			case VerdictDrop:
-				log.Warn("verifier refuted finding",
+				log.Warnw("verifier refuted finding",
 					"verifier", v.Name(), "file", f.FilePath, "title", f.Title, "note", res.Note)
 				reason := v.Name() + " refuted it"
 				if res.Note != "" {
