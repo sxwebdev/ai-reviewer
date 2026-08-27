@@ -13,6 +13,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/dbtypes"
 	"github.com/sxwebdev/ai-reviewer/internal/domain"
+	"github.com/sxwebdev/ai-reviewer/internal/gitlab"
 	"github.com/sxwebdev/ai-reviewer/internal/linear"
 	"github.com/sxwebdev/ai-reviewer/internal/match"
 	"github.com/sxwebdev/ai-reviewer/internal/metrics"
@@ -628,14 +629,32 @@ func (s *Service) inspectRepository(ctx context.Context, loader *snapshotLoader,
 		return nil, fmt.Errorf("list open merge requests of %s: %w", proj.PathWithNamespace, err)
 	}
 
-	iids := make([]int64, 0, len(open))
+	// Drafts are dropped on the list payload, before any detail call is spent on
+	// them: ClassifyAuthorActions and NeedsHumanReview both refuse a draft, so a
+	// snapshot of one can only ever contribute nothing. Four requests per merge
+	// request, three slots a day, every draft the team has open.
+	//
+	// The list payload's own flag decides it — gitlab.MergeRequest.IsDraft covers
+	// both `draft` and the older `work_in_progress`, which is the field a
+	// self-managed instance may still be the only one to set. The same window the
+	// scan's cheap filter accepts applies here: an MR taken out of draft between
+	// the listing and the next slot appears in that next digest, minutes later.
+	candidates := make([]gitlab.MergeRequest, 0, len(open))
 	for _, mr := range open {
+		if mr.IsDraft() {
+			continue
+		}
+		candidates = append(candidates, mr)
+	}
+
+	iids := make([]int64, 0, len(candidates))
+	for _, mr := range candidates {
 		iids = append(iids, mr.IID)
 	}
 	loader.primeReviewStates(ctx, proj.PathWithNamespace, iids)
 
-	out := make([]domain.MergeRequestSnapshot, 0, len(open))
-	for _, mr := range open {
+	out := make([]domain.MergeRequestSnapshot, 0, len(candidates))
+	for _, mr := range candidates {
 		loaded, err := loader.load(ctx, team.Name, proj, mr.IID)
 		if err != nil {
 			// One unreadable MR degrades that MR, not the repository.

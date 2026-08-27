@@ -224,6 +224,11 @@ Reading it:
   make the list scannable once you know them — they are not what carries the
   meaning, because a digest whose rows have to be decoded is one nobody reads
   twice.
+- **Drafts are not in the digest at all** — not as anybody's review, not as
+  their author's own row, however many threads or conflicts they carry. A draft
+  is work that has not been offered to the team, and they are dropped before any
+  detail call is spent on them, so they cost nothing either. Take a merge request
+  out of draft and it appears in the next slot.
 - **People are ordered alphabetically** by the name Slack draws, so a reader
   finds their own block in the same place every slot. Workload used to decide
   this and the position moved from digest to digest; the per-person counts in

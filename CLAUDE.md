@@ -215,6 +215,21 @@ example — it is why `internal/service` never imports River).
   icon. The compressed tail is the one exception and states the rule: it names
   the action once, on the `+8 more to review:` line the ids hang off.
 
+- **A draft is in no section of the digest, and costs no request to establish
+  that.** `NeedsHumanReview`, `changesRequestedBy`, `NoReviewersAssigned`,
+  `needsLinearMove` and `needsLinearStart` each open with the same open/non-draft
+  guard; `UnresolvedThreads`, `HasMergeConflicts` and `FailedPipeline` are
+  deliberately draft-blind, because they answer "how many / does it conflict",
+  not "does this belong in a digest". That split leaked: a draft with threads,
+  conflicts or a red pipeline was rendered as an author row while the other half
+  of the vocabulary correctly said nothing about it. The guard therefore sits on
+  `ClassifyAuthorActions` — the decision that reads the facts — and not on the
+  facts. `service.inspectRepository` drops drafts on the **list payload**, before
+  any detail call, via `gitlab.MergeRequest.IsDraft` (which covers the older
+  `work_in_progress` too): four requests per draft per slot buying a snapshot
+  every classifier then refuses. A merge request taken out of draft appears in the
+  next slot's digest, which is the same freshness window the scan's cheap filter
+  already accepts.
 - **An untagged merge request is an author action, and it is the one row that
   exists because nothing happened.** `domain.NoReviewersAssigned` — open,
   not draft, no reviewer assigned **and** no approval — puts it in the author's

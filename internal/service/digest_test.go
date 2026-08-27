@@ -1711,3 +1711,46 @@ func TestBuildDigestReportsPartsForADryRun(t *testing.T) {
 		t.Errorf("parts = %d, want 1: the run has a part, it is simply not being delivered", out.Parts)
 	}
 }
+
+// TestDigestSkipsDraftsWithoutFetchingThem covers both halves of the draft rule:
+// a draft contributes nothing to the digest, and it costs nothing to establish
+// that. The list payload already carries the flag, so spending four detail calls
+// per draft per slot buys a snapshot that every classifier then refuses.
+func TestDigestSkipsDraftsWithoutFetchingThem(t *testing.T) {
+	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }),
+		func(h *harness) {
+			h.matcher = stubMatcher{results: map[string]match.Result{
+				"author": {Status: match.Matched, SlackID: "U01", Display: "Ann"},
+			}}
+		})
+
+	proj := testProject()
+	// A draft carrying every author flag there is, and one ordinary merge request
+	// so the digest is not empty for an unrelated reason.
+	draft := testMR(901, withDraft(), withConflicts(true, "conflict"),
+		withHeadPipeline(&gitlab.Pipeline{ID: 5, SHA: testHeadSHA, Status: "failed", WebURL: "https://ci/5"}))
+	seedGitLab(h.fake, proj, draft, testMR(testMRIID))
+	setDiscussions(h.fake, proj, 901, []gitlab.Discussion{
+		{ID: "open", Notes: []gitlab.Note{{ID: 1, Resolvable: true, Author: gitlab.User{ID: 1, Username: "author"}}}},
+	})
+
+	p, err := h.svc.PreviewDigest(t.Context(), testTeamConfig())
+	if err != nil {
+		t.Fatalf("PreviewDigest: %v", err)
+	}
+	if p.MRCount != 1 {
+		t.Errorf("mr count = %d, want only the non-draft merge request", p.MRCount)
+	}
+	for _, m := range p.Messages {
+		if body := renderedText(m); strings.Contains(body, "!901") {
+			t.Errorf("the draft reached the digest:\n%s", body)
+		}
+	}
+	// The second half: no detail call was spent on it. discussionCalls counts one
+	// endpoint of the four a snapshot loads, which is enough to prove the merge
+	// request was never fetched — the ordinary one accounts for exactly one.
+	if h.gl.discussionCalls != 1 {
+		t.Errorf("discussion calls = %d, want 1: the draft must be dropped on the list payload",
+			h.gl.discussionCalls)
+	}
+}

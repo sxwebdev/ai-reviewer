@@ -815,3 +815,57 @@ func TestNoReviewersAloneIsAnAuthorAction(t *testing.T) {
 		t.Error("an untagged merge request must belong to its author's section on its own")
 	}
 }
+
+// TestDraftsAreNeverAnAuthorAction: a draft is work its author has not offered
+// to anybody, and the digest is the list of what the team owes each other today.
+//
+// Three of the facts behind AuthorActions are draft-blind on purpose —
+// UnresolvedThreads answers "how many", not "does this belong in a digest" — so
+// before the guard moved up to the aggregate, a draft with threads, conflicts or
+// a red pipeline was rendered as an author row while changesRequestedBy and
+// NoReviewersAssigned correctly said nothing about it. Half the row's vocabulary
+// applied to drafts and half did not, out of one aggregate.
+func TestDraftsAreNeverAnAuthorAction(t *testing.T) {
+	t.Parallel()
+
+	// Everything the author section can possibly report, all at once.
+	loaded := func() MergeRequestSnapshot {
+		s := openSnap()
+		s.Discussions = []Discussion{thread("d1", false), thread("d2", false)}
+		s.Mergeability = Mergeability{HasConflicts: true, DetailedStatus: "conflict", Known: true}
+		s.Pipeline = Pipeline{ID: 5, SHA: "aaa111", Status: "failed", WebURL: "https://ci/5", Known: true}
+		s.Reviewers = []Reviewer{{
+			User: reviewerUser, State: ReviewStateRequestedChanges, LastActivityAt: afterMR,
+		}}
+		return s
+	}
+
+	// The control: with the same data and no draft flag every flag fires, so a
+	// green result below cannot come from a fixture that says nothing.
+	open := ClassifyAuthorActions(loaded())
+	if !open.Any() || open.UnresolvedThreads == 0 || !open.HasConflicts ||
+		!open.PipelineFailed || len(open.ChangesRequestedBy) == 0 {
+		t.Fatalf("the fixture must exercise every flag, got %+v", open)
+	}
+
+	for _, state := range []string{"opened", "locked"} {
+		s := loaded()
+		s.MR.State = state
+		s.MR.Draft = true
+		if got := ClassifyAuthorActions(s); got.Any() {
+			t.Errorf("draft in state %q produced %+v, want nothing", state, got)
+		}
+		if NeedsAuthorAction(s) {
+			t.Errorf("draft in state %q belongs to no section of the digest", state)
+		}
+	}
+
+	// Closed and merged go the same way, and through the same guard.
+	for _, state := range []string{"merged", "closed"} {
+		s := loaded()
+		s.MR.State = state
+		if got := ClassifyAuthorActions(s); got.Any() {
+			t.Errorf("%s merge request produced %+v, want nothing", state, got)
+		}
+	}
+}

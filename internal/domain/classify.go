@@ -333,6 +333,23 @@ func (a AuthorActions) Any() bool {
 // Unknown answers (mergeability not computed, pipeline stale or missing) are
 // reported as "no action" — the digest only ever states things it is sure of.
 func ClassifyAuthorActions(s MergeRequestSnapshot) AuthorActions {
+	// The same open/non-draft guard every author rule below already opens with,
+	// hoisted to the decision that reads them.
+	//
+	// Three of the facts underneath are draft-blind on purpose — a draft really
+	// does have two unresolved threads and a failed pipeline, and UnresolvedThreads
+	// answering "how many" must not start answering "does this belong in a
+	// digest". The result was that a draft with any of threads, conflicts or a
+	// failed pipeline was rendered as an author row, while changesRequestedBy and
+	// NoReviewersAssigned correctly said nothing about it: half the row's
+	// vocabulary applied to drafts and half did not, from one aggregate.
+	//
+	// A draft is work its author has not offered to anybody. Its conflicts and its
+	// red pipeline are theirs to fix when they are ready, and a digest is the list
+	// of what the team owes each other today.
+	if !s.MR.IsOpen() || s.MR.Draft {
+		return AuthorActions{}
+	}
 	a := AuthorActions{
 		NoReviewers:        NoReviewersAssigned(s),
 		ChangesRequestedBy: changesRequestedBy(s),
