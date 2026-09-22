@@ -123,7 +123,19 @@ PR-Agent — single-shot по дизайну, self-reflection есть толь�
 - PR-Agent **явно отказался** от агентского цикла (`skills_loader.py:26-36`: «single-shot model calls and has no tool-use loop»). Их Agent Skills инлайнят весь текст SKILL.md в промпт — это не масштабируется и жрёт бюджет.
 - ai-review имеет самодельный ReAct поверх голого shell (`{"action":"TOOL_CALL","command":"..."}` парсится из текста, `shell=False`, allowlist regex). Это провайдеро-агностично, но хрупко и **небезопасно**: агент исполняет LLM-сгенерированные команды с правами CI-раннера, allowlist разрешает `cat`/`git log` по любому пути → риск exfil секретов (`.env`) в промпт/артефакты.
 
-Наш подход (claude CLI с read-only allowed_tools `Read/Grep/Glob/Bash(git diff|log|show)`, `dontAsk`, worktree в detached read-only HEAD) — и мощнее, и безопаснее.
+Наш подход (claude CLI с read-only allowed_tools, `dontAsk`, worktree в detached read-only HEAD) — и мощнее, и безопаснее.
+
+> **Поправка (2026-08-13).** На момент написания наш allowlist был
+> `Read, Grep, Glob, Bash(git diff *), Bash(git log *), Bash(git show *)` — и вывод «безопаснее»
+> для этой конфигурации был неверен ровно по той причине, которую абзац выше вменяет ai-review:
+> правило allowlist — это префиксное совпадение, `Read/Grep/Glob` были без ограничения пути,
+> а `git diff` принимает `--output=<path>` (запись произвольного файла) и
+> `--no-index <любой файл>` (чтение произвольного файла в обход любого path scope). Оба случая
+> воспроизведены на реальном CLI с нашими флагами, `permission_denials: []`.
+> Текущий дефолт (`internal/config/config.go`) — `Read(${worktree}/**)`, `Grep(${worktree}/**)`,
+> `Glob(${worktree}/**)` и **ни одного** правила `Bash`; окружение подпроцесса собирается
+> по allowlist, а не вычитанием шести имён. Остальной текст документа не правился и описывает
+> состояние на 2026-07-08.
 
 Куда расти именно нам:
 

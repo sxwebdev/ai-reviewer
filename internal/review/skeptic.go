@@ -3,11 +3,11 @@ package review
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/tkcrm/mx/logger"
 )
 
 // skepticBatchSize bounds how many findings go into one skeptic LLM call.
@@ -62,7 +62,7 @@ func (e *Engine) skepticStage(ctx context.Context, in ReviewInput, pc PipelineCo
 			verdicts, cost, err := e.skepticVerify(ctx, in, batch)
 			costs[b] = cost
 			if err != nil {
-				e.log.Warn("skeptic pass failed; keeping findings unverified", "err", err)
+				e.log.Warnw("skeptic pass failed; keeping findings unverified", "err", err)
 				for i := range batch {
 					batch[i].Verification = VerificationUnverified
 				}
@@ -157,7 +157,7 @@ func annotatedHunkFor(files []*FileDiff, f ValidatedFinding) string {
 //     finding is not blocking/critical (blockers are demoted, never dropped);
 //     mutual duplicates (A→B, B→A) keep the smaller index
 //   - no verdict for an index → kept, marked unverified
-func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log *slog.Logger) ([]ValidatedFinding, []SuppressedFinding) {
+func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log logger.Logger) ([]ValidatedFinding, []SuppressedFinding) {
 	byIndex := map[int]llm.FindingVerdict{}
 	for _, v := range verdicts {
 		if v.Index >= 1 && v.Index <= len(batch) {
@@ -217,7 +217,7 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 					out = append(out, f)
 					continue
 				}
-				log.Info("skeptic dropped duplicate finding", "title", f.Title, "duplicate_of", d)
+				log.Infow("skeptic dropped duplicate finding", "title", f.Title, "duplicate_of", d)
 				suppressed = append(suppressed, suppressedFromValidated(f, SuppressSkeptic,
 					"skeptic judged it a duplicate of another finding"))
 				continue
@@ -230,7 +230,7 @@ func applyVerdicts(batch []ValidatedFinding, verdicts []llm.FindingVerdict, log 
 				out = append(out, f)
 				continue
 			}
-			log.Info("skeptic refuted finding", "title", f.Title, "reason", v.Reason)
+			log.Infow("skeptic refuted finding", "title", f.Title, "reason", v.Reason)
 			suppressed = append(suppressed, suppressedFromValidated(f, SuppressSkeptic,
 				"skeptic disputed it: "+v.Reason))
 		case "uncertain":

@@ -3,8 +3,6 @@ package coverage
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +10,17 @@ import (
 	"time"
 
 	"github.com/sxwebdev/ai-reviewer/internal/security"
+	"github.com/tkcrm/mx/logger"
 )
 
-func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+// discardLog is a logger that emits nothing below fatal, so test output stays
+// clean while the code under test keeps a non-nil logger.
+func discardLog() logger.Logger {
+	return logger.New(logger.WithConfig(logger.Config{
+		Level:  logger.LogLevelFatal,
+		Format: logger.LoggerFormatJSON,
+	}))
+}
 
 func TestIntersect(t *testing.T) {
 	profile := Profile{

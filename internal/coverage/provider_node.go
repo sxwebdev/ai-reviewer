@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
+	"github.com/tkcrm/mx/logger"
 )
 
 // nodeProvider measures JS/TS coverage via the repository's own test runner
@@ -21,11 +21,11 @@ import (
 type nodeProvider struct {
 	run     Runner
 	install bool
-	log     *slog.Logger
+	log     logger.Logger
 }
 
 // NewNodeProvider builds the node coverage provider.
-func NewNodeProvider(run Runner, install bool, log *slog.Logger) Provider {
+func NewNodeProvider(run Runner, install bool, log logger.Logger) Provider {
 	return &nodeProvider{run: run, install: install, log: log}
 }
 
@@ -154,7 +154,7 @@ func (p *nodeProvider) installDeps(ctx context.Context, root string) error {
 	if _, err := exec.LookPath(name); err != nil {
 		return fmt.Errorf("%s not on PATH; cannot install dependencies", name)
 	}
-	p.log.Info("coverage: installing node dependencies", "root", root, "manager", name)
+	p.log.Infow("coverage: installing node dependencies", "root", root, "manager", name)
 	if out, err := p.run(ctx, root, []string{"CI=1"}, name, args...); err != nil {
 		return fmt.Errorf("%s install failed: %s", name, firstLines(security.Mask(string(out)), 3))
 	}

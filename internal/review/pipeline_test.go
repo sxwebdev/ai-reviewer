@@ -2,8 +2,6 @@ package review
 
 import (
 	"errors"
-	"io"
-	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,7 +12,7 @@ import (
 )
 
 func pipelineEngine(fake *llm.FakeClient) *Engine {
-	return NewEngine(fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewEngine(fake, discardLog())
 }
 
 func testInput(t *testing.T, pc PipelineConfig) ReviewInput {
@@ -231,7 +229,7 @@ func TestPipelineMaxParallel(t *testing.T) {
 }
 
 func TestResolvePassesUnknownSkippedAndPrimaryEnsured(t *testing.T) {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := discardLog()
 	specs := ResolvePasses([]string{"nonsense", PassSecurity}, log)
 	if len(specs) != 1 || specs[0].Name != PassSecurity {
 		t.Fatalf("unknown pass must be skipped: %+v", specs)

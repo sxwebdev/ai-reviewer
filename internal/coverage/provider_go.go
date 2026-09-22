@@ -3,7 +3,6 @@ package coverage
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
+	"github.com/tkcrm/mx/logger"
 )
 
 // goProvider measures Go coverage: `go test -coverprofile ./...` at the module
@@ -19,11 +19,11 @@ import (
 // per-run timeout is the cost bound.
 type goProvider struct {
 	run Runner
-	log *slog.Logger
+	log logger.Logger
 }
 
 // NewGoProvider builds the Go coverage provider.
-func NewGoProvider(run Runner, log *slog.Logger) Provider {
+func NewGoProvider(run Runner, log logger.Logger) Provider {
 	return &goProvider{run: run, log: log}
 }
 

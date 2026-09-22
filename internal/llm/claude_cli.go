@@ -5,14 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/sxwebdev/ai-reviewer/internal/security"
+	"github.com/tkcrm/mx/logger"
 )
 
 // ClaudeOptions configures the Claude CLI provider. All flags are configurable
@@ -24,16 +23,20 @@ type ClaudeOptions struct {
 	Timeout        time.Duration
 	ExtraArgs      []string
 	Debug          bool
+	// Auth builds the subprocess environment. Nil means ExistingLogin(): inherit
+	// the machine's login and strip every credential variable, so an unconfigured
+	// deployment can never pick up a stray token from the node.
+	Auth ClaudeAuth
 }
 
 // ClaudeCLI runs the `claude` binary as a subprocess in headless JSON mode.
 type ClaudeCLI struct {
 	opts ClaudeOptions
-	log  *slog.Logger
+	log  logger.Logger
 }
 
 // NewClaudeCLI builds a Claude CLI client.
-func NewClaudeCLI(opts ClaudeOptions, log *slog.Logger) *ClaudeCLI {
+func NewClaudeCLI(opts ClaudeOptions, log logger.Logger) *ClaudeCLI {
 	if opts.Bin == "" {
 		opts.Bin = "claude"
 	}
@@ -42,6 +45,9 @@ func NewClaudeCLI(opts ClaudeOptions, log *slog.Logger) *ClaudeCLI {
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = 15 * time.Minute
+	}
+	if opts.Auth == nil {
+		opts.Auth = ExistingLogin()
 	}
 	return &ClaudeCLI{opts: opts, log: log}
 }
@@ -72,7 +78,7 @@ const errMaxStructuredOutputRetries = "error_max_structured_output_retries"
 func (c *ClaudeCLI) invoke(ctx context.Context, req Request) (*claudeEnvelope, error) {
 	env, err := c.runOnce(ctx, req)
 	if err != nil && req.JSONSchema != "" && strings.Contains(err.Error(), errMaxStructuredOutputRetries) {
-		c.log.Warn("claude could not satisfy --json-schema; retrying once without it and extracting JSON ourselves", "err", err)
+		c.log.Warnw("claude could not satisfy --json-schema; retrying once without it and extracting JSON ourselves", "err", err)
 		req.JSONSchema = ""
 		return c.runOnce(ctx, req)
 	}
@@ -101,15 +107,16 @@ func (c *ClaudeCLI) runOnce(ctx context.Context, req Request) (*claudeEnvelope, 
 		args = append(args, "--json-schema", req.JSONSchema)
 	}
 	if req.AgentMode {
-		// Clone before appending: req.AllowedTools is shared across concurrent
-		// review passes (pipeline fan-out), and it may carry spare capacity, so an
-		// in-place append would race and corrupt the other passes' tool lists.
-		tools := slices.Clone(req.AllowedTools)
-		// Named skills selected for this run get an explicit Skill(name) allow
-		// rule so they can be invoked under the pre-approve (dontAsk) permission
-		// mode. The service also adds the tools the skills themselves need.
-		for _, sk := range req.Skills {
-			tools = append(tools, "Skill("+sk+")")
+		// ExpandToolRules builds a fresh slice, so the shared req.AllowedTools —
+		// read concurrently by the pipeline's fan-out passes — is never appended
+		// to in place.
+		tools, dropped := ExpandToolRules(req.AllowedTools, req.WorkDir)
+		if len(dropped) > 0 {
+			// Reaching this means agent mode was requested without a worktree,
+			// which the service does not do; log it rather than silently reviewing
+			// with a narrower tool set than the operator configured.
+			c.log.Warnw("dropping tool rules that need a worktree: none is available",
+				"rules", dropped, "workdir", req.WorkDir)
 		}
 		if len(tools) > 0 {
 			args = append(args, "--allowedTools", strings.Join(tools, ","))
@@ -120,9 +127,17 @@ func (c *ClaudeCLI) runOnce(ctx context.Context, req Request) (*claudeEnvelope, 
 	ctx, cancel := context.WithTimeout(ctx, c.opts.Timeout)
 	defer cancel()
 
+	// The subprocess environment is built deterministically rather than inherited:
+	// whichever credential the configured mode does not set is stripped, so a
+	// stray token on a shared node cannot decide which account gets billed.
+	subEnv, err := c.opts.Auth.Env(os.Environ())
+	if err != nil {
+		return nil, err
+	}
+
 	cmd := exec.CommandContext(ctx, c.opts.Bin, args...)
 	cmd.Dir = req.WorkDir
-	cmd.Env = os.Environ() // inherit existing Claude Code login / token env
+	cmd.Env = subEnv
 	cmd.Stdin = strings.NewReader(req.Prompt)
 	// Run claude in its own process group and kill the whole group on timeout,
 	// so tool subprocesses (git/bash in agent mode) don't survive as orphans.
@@ -133,7 +148,7 @@ func (c *ClaudeCLI) runOnce(ctx context.Context, req Request) (*claudeEnvelope, 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	c.log.Debug("running claude", "bin", c.opts.Bin, "model", model, "workdir", req.WorkDir, "agent", req.AgentMode)
+	c.log.Debugw("running claude", "bin", c.opts.Bin, "model", model, "workdir", req.WorkDir, "agent", req.AgentMode)
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("claude timed out after %s", c.opts.Timeout)
