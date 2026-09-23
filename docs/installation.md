@@ -113,6 +113,7 @@ teams:
     slack_channel: C012345678
     linear_team_ids:
       - "your-linear-team-uuid"
+    linear_digest_exclude_statuses: ["Won't Fix"]
     repositories: [backend/payments]
 ```
 
@@ -125,6 +126,11 @@ merge request at both ends:
   outranks approvals and `REQUESTED_CHANGES`, so a card forgotten in the wrong
   column costs the team a review; the author row is what keeps the merge request in
   the digest.
+- **Canceled** — the author is asked to close the open MR. The digest identifies
+  canceled states by Linear's state type, even when the team renamed the status.
+- **Configured excluded status** — the linked MR is omitted from both author and
+  reviewer sections. Configure status names in `linear_digest_exclude_statuses`;
+  if several valid issues are named, all must be excluded to omit the MR.
 - **At `In Review` or later** — one GitLab approval completes review unless any
   reviewer has `REQUESTED_CHANGES`; an approved issue still in `In Review` becomes
   an action for the MR author to move it forward.

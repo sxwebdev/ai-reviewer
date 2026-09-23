@@ -25,6 +25,28 @@ var linearIdentifierRE = regexp.MustCompile(`(?i)[a-z][a-z0-9]*-[0-9]+`)
 type linearLink struct {
 	issue linear.Issue
 	stage linear.Stage
+	// excluded is true only when every valid issue named by the MR is in a
+	// configured excluded status. One active issue must keep the MR visible.
+	excluded bool
+}
+
+func linearMatchExcluded(match linearIssueMatch, statuses []string) bool {
+	if !match.found || len(match.candidates) == 0 || len(statuses) == 0 {
+		return false
+	}
+	for _, issue := range match.candidates {
+		found := false
+		for _, status := range statuses {
+			if strings.EqualFold(strings.TrimSpace(issue.State.Name), strings.TrimSpace(status)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 type linearDigestState struct {

@@ -284,6 +284,24 @@ func (c *Config) validateTeams() []error {
 			linearOwner[id] = t.Name
 			c.Teams[i].LinearTeamIDs[j] = id.String()
 		}
+		if len(t.LinearDigestExcludeStatuses) > 0 && len(t.LinearTeamIDs) == 0 {
+			add("%s: linear_digest_exclude_statuses requires linear_team_ids", label)
+		}
+		seenStatus := make(map[string]bool, len(t.LinearDigestExcludeStatuses))
+		for j, rawStatus := range t.LinearDigestExcludeStatuses {
+			status := strings.TrimSpace(rawStatus)
+			if status == "" {
+				add("%s: linear_digest_exclude_statuses contains an empty status", label)
+				continue
+			}
+			key := strings.ToLower(status)
+			if seenStatus[key] {
+				add("%s: linear_digest_exclude_statuses repeats status %q", label, status)
+				continue
+			}
+			seenStatus[key] = true
+			c.Teams[i].LinearDigestExcludeStatuses[j] = status
+		}
 	}
 	return errs
 }

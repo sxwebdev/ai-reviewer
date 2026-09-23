@@ -537,11 +537,12 @@ func Teams(cfg *config.Config) []domain.Team {
 	for _, t := range cfg.Teams {
 		spec := cfg.DigestScheduleFor(t)
 		out = append(out, domain.Team{
-			Name:          t.Name,
-			SlackChannel:  t.SlackChannel,
-			AIReview:      t.AIReview.Enabled,
-			LinearTeamIDs: append([]string(nil), t.LinearTeamIDs...),
-			Repositories:  t.Repositories,
+			Name:                        t.Name,
+			SlackChannel:                t.SlackChannel,
+			AIReview:                    t.AIReview.Enabled,
+			LinearTeamIDs:               append([]string(nil), t.LinearTeamIDs...),
+			LinearDigestExcludeStatuses: append([]string(nil), t.LinearDigestExcludeStatuses...),
+			Repositories:                t.Repositories,
 			// Copied: the resolver may hand back the global slice, and a team
 			// mutating it would silently rewrite every other team's schedule.
 			DigestSlots:        append([]string(nil), spec.Slots...),

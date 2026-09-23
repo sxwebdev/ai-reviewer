@@ -171,6 +171,7 @@ Two defaults are worth reading before you trust the table:
 | `AI_REVIEWER_TEAMS_N_REPOSITORIES`                | `teams[N].repositories` (comma-separated) | —              |
 | `AI_REVIEWER_TEAMS_N_AI_REVIEW_ENABLED`           | `teams[N].ai_review.enabled`         | —                   |
 | `AI_REVIEWER_TEAMS_N_LINEAR_TEAM_IDS`             | `teams[N].linear_team_ids` (comma-separated UUIDs) | —       |
+| `AI_REVIEWER_TEAMS_N_LINEAR_DIGEST_EXCLUDE_STATUSES` | `teams[N].linear_digest_exclude_statuses` (comma-separated names) | — |
 | `AI_REVIEWER_TEAMS_N_DIGEST_TIMEZONE`             | `teams[N].digest.timezone`           | inherits            |
 | `AI_REVIEWER_TEAMS_N_DIGEST_SLOTS`                | `teams[N].digest.slots`              | inherits            |
 | `AI_REVIEWER_TEAMS_N_DIGEST_SKIP_WEEKDAYS`        | `teams[N].digest.skip_weekdays`      | inherits            |
@@ -218,6 +219,11 @@ issue is still `In Review`, the MR author is reminded to advance it. Zero
 approvals, a missing issue, or any `REQUESTED_CHANGES` verdict keep the ordinary
 GitLab flow. The status name is an invariant, not a setting: `doctor` rejects a
 team without exactly one case-insensitive `In Review` workflow state.
+Set `teams[].linear_digest_exclude_statuses` to omit linked MRs in named Linear
+statuses from both the reviewer and author sections. Names are matched
+case-insensitively; when an MR names several valid Linear issues, it is omitted
+only if all of them have excluded statuses. This setting requires
+`linear_team_ids`. The board-wide `In Review` count remains a board total.
 
 `llm.claude.passthrough_env` is the seam for a deployment whose `claude` needs a
 variable the built-in inheritance allowlist does not carry (see [Security

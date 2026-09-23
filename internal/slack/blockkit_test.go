@@ -1194,6 +1194,10 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 					IID: 23, Title: "CHAIN-6 f", WebURL: "https://gl/23",
 					AddReviewer: true,
 				},
+				{
+					IID: 24, Title: "CHAIN-7 g", WebURL: "https://gl/24",
+					CloseMR: true, LinearIdentifier: "PAY-7", LinearState: "Canceled",
+				},
 			},
 		}},
 	}
@@ -1202,7 +1206,7 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 	// is to this person; the rest name what to do about it.
 	openers := []string{"review ", "your MR "}
 	imperatives := []string{
-		"waiting ", "address ", "resolve ", "fix ", "move ", "add ",
+		"waiting ", "address ", "resolve ", "fix ", "move ", "add ", "close ",
 	}
 	hasAny := func(s string, prefixes []string) bool {
 		for _, p := range prefixes {
@@ -1215,8 +1219,8 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
 	lines := strings.Split(body, "\n")
-	if len(lines) != 7 { // the person head, two reviews, four own merge requests
-		t.Fatalf("lines = %d, want 7:\n%s", len(lines), body)
+	if len(lines) != 8 { // the person head, two reviews, five own merge requests
+		t.Fatalf("lines = %d, want 8:\n%s", len(lines), body)
 	}
 	for _, line := range lines[1:] {
 		segments := strings.Split(line, " · ")

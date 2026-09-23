@@ -39,6 +39,7 @@ func TestTeamsMapping(t *testing.T) {
 	t.Parallel()
 	cfg := testConfig(t)
 	cfg.Teams[0].LinearTeamIDs = []string{"linear-payments"}
+	cfg.Teams[0].LinearDigestExcludeStatuses = []string{"Won't Fix"}
 	got := Teams(cfg)
 	if len(got) != 2 {
 		t.Fatalf("teams = %d, want 2", len(got))
@@ -56,6 +57,9 @@ func TestTeamsMapping(t *testing.T) {
 	}
 	if !slices.Equal(got[0].LinearTeamIDs, []string{"linear-payments"}) {
 		t.Errorf("linear team ids = %v", got[0].LinearTeamIDs)
+	}
+	if !slices.Equal(got[0].LinearDigestExcludeStatuses, []string{"Won't Fix"}) {
+		t.Errorf("excluded Linear statuses = %v", got[0].LinearDigestExcludeStatuses)
 	}
 	if len(Teams(defaultConfig(t))) != 0 {
 		t.Error("a config with no teams must map to no teams")

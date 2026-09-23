@@ -26,6 +26,115 @@ import (
 
 var digestDay = time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
 
+func TestDigestCanceledTaskAsksAuthorToCloseMR(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		stateType string
+		stateName string
+		want      string
+		unwanted  string
+	}{
+		{"canceled", "canceled", "Canceled", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is Canceled)", "to In Review"},
+		{"renamed canceled status", "canceled", "Duplicate", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is Duplicate)", "to In Review"},
+		{"canceled status without a name", "canceled", "", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is canceled)", "to In Review"},
+		{"work in progress", "started", "In Progress", "move <https://linear.app/CHAIN-206|CHAIN-206> to In Review (now In Progress)", "close this MR"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			snapshot := domain.MergeRequestSnapshot{
+				Project: domain.Project{ID: 1, FullPath: "group/blockchain-api"},
+				MR: domain.MergeRequest{
+					IID: 1392, State: "opened", WebURL: "https://gitlab.example/mr/1392",
+					Author: domain.User{ID: 1, Username: "author", Name: "Author"},
+				},
+			}
+			link := linearLink{
+				issue: linear.Issue{
+					Identifier: "CHAIN-206", URL: "https://linear.app/CHAIN-206",
+					State: linear.WorkflowState{Name: tt.stateName, Type: tt.stateType},
+				},
+				stage: linear.StageBeforeReview,
+			}
+			state := linearDigestState{linksByMR: map[string]linearLink{
+				snapshotKey(snapshot.Project.ID, snapshot.MR.IID): link,
+			}}
+			data, count := h.svc.digestData(t.Context(), domain.Team{Name: "blockchain"}, []domain.MergeRequestSnapshot{snapshot}, 0, state)
+			if count != 1 {
+				t.Fatalf("digest MR count = %d, want 1", count)
+			}
+			text := renderedText(slack.BuildDigest(data)[0])
+			if !strings.Contains(text, tt.want) {
+				t.Errorf("digest lacks %q:\n%s", tt.want, text)
+			}
+			if strings.Contains(text, tt.unwanted) {
+				t.Errorf("digest contains %q:\n%s", tt.unwanted, text)
+			}
+		})
+	}
+}
+
+func TestDigestExcludedLinearStatusOmitsMRAndItsMetrics(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	snapshot := domain.MergeRequestSnapshot{
+		Project: domain.Project{ID: 1, FullPath: "group/blockchain-api"},
+		MR: domain.MergeRequest{
+			IID: 1392, State: "opened", WebURL: "https://gitlab.example/mr/1392",
+			Author: domain.User{ID: 1, Username: "author", Name: "Author"},
+		},
+		Reviewers: []domain.Reviewer{{User: domain.User{ID: 2, Username: "reviewer"}}},
+	}
+	state := linearDigestState{linksByMR: map[string]linearLink{
+		snapshotKey(snapshot.Project.ID, snapshot.MR.IID): {
+			issue: linear.Issue{Identifier: "CHAIN-206", State: linear.WorkflowState{Name: "Won't Fix"}},
+			stage: linear.StageReviewOrLater, excluded: true,
+		},
+	}}
+	data, count := h.svc.digestData(t.Context(), domain.Team{Name: "blockchain"}, []domain.MergeRequestSnapshot{snapshot}, 0, state)
+	if count != 0 || len(data.People) != 0 {
+		t.Errorf("excluded MR remained in digest: count=%d people=%v", count, data.People)
+	}
+	metrics := teamState([]domain.MergeRequestSnapshot{snapshot}, state)
+	if metrics.WaitingHumanReview != 0 || metrics.LinearNotReady != 0 || metrics.NoReviewers != 0 {
+		t.Errorf("excluded MR remained in digest metrics: %+v", metrics)
+	}
+}
+
+func TestConfiguredLinearStatusExclusionReachesDigest(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	teamID := "9cfb482a-81e3-4154-b5b9-2c805e70a02d"
+	team := domain.Team{
+		Name: "blockchain", LinearTeamIDs: []string{teamID},
+		LinearDigestExcludeStatuses: []string{"Won't Fix"},
+	}
+	snapshot := domain.MergeRequestSnapshot{
+		Project: domain.Project{ID: 1, FullPath: "group/blockchain-api"},
+		MR: domain.MergeRequest{
+			IID: 1392, Title: "CHAIN-206 cancelled work", State: "opened",
+			Author: domain.User{ID: 1, Username: "author"},
+		},
+		Reviewers: []domain.Reviewer{{User: domain.User{ID: 2, Username: "reviewer"}}},
+	}
+	status := linear.WorkflowState{ID: "st-wont-fix", Name: "Won't Fix", Type: "canceled", Position: 8192}
+	h.linear.teamStates = append(testWorkflowStates(), status)
+	h.linear.issuesByNumbers = []linear.Issue{{
+		Identifier: "CHAIN-206", Number: 206, State: status,
+		Team: linear.Team{ID: teamID, Key: "CHAIN"},
+	}}
+	state, err := h.svc.gatherLinear(t.Context(), team, []domain.MergeRequestSnapshot{snapshot})
+	if err != nil {
+		t.Fatalf("gatherLinear: %v", err)
+	}
+	data, count := h.svc.digestData(t.Context(), team, []domain.MergeRequestSnapshot{snapshot}, 0, state)
+	if count != 0 || len(data.People) != 0 {
+		t.Errorf("configured status remained in digest: count=%d people=%v", count, data.People)
+	}
+}
+
 // mustGather reads the default registry, which is the only way to tell an absent
 // series from a zero one — testutil.ToFloat64 creates the series it reads.
 func mustGather(t *testing.T) []*dto.MetricFamily {
@@ -721,9 +830,8 @@ func TestBuildDigestAmbiguousLinearMatchIsCountedAndFailsOpen(t *testing.T) {
 	}
 }
 
-// A canceled card, end to end.// A canceled card, end to end. Nothing above linear.Workflow exercised it, so the
-// claim that naming the column tells the author whether to move the card or close
-// the merge request was asserted nowhere.
+// A canceled card must ask the author to close the open MR, not to move the
+// canceled task back into review.
 func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
 	h := newHarness(t, withDB, withConfig(func(c *Config) { c.SlackSendEnabled = true }))
 	team := testTeamConfig()
@@ -755,10 +863,11 @@ func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
 	if strings.Contains(text, "Rita Reviewer") {
 		t.Errorf("a canceled card still asked its reviewer:\n%s", text)
 	}
-	// The column is named, which is the difference between "move the card" and
-	// "close the merge request".
-	if !strings.Contains(text, "(now Canceled)") {
-		t.Errorf("the author row does not name the column:\n%s", text)
+	if !strings.Contains(text, "close this MR (<https://linear.app/CHAIN-184|CHAIN-184> is Canceled)") {
+		t.Errorf("the author row does not ask to close the MR:\n%s", text)
+	}
+	if strings.Contains(text, "to In Review") {
+		t.Errorf("a canceled task was asked to return to review:\n%s", text)
 	}
 }
 

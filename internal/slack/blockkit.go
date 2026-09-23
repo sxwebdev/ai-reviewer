@@ -146,18 +146,17 @@ type AuthorItem struct {
 	// is still In Review. The author owns advancing the board status.
 	MoveLinear bool
 	// StartLinear is set when the linked task has not reached In Review, which is
-	// why no reviewer was asked to look at this merge request. Mutually exclusive
-	// with MoveLinear by construction — one needs the card on In Review, the other
-	// needs it behind — and it is the row that keeps such a merge request in the
-	// digest at all rather than silently dropping out of both sections.
+	// why no reviewer was asked to look at this merge request. A canceled task
+	// sets CloseMR instead: the author should close the open merge request.
+	// Both actions keep the MR in the digest's author section.
 	StartLinear      bool
+	CloseMR          bool
 	LinearIdentifier string
 	LinearWebURL     string
-	// LinearState is the card's current status name, rendered with StartLinear.
+	// LinearState is the card's current status name, rendered with StartLinear
+	// or CloseMR.
 	// Without it the row says the card is in the wrong column but not which one,
-	// and "not in review" is the one fact an author cannot act on: the difference
-	// between In Progress and Canceled is the difference between moving the card
-	// and closing the merge request.
+	// and a canceled card should name the status that explains closing the MR.
 	LinearState string
 }
 
@@ -595,8 +594,8 @@ func reviewEntry(mr ReviewItem, withProject bool) string {
 
 // authorEntry renders one of the author's own merge requests on a single line,
 // with the flags in a fixed order — add a reviewer, changes requested, threads,
-// conflicts, pipeline, advance the Linear card, move the Linear card to In
-// Review — so the digest reads the same way every day.
+// conflicts, pipeline, advance or move the Linear card, close a canceled MR —
+// so the digest reads the same way every day.
 //
 // "Add a reviewer" leads, and that is the one position in this list with an
 // argument behind it rather than a convention: an MR nobody was handed is not a
@@ -651,6 +650,13 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 			flag += " (now " + state + ")"
 		}
 		flags = append(flags, flag)
+	}
+	if mr.CloseMR {
+		state := stateLabel(mr.LinearState)
+		if state == "" {
+			state = "canceled"
+		}
+		flags = append(flags, "🛑 close this MR ("+linearTask(mr)+" is "+state+")")
 	}
 	if len(flags) > 0 {
 		b.WriteString(" · ")

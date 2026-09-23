@@ -880,8 +880,12 @@ func TestValidateLinear(t *testing.T) {
 	t.Run("configured", func(t *testing.T) {
 		c := base()
 		c.Linear.APIKey = "lin_api_key"
+		c.Teams[0].LinearDigestExcludeStatuses = []string{" Won't Fix "}
 		if err := c.Validate(); err != nil {
 			t.Fatalf("Validate: %v", err)
+		}
+		if got := c.Teams[0].LinearDigestExcludeStatuses[0]; got != "Won't Fix" {
+			t.Errorf("excluded status = %q, want trimmed name", got)
 		}
 	})
 
@@ -922,6 +926,30 @@ func TestValidateLinear(t *testing.T) {
 			},
 			want: "absolute HTTPS URL",
 		},
+		{
+			name: "excluded statuses need Linear teams",
+			mutate: func(c *Config) {
+				c.Teams[0].LinearTeamIDs = nil
+				c.Teams[0].LinearDigestExcludeStatuses = []string{"Won't Fix"}
+			},
+			want: "linear_digest_exclude_statuses requires linear_team_ids",
+		},
+		{
+			name: "empty excluded status",
+			mutate: func(c *Config) {
+				c.Linear.APIKey = "lin_api_key"
+				c.Teams[0].LinearDigestExcludeStatuses = []string{" "}
+			},
+			want: "contains an empty status",
+		},
+		{
+			name: "duplicate excluded status",
+			mutate: func(c *Config) {
+				c.Linear.APIKey = "lin_api_key"
+				c.Teams[0].LinearDigestExcludeStatuses = []string{"Won't Fix", "won't fix"}
+			},
+			want: "repeats status",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -941,6 +969,22 @@ func TestValidateLinear(t *testing.T) {
 			t.Fatalf("Validate: %v", err)
 		}
 	})
+}
+
+func TestLoadLinearDigestExcludeStatuses(t *testing.T) {
+	t.Parallel()
+	yml := strings.Replace(minimalYAML, "    repositories: [backend/payments]",
+		"    linear_team_ids: [9cfb482a-81e3-4154-b5b9-2c805e70a02d]\n"+
+			"    linear_digest_exclude_statuses: [\"Won't Fix\"]\n"+
+			"    repositories: [backend/payments]", 1)
+	yml += "linear:\n  api_key: lin_api_key\n"
+	cfg, err := loadFile(t, writeConfig(t, yml))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Teams[0].LinearDigestExcludeStatuses; !slices.Equal(got, []string{"Won't Fix"}) {
+		t.Errorf("excluded statuses = %v, want [Won't Fix]", got)
+	}
 }
 
 func TestLinearAPIKeyEnvironmentName(t *testing.T) {

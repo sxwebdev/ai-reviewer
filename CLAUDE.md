@@ -205,7 +205,8 @@ example — it is why `internal/service` never imports River).
   readable", the residual case, and it still parks the MR with the author.
 - **Every digest row names its action, in the imperative.** `review !1369`,
   `your MR !1366`, `add a reviewer`, `resolve 3 threads`, `fix merge conflicts`,
-  `fix the failed pipeline`, `move CHAIN-184 to In Review`. The icons stay
+  `fix the failed pipeline`, `move CHAIN-184 to In Review`, `close this MR` for
+  a canceled Linear task. The icons stay
   because they make a long list scannable, but they may never be the only thing
   a row says: the two kinds of row sit in the same block, one under the other,
   and `▫️ !1369` above `🛠 !1366` asked the reader to already know which of the
@@ -276,6 +277,12 @@ example — it is why `internal/service` never imports River).
 - **Linear gates linked MR review at both ends; it is not a second task list.**
   Match a valid identifier in the title, then source branch, case-insensitively.
   Then two gates, and *readiness outranks everything*:
+  - **Configured status exclusion.** `teams[].linear_digest_exclude_statuses`
+    removes a linked MR from both sections before classification and from the
+    digest's MR gauges. Match status names case-insensitively; when several valid
+    issues are named, exclude the MR only if all their statuses are configured.
+    A missing Linear issue or failed lookup never suppresses an MR. This is a
+    digest-only setting and does not change scanning or automated reviews.
   - **Readiness.** A card that has not reached `In Review` means the work was
     never offered, so no reviewer is asked — not even against a standing
     `REQUESTED_CHANGES`. This deliberately reverses the original "any status +
@@ -310,7 +317,9 @@ example — it is why `internal/service` never imports River).
     but stopped work is not work past review, so it grades as *before*. Grade
     every issue against **its own** `Issue.Team.ID`, and use
     `linear.CompareStates` for board order — `Position` alone only ranks columns
-    sharing a type.
+    sharing a type. A canceled card produces an author action to close its open
+    MR, not an instruction to move the canceled card back to In Review. Use the
+    state's `canceled` type, since teams can rename the status.
   - **An ambiguous match is not graded.** "First valid identifier in the title
     wins" was harmless while Linear could only stop notifications an approval had
     already stopped; the readiness gate handed it the power to silence every

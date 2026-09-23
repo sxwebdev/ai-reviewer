@@ -19,11 +19,12 @@ import "time"
 // Team is one configured team: a Slack channel to notify and the repositories
 // it owns. Repositories are GitLab full paths ("backend/payments").
 type Team struct {
-	Name          string
-	SlackChannel  string
-	AIReview      bool // team-level switch for automated review
-	LinearTeamIDs []string
-	Repositories  []string
+	Name                        string
+	SlackChannel                string
+	AIReview                    bool // team-level switch for automated review
+	LinearTeamIDs               []string
+	LinearDigestExcludeStatuses []string
+	Repositories                []string
 
 	// DigestSlots and DigestTimezone are this team's digest schedule, already
 	// resolved against the global default — never empty for a configured team.

@@ -39,6 +39,33 @@ func TestMatchLinearIssuePrefersValidTitleThenBranchCaseInsensitively(t *testing
 	}
 }
 
+func TestLinearMatchExcludedRequiresEveryMatchedIssue(t *testing.T) {
+	t.Parallel()
+	issues := map[string]linear.Issue{
+		"CHAIN-1": {Identifier: "CHAIN-1", State: linear.WorkflowState{Name: "Won't Fix"}},
+		"CHAIN-2": {Identifier: "CHAIN-2", State: linear.WorkflowState{Name: "In Progress"}},
+	}
+	tests := []struct {
+		name  string
+		title string
+		want  bool
+	}{
+		{"excluded issue", "CHAIN-1", true},
+		{"mixed issues stay visible", "CHAIN-1 and CHAIN-2", false},
+		{"active issue", "CHAIN-2", false},
+		{"unmatched issue", "CHAIN-3", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			match := matchLinearIssue(domain.MergeRequest{Title: tt.title}, issues)
+			if got := linearMatchExcluded(match, []string{" won't fix "}); got != tt.want {
+				t.Errorf("linearMatchExcluded(%q) = %v, want %v", tt.title, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLinearReviewPolicy(t *testing.T) {
 	t.Parallel()
 	reviewer := domain.Reviewer{User: domain.User{ID: 1, Username: "reviewer"}, State: domain.ReviewStateUnreviewed}

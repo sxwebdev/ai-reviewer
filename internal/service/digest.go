@@ -521,6 +521,13 @@ func (s *Service) gatherLinear(
 		if !match.found {
 			continue
 		}
+		key := snapshotKey(snapshot.Project.ID, snapshot.MR.IID)
+		if linearMatchExcluded(match, team.LinearDigestExcludeStatuses) {
+			// An excluded MR needs no readiness decision. In particular, an
+			// unreadable board must not count it as a degraded gate.
+			state.linksByMR[key] = linearLink{issue: match.issue, excluded: true}
+			continue
+		}
 		// Keyed by the issue's own team, never by the first configured one: a service
 		// team may map several Linear teams and each orders its columns
 		// independently, so grading an issue against another team's board is how a
@@ -532,7 +539,7 @@ func (s *Service) gatherLinear(
 			}
 			return workflows[teamID].Stage(issue.State)
 		}
-		state.linksByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)] = linearLink{
+		state.linksByMR[key] = linearLink{
 			issue: match.issue,
 			stage: linearStage(match, stageOf),
 		}
@@ -544,7 +551,7 @@ func (s *Service) gatherLinear(
 			// identifier regex produces incidental candidates from ordinary branch names
 			// (`feature/CHAIN-184-retry-fix-2` yields FIX-2), so this is reachable
 			// without anybody deliberately naming two tickets.
-			gated := state.linksByMR[snapshotKey(snapshot.Project.ID, snapshot.MR.IID)].stage
+			gated := state.linksByMR[key].stage
 			if gated == linear.StageUnknown {
 				metrics.LinearGateAmbiguous(team.Name)
 				s.log.Warnw("merge request references Linear issues at different statuses; the readiness gate is off for it",
@@ -672,6 +679,9 @@ func teamState(snapshots []domain.MergeRequestSnapshot, linearState linearDigest
 	var st metrics.TeamState
 	for _, snap := range snapshots {
 		link, linked := linearState.linkFor(snap)
+		if linked && link.excluded {
+			continue
+		}
 		for _, r := range snap.Reviewers {
 			if needsReviewerAction(snap, r, link, linked) {
 				st.WaitingHumanReview++
@@ -770,6 +780,9 @@ func (s *Service) digestData(
 	for _, snap := range ordered {
 		key := snapshotKey(snap.Project.ID, snap.MR.IID)
 		link, linked := linearState.linkFor(snap)
+		if linked && link.excluded {
+			continue
+		}
 
 		for _, r := range snap.Reviewers {
 			if !needsReviewerAction(snap, r, link, linked) {
@@ -790,6 +803,7 @@ func (s *Service) digestData(
 		actions := domain.ClassifyAuthorActions(snap)
 		moveLinear := needsLinearMove(snap, link, linked)
 		startLinear := needsLinearStart(snap, link, linked)
+		closeMR := startLinear && strings.EqualFold(strings.TrimSpace(link.issue.State.Type), "canceled")
 		// The board can withdraw this one flag, and only this one: an MR whose card
 		// has not been offered for review was not forgotten. Whenever it does,
 		// startLinear is true by construction, so the row still exists and still
@@ -818,7 +832,8 @@ func (s *Service) digestData(
 			PipelineFailed:     actions.PipelineFailed,
 			PipelineWebURL:     actions.Pipeline.WebURL,
 			MoveLinear:         moveLinear,
-			StartLinear:        startLinear,
+			StartLinear:        startLinear && !closeMR,
+			CloseMR:            closeMR,
 			LinearIdentifier:   link.issue.Identifier,
 			LinearWebURL:       link.issue.URL,
 			LinearState:        link.issue.State.Name,

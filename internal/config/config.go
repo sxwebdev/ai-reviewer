@@ -435,12 +435,13 @@ type NodeCoverage struct {
 // the expanded path (AI_REVIEWER_TEAMS_0_NAME), and an explicit leaf tag would
 // drop the index and collide across elements.
 type TeamConfig struct {
-	Name          string             `yaml:"name" validate:"required" usage:"Team name (unique, case-insensitive)"`
-	SlackChannel  string             `yaml:"slack_channel" validate:"required" usage:"Slack channel id the digest is posted to"`
-	AIReview      TeamAIReviewConfig `yaml:"ai_review"`
-	LinearTeamIDs []string           `yaml:"linear_team_ids" usage:"Linear team UUIDs whose In Review issues are included in the digest"`
-	Repositories  []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
-	Digest        TeamDigestConfig   `yaml:"digest"`
+	Name                        string             `yaml:"name" validate:"required" usage:"Team name (unique, case-insensitive)"`
+	SlackChannel                string             `yaml:"slack_channel" validate:"required" usage:"Slack channel id the digest is posted to"`
+	AIReview                    TeamAIReviewConfig `yaml:"ai_review"`
+	LinearTeamIDs               []string           `yaml:"linear_team_ids" usage:"Linear team UUIDs whose In Review issues are included in the digest"`
+	LinearDigestExcludeStatuses []string           `yaml:"linear_digest_exclude_statuses" usage:"Linear status names whose linked merge requests are omitted from the digest"`
+	Repositories                []string           `yaml:"repositories" validate:"required,min=1" usage:"GitLab project paths or numeric ids"`
+	Digest                      TeamDigestConfig   `yaml:"digest"`
 }
 
 // TeamAIReviewConfig toggles automated review for one team; the digest is

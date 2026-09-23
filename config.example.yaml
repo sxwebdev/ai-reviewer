@@ -227,6 +227,9 @@ teams:
     ai_review: { enabled: false }
     # Linear team UUIDs: open the team in Linear, Cmd/Ctrl+K → Copy model UUID.
     linear_team_ids: []
+    # Optional status names: linked MRs in these Linear statuses are omitted
+    # entirely from this team's digest (case-insensitive match).
+    linear_digest_exclude_statuses: []
     repositories: [backend/payments, backend/billing, frontend/checkout]
 
   - name: platform
