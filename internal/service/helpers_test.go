@@ -361,7 +361,7 @@ func (f *fakeLinear) GetTeam(_ context.Context, id string) (*linear.Team, error)
 	if states == nil {
 		states = testWorkflowStates()
 	}
-	return &linear.Team{ID: id, Key: "CHAIN", Name: "Chain", States: states}, nil
+	return &linear.Team{ID: id, Key: "TASK", Name: "Example team", States: states}, nil
 }
 
 func (f *fakeLinear) ListIssuesByNumbers(_ context.Context, teamIDs []string, numbers []int) ([]linear.Issue, error) {

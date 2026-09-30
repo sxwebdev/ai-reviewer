@@ -202,17 +202,17 @@ One block per person, answering "what does this person owe": the reviews they
 have not delivered, then their own merge requests that need work.
 
 ```text
-📋 MR Digest — blockchain-api
+📋 MR Digest — example-api
 
-@dkhristoliubov · to review 11 · your MRs 3
-🔴 review !1392 · waiting 10d — CHAIN-206: raise FIREBLOCKS_PROXY_TIMEOUT above…
-🟡 review !1358 · waiting 5d — CHAIN-170 index EVM ERC20 deposits via Transfer…
-🟡 review !1327 · waiting 4d — CHAIN-104 partial index for unsynced blocks
-   +8 more to review: !1363 !1365 !1369 !1356 !1390 !1385 !1403 !1404
-🛠 your MR !1378 · 💬 resolve 6 threads — CHAIN-122 Consolidation deposit detection
-🛠 your MR !1366 · 💬 resolve 3 threads · ⚠️ fix merge conflicts — CHAIN-184 Scheduler…
-🛠 your MR !1375 · 🔁 address changes requested by @apyshinskii — CHAIN-203 Delegator…
-🛠 your MR !1741 · 👤 add a reviewer — Document CONCURRENTLY migration pattern in…
+@example-author · to review 11 · your MRs 4
+🔴 review !101 · waiting 10d — TASK-121 Increase request timeout
+🟡 review !102 · waiting 5d — TASK-122 Add event processing
+🟡 review !103 · waiting 4d — TASK-123 Improve query performance
+   +8 more to review: !104 !105 !106 !107 !108 !109 !110 !111
+🛠 your MR !112 · 💬 resolve 6 threads — TASK-124 Add duplicate detection
+🛠 your MR !113 · 💬 resolve 3 threads · ⚠️ fix merge conflicts — TASK-125 Add background jobs
+🛠 your MR !114 · 🔁 address changes requested by example-reviewer — TASK-126 Update retry logic
+🛠 your MR !115 · 👤 add a reviewer — TASK-127 Document migration steps
 ```
 
 Reading it:
@@ -220,7 +220,7 @@ Reading it:
 - **Every row names the action it asks for**, and every flag is an imperative:
   `review`, `your MR`, `add a reviewer`, `resolve N threads`,
   `fix merge conflicts`, `fix the failed pipeline`,
-  `move CHAIN-N to In Review`. The icons are there to
+  `move TASK-N to In Review`. The icons are there to
   make the list scannable once you know them — they are not what carries the
   meaning, because a digest whose rows have to be decoded is one nobody reads
   twice.
@@ -262,15 +262,19 @@ Reading it:
   first in practice, so it survives the cut.
 - **Linear-aware readiness:** a linked MR whose card has not reached `In Review`
   asks **nobody** to review it. Its author gets
-  `move CHAIN-N to In Review (now In Progress)` instead — the column is named
+  `move TASK-N to In Review (now In Progress)` instead — the column is named
   because the difference between `In Progress` and `Canceled` is the difference
   between moving the card and closing the merge request. This outranks approvals
   and `REQUESTED_CHANGES` alike, and a forgotten card therefore costs a review;
   the author row is what stops the merge request disappearing from the digest.
 - **Linear-aware completion:** at `In Review` or later, a linked MR with at least
   one *readable* approval stops notifying its remaining reviewers. If its issue is
-  still exactly `In Review`, the author gets `move CHAIN-N forward in Linear`.
+  still exactly `In Review`, the author gets `move TASK-N forward in Linear`.
   Zero approvals or any `REQUESTED_CHANGES` verdict keep the ordinary GitLab flow.
+  A pending change request stays with the author even after a push. Explicitly
+  re-requesting review resets the reviewer state to `UNREVIEWED` and returns the
+  review to their queue. The author row names change-requesting reviewers without
+  pinging them.
 
 A person who owes nothing is not listed. Without Linear, a digest with no
 actions is not posted; with Linear enabled, the healthy `In Review` aggregate
@@ -330,7 +334,7 @@ open — reviewers are notified exactly as before — which is safe but silent.
 
 A merge request naming several valid Linear issues is graded only if they agree.
 "First valid identifier in the title wins" is fine for naming a card, but a title
-like `CHAIN-1 superseded by CHAIN-2 work` would otherwise let a cancelled duplicate
+like `TASK-1 superseded by TASK-2 work` would otherwise let a cancelled duplicate
 silence every reviewer and hand the author an instruction they cannot follow.
 
 Every issue is graded against **its own** Linear team. A service team may map
@@ -566,7 +570,7 @@ no secret values, so its output is safe to paste into a ticket.
 | `claude auth` check fails                           | The mode and the credential disagree. `oauth-token` needs `AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN`; `existing-login` will not work in a container |
 | Reviewer states look coarse                         | GraphQL is disabled or unsupported; the REST heuristic is in use. `doctor` says which                    |
 | Linear section is missing                           | The team declares no `linear_team_ids`, or Linear failed — an empty board still renders `Linear · In Review: 0`, so an absent line never means "no issues". A failure also adds a warning and marks the run `partial`. Run `doctor` to validate the key, UUIDs and workflow state |
-| A merge request reaches nobody's review queue       | Its Linear card has not reached `In Review`, so the readiness gate parked it with its author — look for the `move CHAIN-N to In Review` row under the author, and check `merge_requests_linear_not_ready_total`. `doctor`'s `linear review gate` line prints which columns count as "before" for that team and board |
+| A merge request reaches nobody's review queue       | Its Linear card has not reached `In Review`, so the readiness gate parked it with its author — look for the `move TASK-N to In Review` row under the author, and check `merge_requests_linear_not_ready_total`. `doctor`'s `linear review gate` line prints which columns count as "before" for that team and board |
 | A card is behind `In Review` but reviewers are still asked | The gate refused to grade it. Either the board could not be ordered (the digest carries a `Partial data: a Linear board could not be ordered` warning, and `merge_requests_linear_not_ready_total` goes absent), or the merge request names several Linear issues at different statuses — check `linear_gate_ambiguous_total` and the `references Linear issues at different statuses` log line |
 | Reviewers are still nudged after somebody approved  | `GET /approvals` is unreadable, so the approval is invisible to the service and both completion rules are inert. It is available on every GitLab tier, so the cause is access: give the service account at least Reporter and check `merge_requests_access_level`. Confirm with `doctor`'s `approvals visibility` check or the `merge_requests_with_unknown_approvals_total` gauge |
 | A review job runs but publishes nothing             | It ran as a dry run. Re-run with `ai-reviewer review <ref> --publish --wait`                              |

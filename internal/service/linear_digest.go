@@ -11,7 +11,7 @@ import (
 )
 
 // linearIdentifierRE deliberately extracts candidates rather than declaring
-// them valid. A title may contain another tracker key (for example BTA-4203);
+// them valid. A title may contain another tracker key (for example OTHER-4203);
 // only an issue returned from one of the configured Linear teams is a match.
 var linearIdentifierRE = regexp.MustCompile(`(?i)[a-z][a-z0-9]*-[0-9]+`)
 
@@ -133,8 +133,8 @@ func matchLinearIssue(mr domain.MergeRequest, issues map[string]linear.Issue) li
 // stop notifications that an approval had already stopped. The readiness gate
 // removed that precondition, which handed the heuristic the power to silence
 // every reviewer on a merge request: a title like
-// "CHAIN-1 superseded by CHAIN-2 work" picks CHAIN-1, and if that card is
-// canceled while CHAIN-2 is properly In Review, nobody is asked to review and the
+// "TASK-1 superseded by TASK-2 work" picks TASK-1, and if that card is
+// canceled while TASK-2 is properly In Review, nobody is asked to review and the
 // author is told to move a card that cannot be moved.
 //
 // So when a merge request names several valid issues, the gate only applies where
@@ -296,7 +296,7 @@ func needsLinearMove(snapshot domain.MergeRequestSnapshot, link linearLink, link
 // same partition rule needsLinearStart carries: the guard suppressed on here is
 // exactly needsLinearStart's condition (linked, before In Review, and the same
 // open/non-draft guard NoReviewersAssigned opens with), so every suppression
-// leaves an author row that says "move CHAIN-184 to In Review". There is no
+// leaves an author row that says "move TASK-184 to In Review". There is no
 // input for which this returns false, actions.Any() is otherwise false and
 // startLinear is false — which would be an author row with nothing on it.
 func needsReviewerTag(snapshot domain.MergeRequestSnapshot, link linearLink, linked bool) bool {

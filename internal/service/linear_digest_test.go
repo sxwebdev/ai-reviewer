@@ -12,8 +12,8 @@ import (
 func TestMatchLinearIssuePrefersValidTitleThenBranchCaseInsensitively(t *testing.T) {
 	t.Parallel()
 	issues := map[string]linear.Issue{
-		"CHAIN-184": {Identifier: "CHAIN-184"},
-		"CHAIN-203": {Identifier: "CHAIN-203"},
+		"TASK-184": {Identifier: "TASK-184"},
+		"TASK-203": {Identifier: "TASK-203"},
 	}
 	tests := []struct {
 		name          string
@@ -23,10 +23,10 @@ func TestMatchLinearIssuePrefersValidTitleThenBranchCaseInsensitively(t *testing
 		wantField     string
 		wantConflicts []string
 	}{
-		{name: "title", title: "feat: [chain-184] wrapper", branch: "feature/no-key", want: "CHAIN-184", wantField: "title"},
-		{name: "branch fallback", title: "Scheduler wrapper", branch: "feature/ChAiN-203_scheduler", want: "CHAIN-203", wantField: "source_branch"},
-		{name: "unknown title key falls back", title: "BTA-4203 wrapper", branch: "chain-184-wrapper", want: "CHAIN-184", wantField: "source_branch"},
-		{name: "valid title wins conflict", title: "CHAIN-184 wrapper", branch: "feature/chain-203", want: "CHAIN-184", wantField: "title", wantConflicts: []string{"CHAIN-203"}},
+		{name: "title", title: "feat: [task-184] wrapper", branch: "feature/no-key", want: "TASK-184", wantField: "title"},
+		{name: "branch fallback", title: "Example background job", branch: "feature/TaSk-203_scheduler", want: "TASK-203", wantField: "source_branch"},
+		{name: "unknown title key falls back", title: "OTHER-4203 wrapper", branch: "task-184-wrapper", want: "TASK-184", wantField: "source_branch"},
+		{name: "valid title wins conflict", title: "TASK-184 wrapper", branch: "feature/task-203", want: "TASK-184", wantField: "title", wantConflicts: []string{"TASK-203"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,18 +42,18 @@ func TestMatchLinearIssuePrefersValidTitleThenBranchCaseInsensitively(t *testing
 func TestLinearMatchExcludedRequiresEveryMatchedIssue(t *testing.T) {
 	t.Parallel()
 	issues := map[string]linear.Issue{
-		"CHAIN-1": {Identifier: "CHAIN-1", State: linear.WorkflowState{Name: "Won't Fix"}},
-		"CHAIN-2": {Identifier: "CHAIN-2", State: linear.WorkflowState{Name: "In Progress"}},
+		"TASK-1": {Identifier: "TASK-1", State: linear.WorkflowState{Name: "Won't Fix"}},
+		"TASK-2": {Identifier: "TASK-2", State: linear.WorkflowState{Name: "In Progress"}},
 	}
 	tests := []struct {
 		name  string
 		title string
 		want  bool
 	}{
-		{"excluded issue", "CHAIN-1", true},
-		{"mixed issues stay visible", "CHAIN-1 and CHAIN-2", false},
-		{"active issue", "CHAIN-2", false},
-		{"unmatched issue", "CHAIN-3", false},
+		{"excluded issue", "TASK-1", true},
+		{"mixed issues stay visible", "TASK-1 and TASK-2", false},
+		{"active issue", "TASK-2", false},
+		{"unmatched issue", "TASK-3", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -164,7 +164,7 @@ func TestLinearReviewPolicy(t *testing.T) {
 				}}
 			}
 			link := linearLink{
-				issue: linear.Issue{Identifier: "CHAIN-184", State: linear.WorkflowState{Name: tt.state}},
+				issue: linear.Issue{Identifier: "TASK-184", State: linear.WorkflowState{Name: tt.state}},
 				stage: tt.stage,
 			}
 			if got := needsReviewerAction(snapshot, reviewer, link, tt.linked); got != tt.wantReviewerAction {
@@ -217,9 +217,7 @@ func TestReadinessSuppressionAlwaysHandsTheMRToItsAuthor(t *testing.T) {
 							for _, blocked := range []bool{false, true} {
 								reviewer := domain.Reviewer{
 									User: domain.User{ID: 1, Username: "r"}, State: rs,
-									// Dated, so the push-aware REQUESTED_CHANGES branch of
-									// NeedsHumanReview can actually fire; left at zero it
-									// short-circuits and that dimension is dead.
+									// Push timestamps must not override an explicit review state.
 									LastActivityAt: time.Unix(100, 0),
 								}
 								snap := domain.MergeRequestSnapshot{
@@ -238,7 +236,7 @@ func TestReadinessSuppressionAlwaysHandsTheMRToItsAuthor(t *testing.T) {
 								if approved {
 									snap.ApprovedBy = []domain.User{{ID: 9}}
 								}
-								link := linearLink{issue: linear.Issue{Identifier: "CHAIN-1"}, stage: stage}
+								link := linearLink{issue: linear.Issue{Identifier: "TASK-1"}, stage: stage}
 								open := linearLink{issue: link.issue, stage: linear.StageUnknown}
 
 								if !needsReviewerAction(snap, reviewer, open, true) ||
@@ -269,11 +267,11 @@ func TestReadinessSuppressionAlwaysHandsTheMRToItsAuthor(t *testing.T) {
 // instruction. The gate now applies only where the candidates agree.
 func TestLinearStageRefusesToGradeAnAmbiguousMatch(t *testing.T) {
 	t.Parallel()
-	canceled := linear.Issue{Identifier: "CHAIN-1"}
-	inReview := linear.Issue{Identifier: "CHAIN-2"}
+	canceled := linear.Issue{Identifier: "TASK-1"}
+	inReview := linear.Issue{Identifier: "TASK-2"}
 	stages := map[string]linear.Stage{
-		"CHAIN-1": linear.StageBeforeReview,
-		"CHAIN-2": linear.StageReviewOrLater,
+		"TASK-1": linear.StageBeforeReview,
+		"TASK-2": linear.StageReviewOrLater,
 	}
 	stageOf := func(issue linear.Issue) linear.Stage { return stages[issue.Identifier] }
 
@@ -288,8 +286,8 @@ func TestLinearStageRefusesToGradeAnAmbiguousMatch(t *testing.T) {
 
 	// Agreement is still graded, so the ordinary "two tickets, both In Progress"
 	// title keeps its gate.
-	other := linear.Issue{Identifier: "CHAIN-3"}
-	stages["CHAIN-3"] = linear.StageBeforeReview
+	other := linear.Issue{Identifier: "TASK-3"}
+	stages["TASK-3"] = linear.StageBeforeReview
 	agreeing := linearIssueMatch{
 		issue: canceled, found: true,
 		candidates: []linear.Issue{canceled, other},
@@ -329,14 +327,14 @@ func TestLinearAuthorActionsSkipDraftAndClosedMergeRequests(t *testing.T) {
 				ApprovalsKnown: true,
 			}
 			move := linearLink{
-				issue: linear.Issue{Identifier: "CHAIN-184", State: linear.WorkflowState{Name: linear.InReviewState}},
+				issue: linear.Issue{Identifier: "TASK-184", State: linear.WorkflowState{Name: linear.InReviewState}},
 				stage: linear.StageReviewOrLater,
 			}
 			if got := needsLinearMove(snapshot, move, true); got != tt.want {
 				t.Errorf("needsLinearMove = %v, want %v", got, tt.want)
 			}
 			start := linearLink{
-				issue: linear.Issue{Identifier: "CHAIN-184", State: linear.WorkflowState{Name: "In Progress"}},
+				issue: linear.Issue{Identifier: "TASK-184", State: linear.WorkflowState{Name: "In Progress"}},
 				stage: linear.StageBeforeReview,
 			}
 			if got := needsLinearStart(snapshot, start, true); got != tt.want {
@@ -357,17 +355,17 @@ func TestNeedsReviewerActionKeepsGitLabTerminalVerdict(t *testing.T) {
 
 func TestLinearIdentifiersRequireBoundariesNormalizeAndDedupe(t *testing.T) {
 	t.Parallel()
-	text := "CHAIN-1/chain-2 CHAIN-3abc 1CHAIN-4 [ChAiN-5] chain-1"
-	if got := linearIdentifiers(text); !slices.Equal(got, []string{"CHAIN-1", "CHAIN-2", "CHAIN-5"}) {
-		t.Errorf("identifiers = %v, want [CHAIN-1 CHAIN-2 CHAIN-5]", got)
+	text := "TASK-1/task-2 TASK-3abc 1TASK-4 [TaSk-5] task-1"
+	if got := linearIdentifiers(text); !slices.Equal(got, []string{"TASK-1", "TASK-2", "TASK-5"}) {
+		t.Errorf("identifiers = %v, want [TASK-1 TASK-2 TASK-5]", got)
 	}
 }
 
 func TestLinearIssueNumbersAreUniqueAndSorted(t *testing.T) {
 	t.Parallel()
 	snapshots := []domain.MergeRequestSnapshot{
-		{MR: domain.MergeRequest{Title: "CHAIN-203/chain-184", SourceBranch: "feature/CHAIN-203"}},
-		{MR: domain.MergeRequest{Title: "No task", SourceBranch: "fix/chain-9-something"}},
+		{MR: domain.MergeRequest{Title: "TASK-203/task-184", SourceBranch: "feature/TASK-203"}},
+		{MR: domain.MergeRequest{Title: "No task", SourceBranch: "fix/task-9-something"}},
 	}
 	if got := linearIssueNumbers(snapshots); !slices.Equal(got, []int{9, 184, 203}) {
 		t.Errorf("numbers = %v, want [9 184 203]", got)
@@ -410,7 +408,7 @@ func TestReviewerTagSuppressionAlwaysLeavesTheRowSaying(t *testing.T) {
 								if approved {
 									snap.ApprovedBy = []domain.User{{ID: 9}}
 								}
-								link := linearLink{issue: linear.Issue{Identifier: "CHAIN-1"}, stage: stage}
+								link := linearLink{issue: linear.Issue{Identifier: "TASK-1"}, stage: stage}
 
 								raw := domain.NoReviewersAssigned(snap)
 								gated := needsReviewerTag(snap, link, linked)

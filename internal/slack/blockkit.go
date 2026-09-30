@@ -572,7 +572,7 @@ func reviewRef(mr ReviewItem, withProject bool) string {
 }
 
 // reviewEntry renders one pending review as a single line:
-// "🔴 review !1370 · waiting 17d — CHAIN-182 optimize the Metabase wallet lookup".
+// "🔴 review !1370 · waiting 17d — TASK-121 improve lookup performance".
 func reviewEntry(mr ReviewItem, withProject bool) string {
 	var b strings.Builder
 	b.WriteString(ageMarker(mr.Waiting))

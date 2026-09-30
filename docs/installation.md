@@ -117,12 +117,12 @@ teams:
     repositories: [backend/payments]
 ```
 
-The service matches an identifier such as `CHAIN-184` in the MR title, then the
+The service matches an identifier such as `TASK-184` in the MR title, then the
 source branch, without regard to case. The linked issue's status then gates the
 merge request at both ends:
 
 - **Before `In Review`** — the work was never offered, so **no reviewer is asked**.
-  The MR author gets `move CHAIN-184 to In Review (now In Progress)` instead. This
+  The MR author gets `move TASK-184 to In Review (now In Progress)` instead. This
   outranks approvals and `REQUESTED_CHANGES`, so a card forgotten in the wrong
   column costs the team a review; the author row is what keeps the merge request in
   the digest.

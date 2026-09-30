@@ -193,7 +193,7 @@ func TestListIssuesByNumbersBatchesCandidatesAndRestrictsTeams(t *testing.T) {
 			t.Errorf("numbers = %#v", req.Variables["numbers"])
 		}
 		writeResponse(t, w, `{"data":{"issues":{"nodes":[`+
-			`{"id":"i1","identifier":"CHAIN-184","number":184,"title":"Wrapper","url":"https://linear/184","updatedAt":"2026-08-17T10:00:00Z","state":{"id":"s1","name":"QA"},"team":{"id":"t1","key":"CHAIN","name":"Chain"},"assignee":null},`+
+			`{"id":"i1","identifier":"TASK-184","number":184,"title":"Wrapper","url":"https://linear/184","updatedAt":"2026-08-17T10:00:00Z","state":{"id":"s1","name":"QA"},"team":{"id":"t1","key":"TASK","name":"Example team"},"assignee":null},`+
 			`{"id":"foreign","identifier":"OPS-9","number":9,"title":"Foreign","url":"https://linear/9","updatedAt":"2026-08-17T10:00:00Z","state":{"id":"s2","name":"In Review"},"team":{"id":"t2","key":"OPS","name":"Ops"},"assignee":null}`+
 			`],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
 	})
@@ -202,7 +202,7 @@ func TestListIssuesByNumbersBatchesCandidatesAndRestrictsTeams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListIssuesByNumbers: %v", err)
 	}
-	if len(issues) != 1 || issues[0].Identifier != "CHAIN-184" || issues[0].Number != 184 || issues[0].State.Name != "QA" {
+	if len(issues) != 1 || issues[0].Identifier != "TASK-184" || issues[0].Number != 184 || issues[0].State.Name != "QA" {
 		t.Errorf("issues = %+v", issues)
 	}
 	if calls.Load() != 1 {
@@ -446,7 +446,7 @@ func TestListIssuesByNumbersChunksLargeCandidateLists(t *testing.T) {
 		mu.Unlock()
 		// The same issue is returned by every chunk: the merge must not duplicate it.
 		writeResponse(t, w, `{"data":{"issues":{"nodes":[`+
-			`{"id":"i1","identifier":"CHAIN-7","number":7,"title":"Shared","url":"https://linear/7","updatedAt":"2026-08-17T10:00:00Z","state":{"id":"s1","name":"QA"},"team":{"id":"t1","key":"CHAIN","name":"Chain"},"assignee":null}`+
+			`{"id":"i1","identifier":"TASK-7","number":7,"title":"Shared","url":"https://linear/7","updatedAt":"2026-08-17T10:00:00Z","state":{"id":"s1","name":"QA"},"team":{"id":"t1","key":"TASK","name":"Example team"},"assignee":null}`+
 			`],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
 	})
 
@@ -458,8 +458,8 @@ func TestListIssuesByNumbersChunksLargeCandidateLists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListIssuesByNumbers: %v", err)
 	}
-	if len(issues) != 1 || issues[0].Identifier != "CHAIN-7" {
-		t.Errorf("issues = %+v, want one deduplicated CHAIN-7", issues)
+	if len(issues) != 1 || issues[0].Identifier != "TASK-7" {
+		t.Errorf("issues = %+v, want one deduplicated TASK-7", issues)
 	}
 	if calls.Load() != 3 || !slices.Equal(batchSizes, []int{100, 100, 50}) {
 		t.Errorf("calls/batch sizes = %d/%v, want 3/[100 100 50]", calls.Load(), batchSizes)

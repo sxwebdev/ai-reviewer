@@ -280,10 +280,10 @@ func TestTeamLabel(t *testing.T) {
 		team linear.Team
 		want string
 	}{
-		{name: "name and key", team: linear.Team{ID: "t1", Name: "Chain", Key: "CHAIN"}, want: "Chain (CHAIN)"},
-		{name: "no key", team: linear.Team{ID: "t1", Name: "Chain"}, want: "Chain"},
-		{name: "blank key", team: linear.Team{ID: "t1", Name: "Chain", Key: "  "}, want: "Chain"},
-		{name: "no name falls back to the id", team: linear.Team{ID: "t1", Key: "CHAIN"}, want: "t1 (CHAIN)"},
+		{name: "name and key", team: linear.Team{ID: "t1", Name: "Example team", Key: "TASK"}, want: "Example team (TASK)"},
+		{name: "no key", team: linear.Team{ID: "t1", Name: "Example team"}, want: "Example team"},
+		{name: "blank key", team: linear.Team{ID: "t1", Name: "Example team", Key: "  "}, want: "Example team"},
+		{name: "no name falls back to the id", team: linear.Team{ID: "t1", Key: "TASK"}, want: "t1 (TASK)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

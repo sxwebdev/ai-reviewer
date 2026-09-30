@@ -226,8 +226,8 @@ func TestSinglePersonSeesBothHalvesTogether(t *testing.T) {
 		Project: "payments",
 		People: []slack.PersonDigest{{
 			Person:   slack.Mention{SlackID: "U1"},
-			ToReview: []slack.ReviewItem{{IID: 10, Title: "CHAIN-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour}},
-			Own:      []slack.AuthorItem{{IID: 11, Title: "CHAIN-2 b", WebURL: "https://gl/11", UnresolvedThreads: 2}},
+			ToReview: []slack.ReviewItem{{IID: 10, Title: "TASK-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour}},
+			Own:      []slack.AuthorItem{{IID: 11, Title: "TASK-2 b", WebURL: "https://gl/11", UnresolvedThreads: 2}},
 		}},
 	}
 	blocks := blockTexts(t, slack.BuildDigest(d)[0].Blocks)
@@ -256,7 +256,7 @@ func TestReviewTailIsListedNotDropped(t *testing.T) {
 	for i := range total {
 		p.ToReview = append(p.ToReview, slack.ReviewItem{
 			IID:     int64(100 + i),
-			Title:   fmt.Sprintf("CHAIN-%d something", i),
+			Title:   fmt.Sprintf("TASK-%d something", i),
 			WebURL:  fmt.Sprintf("https://gl/%d", 100+i),
 			Waiting: time.Duration(total-i) * 24 * time.Hour, // caller sorts; oldest first here
 		})
@@ -264,7 +264,7 @@ func TestReviewTailIsListedNotDropped(t *testing.T) {
 	d := slack.DigestData{Team: "t", Project: "p", People: []slack.PersonDigest{p}}
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
 
-	if got := strings.Count(body, " — CHAIN-"); got != 3 {
+	if got := strings.Count(body, " — TASK-"); got != 3 {
 		t.Errorf("detailed rows = %d, want 3 (the rest belong in the tail):\n%s", got, body)
 	}
 	if !strings.Contains(body, fmt.Sprintf("+%d more to review:", total-3)) {
@@ -294,7 +294,7 @@ func TestBigReviewTailIsSplitNotTruncated(t *testing.T) {
 		p.ToReview = append(p.ToReview, slack.ReviewItem{
 			Project: "blockchain-api",
 			IID:     iid,
-			Title:   fmt.Sprintf("CHAIN-%d fix the lookup", i),
+			Title:   fmt.Sprintf("TASK-%d fix the lookup", i),
 			WebURL: fmt.Sprintf(
 				"https://gitlab.example.com/backend/blockchain-api/-/merge_requests/%d", iid),
 			Waiting: time.Duration(total-i) * 24 * time.Hour,
@@ -496,7 +496,7 @@ func TestWaitingSuffix(t *testing.T) {
 func TestLongTitleIsShortenedToOneLine(t *testing.T) {
 	t.Parallel()
 
-	const long = "CHAIN-190 create one outbox message per transaction/transfer instead of batched payload with first-id aggregate_id"
+	const long = "TASK-190 create one outbox message per transaction/transfer instead of batched payload with first-id aggregate_id"
 	d := slack.DigestData{
 		Team: "t", Project: "p",
 		People: []slack.PersonDigest{{
@@ -514,7 +514,7 @@ func TestLongTitleIsShortenedToOneLine(t *testing.T) {
 		t.Errorf("a shortened title must be marked: %q", title)
 	}
 	// The ticket key is what makes a shortened title still identifiable.
-	if !strings.HasPrefix(title, "CHAIN-190 ") {
+	if !strings.HasPrefix(title, "TASK-190 ") {
 		t.Errorf("the ticket key must survive: %q", title)
 	}
 	// Cut at a word boundary, not mid-word.
@@ -803,7 +803,7 @@ func TestSplitIntoNumberedPartsLosesNothing(t *testing.T) {
 			iid := int64(i*1000 + j)
 			p.ToReview = append(p.ToReview, slack.ReviewItem{
 				Project: fmt.Sprintf("rev%d-%d", i, j), IID: iid,
-				Title: fmt.Sprintf("CHAIN-%d review", j),
+				Title: fmt.Sprintf("TASK-%d review", j),
 				// Real GitLab URLs: the URL is most of a compressed row, so a short
 				// stand-in would hide the very overflow this test is about.
 				WebURL:  fmt.Sprintf("https://gitlab.example.com/backend/rev%d/-/merge_requests/%d", i, iid),
@@ -815,7 +815,7 @@ func TestSplitIntoNumberedPartsLosesNothing(t *testing.T) {
 			iid := int64(i*1000 + 500 + j)
 			p.Own = append(p.Own, slack.AuthorItem{
 				Project: fmt.Sprintf("auth%d-%d", i, j), IID: iid,
-				Title:             fmt.Sprintf("CHAIN-%d own", j),
+				Title:             fmt.Sprintf("TASK-%d own", j),
 				WebURL:            fmt.Sprintf("https://gitlab.example.com/backend/auth%d/-/merge_requests/%d", i, iid),
 				UnresolvedThreads: 2, MergeConflicts: true,
 			})
@@ -984,14 +984,14 @@ func TestSectionsHonourAnyLimit(t *testing.T) {
 	p := slack.PersonDigest{Person: slack.Mention{Display: strings.Repeat("Very Long Name ", 12)}}
 	for i := range 20 {
 		p.ToReview = append(p.ToReview, slack.ReviewItem{
-			Project: "blockchain-api", IID: int64(1400 + i), Title: "CHAIN-7 fix the lookup",
+			Project: "blockchain-api", IID: int64(1400 + i), Title: "TASK-7 fix the lookup",
 			WebURL:  fmt.Sprintf("https://gitlab.example.com/backend/blockchain-api/-/merge_requests/%d", 1400+i),
 			Waiting: time.Duration(i+1) * 24 * time.Hour,
 		})
 	}
 	for i := range 2 {
 		p.Own = append(p.Own, slack.AuthorItem{
-			Project: "wallet", IID: int64(70 + i), Title: "CHAIN-8 фикс отправки уведомлений",
+			Project: "wallet", IID: int64(70 + i), Title: "TASK-8 фикс отправки уведомлений",
 			WebURL:            fmt.Sprintf("https://gitlab.example.com/backend/wallet/-/merge_requests/%d", 70+i),
 			UnresolvedThreads: 3, MergeConflicts: true,
 		})
@@ -1171,31 +1171,31 @@ func TestEveryRowSaysWhatToDo(t *testing.T) {
 		People: []slack.PersonDigest{{
 			Person: slack.Mention{SlackID: "U1"},
 			ToReview: []slack.ReviewItem{
-				{IID: 10, Title: "CHAIN-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour},
-				{IID: 11, Title: "CHAIN-2 b", WebURL: "https://gl/11"},
+				{IID: 10, Title: "TASK-1 a", WebURL: "https://gl/10", Waiting: 3 * 24 * time.Hour},
+				{IID: 11, Title: "TASK-2 b", WebURL: "https://gl/11"},
 			},
 			Own: []slack.AuthorItem{
 				{
-					IID: 20, Title: "CHAIN-3 c", WebURL: "https://gl/20",
+					IID: 20, Title: "TASK-3 c", WebURL: "https://gl/20",
 					ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}},
 					UnresolvedThreads:  2, MergeConflicts: true, PipelineFailed: true,
 					PipelineWebURL: "https://gl/p/20",
 				},
 				{
-					IID: 21, Title: "CHAIN-4 d", WebURL: "https://gl/21",
+					IID: 21, Title: "TASK-4 d", WebURL: "https://gl/21",
 					MoveLinear: true, LinearIdentifier: "PAY-4", LinearWebURL: "https://linear.app/PAY-4",
 				},
 				{
-					IID: 22, Title: "CHAIN-5 e", WebURL: "https://gl/22",
+					IID: 22, Title: "TASK-5 e", WebURL: "https://gl/22",
 					StartLinear: true, LinearIdentifier: "PAY-5",
 					LinearWebURL: "https://linear.app/PAY-5", LinearState: "In Progress",
 				},
 				{
-					IID: 23, Title: "CHAIN-6 f", WebURL: "https://gl/23",
+					IID: 23, Title: "TASK-6 f", WebURL: "https://gl/23",
 					AddReviewer: true,
 				},
 				{
-					IID: 24, Title: "CHAIN-7 g", WebURL: "https://gl/24",
+					IID: 24, Title: "TASK-7 g", WebURL: "https://gl/24",
 					CloseMR: true, LinearIdentifier: "PAY-7", LinearState: "Canceled",
 				},
 			},
@@ -1373,7 +1373,7 @@ func TestAddReviewerRowIsRenderedFirst(t *testing.T) {
 			// position against each one — changes-requested in particular, which is
 			// the nearest neighbour and the one a careless edit would swap it with.
 			Own: []slack.AuthorItem{{
-				IID: 30, Title: "CHAIN-9 z", WebURL: "https://gl/30",
+				IID: 30, Title: "TASK-9 z", WebURL: "https://gl/30",
 				AddReviewer:        true,
 				ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}},
 				UnresolvedThreads:  2,
@@ -1416,7 +1416,7 @@ func TestAddReviewerRowStandsAlone(t *testing.T) {
 		Team: "payments", Project: "payments",
 		People: []slack.PersonDigest{{
 			Person: slack.Mention{SlackID: "U1"},
-			Own:    []slack.AuthorItem{{IID: 31, Title: "CHAIN-10 y", WebURL: "https://gl/31", AddReviewer: true}},
+			Own:    []slack.AuthorItem{{IID: 31, Title: "TASK-10 y", WebURL: "https://gl/31", AddReviewer: true}},
 		}},
 	}
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]

@@ -35,10 +35,10 @@ func TestDigestCanceledTaskAsksAuthorToCloseMR(t *testing.T) {
 		want      string
 		unwanted  string
 	}{
-		{"canceled", "canceled", "Canceled", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is Canceled)", "to In Review"},
-		{"renamed canceled status", "canceled", "Duplicate", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is Duplicate)", "to In Review"},
-		{"canceled status without a name", "canceled", "", "close this MR (<https://linear.app/CHAIN-206|CHAIN-206> is canceled)", "to In Review"},
-		{"work in progress", "started", "In Progress", "move <https://linear.app/CHAIN-206|CHAIN-206> to In Review (now In Progress)", "close this MR"},
+		{"canceled", "canceled", "Canceled", "close this MR (<https://linear.app/TASK-206|TASK-206> is Canceled)", "to In Review"},
+		{"renamed canceled status", "canceled", "Duplicate", "close this MR (<https://linear.app/TASK-206|TASK-206> is Duplicate)", "to In Review"},
+		{"canceled status without a name", "canceled", "", "close this MR (<https://linear.app/TASK-206|TASK-206> is canceled)", "to In Review"},
+		{"work in progress", "started", "In Progress", "move <https://linear.app/TASK-206|TASK-206> to In Review (now In Progress)", "close this MR"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestDigestCanceledTaskAsksAuthorToCloseMR(t *testing.T) {
 			}
 			link := linearLink{
 				issue: linear.Issue{
-					Identifier: "CHAIN-206", URL: "https://linear.app/CHAIN-206",
+					Identifier: "TASK-206", URL: "https://linear.app/TASK-206",
 					State: linear.WorkflowState{Name: tt.stateName, Type: tt.stateType},
 				},
 				stage: linear.StageBeforeReview,
@@ -89,7 +89,7 @@ func TestDigestExcludedLinearStatusOmitsMRAndItsMetrics(t *testing.T) {
 	}
 	state := linearDigestState{linksByMR: map[string]linearLink{
 		snapshotKey(snapshot.Project.ID, snapshot.MR.IID): {
-			issue: linear.Issue{Identifier: "CHAIN-206", State: linear.WorkflowState{Name: "Won't Fix"}},
+			issue: linear.Issue{Identifier: "TASK-206", State: linear.WorkflowState{Name: "Won't Fix"}},
 			stage: linear.StageReviewOrLater, excluded: true,
 		},
 	}}
@@ -114,7 +114,7 @@ func TestConfiguredLinearStatusExclusionReachesDigest(t *testing.T) {
 	snapshot := domain.MergeRequestSnapshot{
 		Project: domain.Project{ID: 1, FullPath: "group/blockchain-api"},
 		MR: domain.MergeRequest{
-			IID: 1392, Title: "CHAIN-206 cancelled work", State: "opened",
+			IID: 1392, Title: "TASK-206 cancelled work", State: "opened",
 			Author: domain.User{ID: 1, Username: "author"},
 		},
 		Reviewers: []domain.Reviewer{{User: domain.User{ID: 2, Username: "reviewer"}}},
@@ -122,8 +122,8 @@ func TestConfiguredLinearStatusExclusionReachesDigest(t *testing.T) {
 	status := linear.WorkflowState{ID: "st-wont-fix", Name: "Won't Fix", Type: "canceled", Position: 8192}
 	h.linear.teamStates = append(testWorkflowStates(), status)
 	h.linear.issuesByNumbers = []linear.Issue{{
-		Identifier: "CHAIN-206", Number: 206, State: status,
-		Team: linear.Team{ID: teamID, Key: "CHAIN"},
+		Identifier: "TASK-206", Number: 206, State: status,
+		Team: linear.Team{ID: teamID, Key: "TASK"},
 	}}
 	state, err := h.svc.gatherLinear(t.Context(), team, []domain.MergeRequestSnapshot{snapshot})
 	if err != nil {
@@ -338,7 +338,7 @@ func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *test
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-184 Scheduler wrapper"
+	mr.Title = "TASK-184 Example background job"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
@@ -347,10 +347,10 @@ func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *test
 		User: gitlab.User{ID: 77, Username: "approver", Name: "Alice Approver"},
 	}}})
 	issue := linear.Issue{
-		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-		URL:   "https://linear.app/CHAIN-184",
+		ID: "linear-184", Identifier: "TASK-184", Number: 184,
+		URL:   "https://linear.app/TASK-184",
 		State: testState(t, linear.InReviewState),
-		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 	}
 	h.linear.issues = []linear.Issue{issue}
 	h.linear.issuesByNumbers = []linear.Issue{issue}
@@ -372,7 +372,7 @@ func TestBuildDigestApprovedLinkedInReviewNudgesAuthorInsteadOfReviewers(t *test
 		t.Fatalf("decode payload: %v", err)
 	}
 	text := renderedText(message)
-	for _, want := range []string{"Linear · In Review: 1", "Ann Author", "move <https://linear.app/CHAIN-184|CHAIN-184> forward in Linear"} {
+	for _, want := range []string{"Linear · In Review: 1", "Ann Author", "move <https://linear.app/TASK-184|TASK-184> forward in Linear"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("digest is missing %q:\n%s", want, text)
 		}
@@ -393,16 +393,16 @@ func TestBuildDigestBeforeInReviewParksTheMRWithItsAuthor(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-184 Scheduler wrapper"
+	mr.Title = "TASK-184 Example background job"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
 	}
 	issue := linear.Issue{
-		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-		URL:   "https://linear.app/CHAIN-184",
+		ID: "linear-184", Identifier: "TASK-184", Number: 184,
+		URL:   "https://linear.app/TASK-184",
 		State: testState(t, "In Progress"),
-		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 	}
 	h.linear.issuesByNumbers = []linear.Issue{issue}
 
@@ -423,7 +423,7 @@ func TestBuildDigestBeforeInReviewParksTheMRWithItsAuthor(t *testing.T) {
 	}
 	// And it is not lost either: the author owns it, and the row says which column
 	// the card is actually in.
-	for _, want := range []string{"Ann Author", "move <https://linear.app/CHAIN-184|CHAIN-184> to In Review", "(now In Progress)"} {
+	for _, want := range []string{"Ann Author", "move <https://linear.app/TASK-184|TASK-184> to In Review", "(now In Progress)"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("digest is missing %q:\n%s", want, text)
 		}
@@ -443,7 +443,7 @@ func TestBuildDigestUnreadableWorkflowKeepsNotifyingReviewers(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-184 Scheduler wrapper"
+	mr.Title = "TASK-184 Example background job"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
@@ -453,10 +453,10 @@ func TestBuildDigestUnreadableWorkflowKeepsNotifyingReviewers(t *testing.T) {
 		{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
 	}
 	h.linear.issuesByNumbers = []linear.Issue{{
-		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-		URL:   "https://linear.app/CHAIN-184",
+		ID: "linear-184", Identifier: "TASK-184", Number: 184,
+		URL:   "https://linear.app/TASK-184",
 		State: linear.WorkflowState{ID: "st-progress", Name: "In Progress", Type: "started", Position: 1024},
-		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 	}}
 
 	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
@@ -495,7 +495,7 @@ func TestBuildDigestUnreadableApprovalsNeverReadAsUnapproved(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-184 Scheduler wrapper"
+	mr.Title = "TASK-184 Example background job"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
@@ -506,10 +506,10 @@ func TestBuildDigestUnreadableApprovalsNeverReadAsUnapproved(t *testing.T) {
 	}}})
 	h.gl.failApprovals = &gitlab.APIError{Status: 403, Path: "/approvals"}
 	issue := linear.Issue{
-		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-		URL:   "https://linear.app/CHAIN-184",
+		ID: "linear-184", Identifier: "TASK-184", Number: 184,
+		URL:   "https://linear.app/TASK-184",
 		State: testState(t, linear.InReviewState),
-		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+		Team:  linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 	}
 	h.linear.issuesByNumbers = []linear.Issue{issue}
 
@@ -548,7 +548,7 @@ func TestBuildDigestGradesEachIssueAgainstItsOwnLinearTeam(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	first := testMR(101, withReviewers(reviewer))
-	first.Title = "CHAIN-1 chain side"
+	first.Title = "TASK-1 example task"
 	second := testMR(102, withReviewers(reviewer))
 	second.Title = "OPS-2 ops side"
 	seedGitLab(h.fake, proj, first, second)
@@ -576,8 +576,8 @@ func TestBuildDigestGradesEachIssueAgainstItsOwnLinearTeam(t *testing.T) {
 	}
 	h.linear.issuesByNumbers = []linear.Issue{
 		{
-			ID: "i1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
-			State: chainTesting, Team: linear.Team{ID: chainTeam, Key: "CHAIN"},
+			ID: "i1", Identifier: "TASK-1", Number: 1, URL: "https://linear.app/TASK-1",
+			State: chainTesting, Team: linear.Team{ID: chainTeam, Key: "TASK"},
 		},
 		{
 			ID: "i2", Identifier: "OPS-2", Number: 2, URL: "https://linear.app/OPS-2",
@@ -598,7 +598,7 @@ func TestBuildDigestGradesEachIssueAgainstItsOwnLinearTeam(t *testing.T) {
 	if !strings.Contains(text, "Rita Reviewer") || !strings.Contains(text, "!101") {
 		t.Errorf("the merge request past its own board's In Review lost its reviewer:\n%s", text)
 	}
-	if strings.Contains(text, "CHAIN-1> to In Review") {
+	if strings.Contains(text, "TASK-1> to In Review") {
 		t.Errorf("chain's card was graded against another team's board:\n%s", text)
 	}
 	// Ops's identically-keyed card is behind review on Ops's board, so its author is
@@ -618,7 +618,7 @@ func TestBuildDigestKeepsWorkingWorkflowsWhenOneTeamIsBroken(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-1 wrapper"
+	mr.Title = "TASK-1 wrapper"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
@@ -628,8 +628,8 @@ func TestBuildDigestKeepsWorkingWorkflowsWhenOneTeamIsBroken(t *testing.T) {
 		goodTeam: testWorkflowStates(),
 	}
 	h.linear.issuesByNumbers = []linear.Issue{{
-		ID: "i1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
-		State: testState(t, "In Progress"), Team: linear.Team{ID: goodTeam, Key: "CHAIN"},
+		ID: "i1", Identifier: "TASK-1", Number: 1, URL: "https://linear.app/TASK-1",
+		State: testState(t, "In Progress"), Team: linear.Team{ID: goodTeam, Key: "TASK"},
 	}}
 
 	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
@@ -640,7 +640,7 @@ func TestBuildDigestKeepsWorkingWorkflowsWhenOneTeamIsBroken(t *testing.T) {
 		t.Errorf("status = %q, want %q — one broken board is a degradation", out.Status, DigestPartial)
 	}
 	text := renderedText(decodeMessage(t, h.digestMessages(t, out.RunID)[0]))
-	if !strings.Contains(text, "move <https://linear.app/CHAIN-1|CHAIN-1> to In Review") {
+	if !strings.Contains(text, "move <https://linear.app/TASK-1|TASK-1> to In Review") {
 		t.Errorf("the readable board lost its gate because another team's was broken:\n%s", text)
 	}
 	// And the warning may not deny what the row above it just did. The digest-wide
@@ -728,15 +728,15 @@ func TestBuildDigestClearsTheNotReadyGaugeWheneverTheGateCouldNotRun(t *testing.
 			proj := testProject()
 			reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 			mr := testMR(testMRIID, withReviewers(reviewer))
-			mr.Title = "CHAIN-184 Scheduler wrapper"
+			mr.Title = "TASK-184 Example background job"
 			seedGitLab(h.fake, proj, mr)
 			h.gql.States = map[int64][]gitlab.ReviewerState{
 				testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
 			}
 			h.linear.issuesByNumbers = []linear.Issue{{
-				ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-				URL: "https://linear.app/CHAIN-184", State: testState(t, "In Progress"),
-				Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+				ID: "linear-184", Identifier: "TASK-184", Number: 184,
+				URL: "https://linear.app/TASK-184", State: testState(t, "In Progress"),
+				Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 			}}
 
 			// First a healthy build, so the series exists and is non-zero.
@@ -790,20 +790,20 @@ func TestBuildDigestAmbiguousLinearMatchIsCountedAndFailsOpen(t *testing.T) {
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
 	// The first identifier names a superseded card; the branch names the live one.
-	mr.Title = "CHAIN-1 superseded by CHAIN-2 work"
-	mr.SourceBranch = "feature/CHAIN-2-impl"
+	mr.Title = "TASK-1 superseded by TASK-2 work"
+	mr.SourceBranch = "feature/TASK-2-impl"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
 	}
-	linearTeam := linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"}
+	linearTeam := linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"}
 	h.linear.issuesByNumbers = []linear.Issue{
 		{
-			ID: "l1", Identifier: "CHAIN-1", Number: 1, URL: "https://linear.app/CHAIN-1",
+			ID: "l1", Identifier: "TASK-1", Number: 1, URL: "https://linear.app/TASK-1",
 			State: testState(t, "Backlog"), Team: linearTeam,
 		},
 		{
-			ID: "l2", Identifier: "CHAIN-2", Number: 2, URL: "https://linear.app/CHAIN-2",
+			ID: "l2", Identifier: "TASK-2", Number: 2, URL: "https://linear.app/TASK-2",
 			State: testState(t, linear.InReviewState), Team: linearTeam,
 		},
 	}
@@ -839,7 +839,7 @@ func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
 	proj := testProject()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer", Name: "Rita Reviewer"}
 	mr := testMR(testMRIID, withReviewers(reviewer))
-	mr.Title = "CHAIN-184 Scheduler wrapper"
+	mr.Title = "TASK-184 Example background job"
 	seedGitLab(h.fake, proj, mr)
 	h.gql.States = map[int64][]gitlab.ReviewerState{
 		testMRIID: {{Username: reviewer.Username, State: gitlab.ReviewStateUnreviewed}},
@@ -847,9 +847,9 @@ func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
 	canceled := linear.WorkflowState{ID: "st-canceled", Name: "Canceled", Type: "canceled", Position: 8192}
 	h.linear.teamStates = append(testWorkflowStates(), canceled)
 	h.linear.issuesByNumbers = []linear.Issue{{
-		ID: "linear-184", Identifier: "CHAIN-184", Number: 184,
-		URL: "https://linear.app/CHAIN-184", State: canceled,
-		Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "CHAIN"},
+		ID: "linear-184", Identifier: "TASK-184", Number: 184,
+		URL: "https://linear.app/TASK-184", State: canceled,
+		Team: linear.Team{ID: team.LinearTeamIDs[0], Key: "TASK"},
 	}}
 
 	out, err := h.svc.BuildDigest(t.Context(), team, "09:00", digestDay, 0)
@@ -863,7 +863,7 @@ func TestBuildDigestCanceledCardParksTheMRWithItsAuthor(t *testing.T) {
 	if strings.Contains(text, "Rita Reviewer") {
 		t.Errorf("a canceled card still asked its reviewer:\n%s", text)
 	}
-	if !strings.Contains(text, "close this MR (<https://linear.app/CHAIN-184|CHAIN-184> is Canceled)") {
+	if !strings.Contains(text, "close this MR (<https://linear.app/TASK-184|TASK-184> is Canceled)") {
 		t.Errorf("the author row does not ask to close the MR:\n%s", text)
 	}
 	if strings.Contains(text, "to In Review") {
@@ -903,7 +903,7 @@ func TestBuildDigestLinearLinkLookupFailureKeepsGitLabReviewersAndTheCount(t *te
 	team := testTeamConfig()
 	team.LinearTeamIDs = []string{"9cfb482a-81e3-4154-b5b9-2c805e70a02d"}
 	for _, mr := range h.fake.MRs {
-		mr.Title = "CHAIN-481 Add payment retries"
+		mr.Title = "TASK-481 Add payment retries"
 	}
 	h.linear.issues = []linear.Issue{{
 		ID: "i1", Identifier: "PAY-4", URL: "https://linear/PAY-4",
@@ -1485,8 +1485,8 @@ func TestTeamStateCountsBoardGatedAndApprovalBlindMergeRequests(t *testing.T) {
 		Project: domain.Project{ID: 1}, MR: mr(3), Reviewers: reviewers,
 	}
 	state := linearDigestState{enabled: true, linksByMR: map[string]linearLink{
-		snapshotKey(1, 1): {issue: linear.Issue{Identifier: "CHAIN-1"}, stage: linear.StageBeforeReview},
-		snapshotKey(1, 2): {issue: linear.Issue{Identifier: "CHAIN-2"}, stage: linear.StageReviewOrLater},
+		snapshotKey(1, 1): {issue: linear.Issue{Identifier: "TASK-1"}, stage: linear.StageBeforeReview},
+		snapshotKey(1, 2): {issue: linear.Issue{Identifier: "TASK-2"}, stage: linear.StageReviewOrLater},
 	}}
 
 	got := teamState([]domain.MergeRequestSnapshot{gated, waiting, blind}, state)
@@ -1861,5 +1861,57 @@ func TestDigestSkipsDraftsWithoutFetchingThem(t *testing.T) {
 	if h.gl.discussionCalls != 1 {
 		t.Errorf("discussion calls = %d, want 1: the draft must be dropped on the list payload",
 			h.gl.discussionCalls)
+	}
+}
+
+// Review-state changes, rather than pushes, determine whose digest row is shown.
+func TestDigestRequestedChangesWaitsForReRequest(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name                 string
+		state                domain.ReviewState
+		push                 time.Time
+		wantOwner            string
+		wantReviews, wantOwn int
+	}{
+		{"pending changes", domain.ReviewStateRequestedChanges, testNow.Add(-2 * time.Hour), "U01", 0, 1},
+		{"push without re-request", domain.ReviewStateRequestedChanges, testNow, "U01", 0, 1},
+		{"re-request without new push", domain.ReviewStateUnreviewed, testNow.Add(-2 * time.Hour), "U42", 1, 0},
+		{"re-request after push", domain.ReviewStateUnreviewed, testNow, "U42", 1, 0},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, func(h *harness) {
+				h.matcher = stubMatcher{results: map[string]match.Result{
+					"author":   {Status: match.Matched, SlackID: "U01"},
+					"reviewer": {Status: match.Matched, SlackID: "U42"},
+				}}
+			})
+			snap := domain.MergeRequestSnapshot{
+				Project:    domain.Project{ID: testProjectID, FullPath: "backend/payments"},
+				MR:         domain.MergeRequest{IID: testMRIID, State: "opened", Author: domain.User{ID: 1, Username: "author"}},
+				Reviewers:  []domain.Reviewer{{User: domain.User{ID: 42, Username: "reviewer"}, State: tt.state, LastActivityAt: testNow.Add(-time.Hour)}},
+				LastPushAt: tt.push,
+			}
+			data, count := h.svc.digestData(t.Context(), testTeamConfig(), []domain.MergeRequestSnapshot{snap}, 0, linearDigestState{})
+			if count != 1 || len(data.People) != 1 {
+				t.Fatalf("MR count=%d, people=%d; want exactly one of each", count, len(data.People))
+			}
+			person := data.People[0]
+			if person.Person.SlackID != tt.wantOwner || len(person.ToReview) != tt.wantReviews || len(person.Own) != tt.wantOwn {
+				t.Fatalf("digest owner=%q, reviews=%d, own=%d; want %q, %d, %d", person.Person.SlackID, len(person.ToReview), len(person.Own), tt.wantOwner, tt.wantReviews, tt.wantOwn)
+			}
+			body := renderedText(slack.BuildDigest(data)[0])
+			if !strings.Contains(body, "<@"+tt.wantOwner+">") {
+				t.Errorf("digest must ping its action owner: %s", body)
+			}
+			if tt.wantOwn == 1 && strings.Contains(body, "<@U42>") {
+				t.Errorf("pending changes must not ping the reviewer: %s", body)
+			}
+			if tt.wantOwn == 1 && (len(person.Own[0].ChangesRequestedBy) != 1 || (person.Own[0].ChangesRequestedBy[0].SlackID != "" || !strings.Contains(person.Own[0].ChangesRequestedBy[0].Display, "reviewer"))) {
+				t.Error("author row must name the reviewer without pinging them")
+			}
+		})
 	}
 }

@@ -24,6 +24,14 @@ notes where the two diverged).
 
 Requires Go 1.26+, `git`, PostgreSQL ≥ 16 and an authenticated `claude` CLI.
 
+## Example data
+
+Use fictional usernames and task data in documentation, code examples, comments,
+and test fixtures. Use identifiers such as `TASK-121` (or `OTHER-1` when a test
+needs a second project key), generic task titles, and names such as
+`example-author` / `example-reviewer`. Do not copy real users or tasks from
+production digests into the repository.
+
 ## Commands
 
 ```bash
@@ -191,21 +199,16 @@ example — it is why `internal/service` never imports River).
   validator's own and the engine's final cut). A cap that silently truncated left
   `raw_findings: 40, validated: 2, suppressed: ""`, which is the exact question the
   field exists to answer.
-- **The digest's two sections are a partition, not an overlap.** For a reviewer in
-  `REQUESTED_CHANGES`, exactly one side claims the merge request:
-  `NeedsHumanReview` takes it back once the author pushes after the verdict, and
-  `ClassifyAuthorActions.ChangesRequestedBy` holds it until then. Change one rule
-  without the other and the MR is either reported twice or vanishes from the digest
-  entirely — the second is what used to happen. **Both rules need the verdict to
-  have a date**, and that is why `service.lastActivityAt` falls back to the
-  reviewer's newest *system* note when they left no ordinary one: "Request changes"
-  with no comment is a system note, and with a zero timestamp the push comparison
-  can never fire — the author read "changes requested by X" for the life of the MR
-  and X was never asked to look again. Zero now means "no note of any kind was
-  readable", the residual case, and it still parks the MR with the author.
+- **Pending change requests belong to the author.** While a reviewer's state is
+  `REQUESTED_CHANGES`, `NeedsHumanReview` returns false and
+  `ClassifyAuthorActions.ChangesRequestedBy` includes them regardless of pushes
+  or activity timestamps. Explicitly re-requesting review resets GitLab's state
+  to `UNREVIEWED` and returns the action to the reviewer. Name change-requesting
+  reviewers in the author row without Slack mentions so only the author is pinged
+  for the pending request.
 - **Every digest row names its action, in the imperative.** `review !1369`,
   `your MR !1366`, `add a reviewer`, `resolve 3 threads`, `fix merge conflicts`,
-  `fix the failed pipeline`, `move CHAIN-184 to In Review`, `close this MR` for
+  `fix the failed pipeline`, `move TASK-184 to In Review`, `close this MR` for
   a canceled Linear task. The icons stay
   because they make a long list scannable, but they may never be the only thing
   a row says: the two kinds of row sit in the same block, one under the other,
@@ -255,7 +258,7 @@ example — it is why `internal/service` never imports River).
     `needsReviewerTag` suppresses it when the card has not reached In Review — a
     card that was never offered is not an MR somebody forgot to tag. That is legal
     only because the suppressed set is *exactly* `needsLinearStart`'s, so the row
-    survives saying `move CHAIN-184 to In Review`. Drift between the two guards
+    survives saying `move TASK-184 to In Review`. Drift between the two guards
     renders an author row whose every flag was suppressed: a bare link with
     nothing to do about it. Pinned as a property —
     `TestReviewerTagSuppressionAlwaysLeavesTheRowSaying`.
