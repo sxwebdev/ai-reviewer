@@ -159,30 +159,9 @@ type Reviewer struct {
 	User
 	State ReviewState
 
-	// LastActivityAt is when this reviewer last engaged with the MR: their most
-	// recent ordinary note, or — only when they wrote none — their most recent
-	// system note **predating LastPushAt**. The service layer computes it from the
-	// discussions it already loads for every snapshot, so it costs no extra API
-	// call.
-	//
-	// It exists because GitLab's reviewState (mergeRequestInteraction) carries
-	// no timestamp of its own, and NeedsHumanReview has to know whether a
-	// REQUESTED_CHANGES verdict predates the author's latest push. Zero means
-	// "could not be determined", which now covers two situations: the discussions
-	// were not loaded, or the only evidence of this reviewer is a system note the
-	// author has not answered yet.
-	//
-	// The system-note fallback is what makes a verdict delivered through GitLab's
-	// UI alone datable at all: a "Request changes" click with no comment leaves
-	// nothing but a *system* note, so counting ordinary notes only pinned such a
-	// reviewer at zero forever and no push could ever hand the MR back to them.
-	// The clamp is what keeps that from losing the opposite way — a system note can
-	// only ever prove a verdict is OLDER than the last push, never that the
-	// reviewer acted after it, because GitLab credits label, assignee and commit
-	// events to whoever made them too. service.lastActivityAt carries the full
-	// argument. An ordinary note is unclamped and wins whenever there is one; an
-	// approval would be dated the same way, which changes nothing, since
-	// NeedsHumanReview answers APPROVED before it ever reads this field.
+	// LastActivityAt records the latest ordinary note, or, if there is none,
+	// the latest system note at or before LastPushAt. It is snapshot metadata;
+	// explicit GitLab review state alone determines pending change requests.
 	LastActivityAt time.Time
 }
 

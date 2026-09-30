@@ -549,7 +549,7 @@ func (s *Service) gatherLinear(
 			// two outcomes are logged apart: an operator asking "our card is in Backlog,
 			// why were three reviewers still pinged?" has no other signal, and the
 			// identifier regex produces incidental candidates from ordinary branch names
-			// (`feature/CHAIN-184-retry-fix-2` yields FIX-2), so this is reachable
+			// (`feature/TASK-184-retry-fix-2` yields FIX-2), so this is reachable
 			// without anybody deliberately naming two tickets.
 			gated := state.linksByMR[key].stage
 			if gated == linear.StageUnknown {
@@ -812,12 +812,13 @@ func (s *Service) digestData(
 		if !actions.Any() && !moveLinear && !startLinear {
 			continue
 		}
-		// The reviewers who asked for changes are named, so the author knows who to
-		// go back to. Resolved through the same per-run cache as everyone else, so a
-		// reviewer who is also an author costs no extra lookup.
+		// Name the reviewers for context without pinging them: while their change
+		// requests stand, only the author owes an action on those requests.
 		var requested []slack.Mention
 		for _, u := range actions.ChangesRequestedBy {
-			requested = append(requested, s.mention(ctx, mentions, u))
+			requested = append(requested, slack.Mention{Display: match.Fallback(match.GitLabUser{
+				Username: u.Username, Name: u.Name,
+			})})
 		}
 		p := at(snap.MR.Author)
 		p.Own = append(p.Own, slack.AuthorItem{

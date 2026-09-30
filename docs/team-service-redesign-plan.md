@@ -856,7 +856,8 @@ func FailedPipeline(s Snapshot) (p Pipeline, failed bool, known bool)
 Это чистая функция над снапшотом: никакого парсинга статуса из текста комментариев.
 
 **Human review** — на основе `ReviewState` из GraphQL: ревьюеру нужно действие, если его состояние
-не `REVIEWED`/`APPROVED` (либо он `REQUESTED_CHANGES` и после этого был новый пуш). Fallback,
+`UNREVIEWED`, `UNAPPROVED` или `REVIEW_STARTED`. При `REQUESTED_CHANGES` действие
+остаётся у автора независимо от push, пока явный Re-request review не сбросит состояние. Fallback,
 если GraphQL недоступен (`graphql_enabled: false` или ошибка): ревьюер не в `approved_by`
 и не оставил не-system заметку после `LastPushAt`.
 

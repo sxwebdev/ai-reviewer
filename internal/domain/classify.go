@@ -92,11 +92,9 @@ func NeedsAIReview(s MergeRequestSnapshot, teamEnabled bool, lastReviewedSHA str
 // The authoritative source is the GraphQL review state: REVIEWED and APPROVED
 // mean done, UNREVIEWED means the reviewer has not looked yet.
 //
-// REQUESTED_CHANGES is push-aware. A reviewer who requested changes has already
-// acted, and the ball sits with the author until new commits land; listing them
-// under "Reviews needed" would nudge exactly the wrong person, and would do so
-// for the single most common state in an active MR. So they owe an action only
-// once the author has pushed since their last engagement.
+// REQUESTED_CHANGES keeps the action with the author until review is explicitly
+// re-requested and GitLab resets the review state. A push can contain only part
+// of the requested fixes and must not summon the reviewer on its own.
 //
 // UNAPPROVED and REVIEW_STARTED both owe one: withdrawing an approval asks for a
 // fresh verdict, and starting a review is not finishing it. Neither may be left
@@ -120,28 +118,7 @@ func NeedsHumanReview(s MergeRequestSnapshot, r Reviewer) bool {
 	case ReviewStateUnreviewed, ReviewStateUnapproved, ReviewStateReviewStarted:
 		return true
 	case ReviewStateRequestedChanges:
-		// Without an engagement timestamp the verdict cannot be dated, so this
-		// reviewer is treated as done and the author is nudged instead — which is
-		// where the ball actually is. That relies on ClassifyAuthorActions listing
-		// the MR under the author for exactly this state; before it did, the safe
-		// answer here was the opposite (nudge the reviewer, because a stalled MR
-		// nobody chases costs more than a spurious line), since an undatable
-		// verdict with no unresolved thread made the MR vanish from the digest
-		// altogether. The two rules are a pair — changing one without the other
-		// either double-reports the MR or loses it.
-		//
-		// A verdict delivered by clicking "Request changes" without writing a word
-		// used to land here on *every* pass, so the push-aware comparison below was
-		// unreachable for it and the author kept the MR for the life of the merge
-		// request. The service now dates such a verdict from the reviewer's own
-		// system note as soon as the author's push proves it is the older of the two
-		// (see Reviewer.LastActivityAt). So this branch still fires while the ball is
-		// genuinely with the author, and stops firing the moment they answer — which
-		// is the whole difference between a residual case and a dead end.
-		if r.LastActivityAt.IsZero() {
-			return false
-		}
-		return s.LastPushAt.After(r.LastActivityAt)
+		return false
 	}
 
 	// ReviewStateUnknown: graphql_enabled=false, the query failed, or GitLab
@@ -365,22 +342,8 @@ func ClassifyAuthorActions(s MergeRequestSnapshot) AuthorActions {
 	return a
 }
 
-// changesRequestedBy lists the reviewers who asked for changes and have not been
-// answered by a push yet.
-//
-// This is the gap the digest had: the author-facing section was built from
-// unresolved threads, conflicts and pipelines only, and never looked at
-// s.Reviewers at all. So a "Request changes" verdict reached the author only by
-// accident — if the reviewer happened to leave a *resolvable* thread. Without
-// one (a plain comment, resolved threads, or a verdict with no comment at all)
-// the MR appeared in neither section: NeedsHumanReview said the reviewer was
-// done, and nothing said the author owed anything. Observed on a live project as
-// the single REQUESTED_CHANGES MR being rendered as "3 unresolved threads",
-// with the actual verdict stated nowhere.
-//
-// A verdict answered by a later push is excluded: the ball has gone back to the
-// reviewer, NeedsHumanReview lists them, and reporting both would double-count
-// the same merge request.
+// changesRequestedBy lists all pending change requests. Only GitLab's review
+// state clears them; pushes and comments do not establish readiness for review.
 func changesRequestedBy(s MergeRequestSnapshot) []User {
 	if !s.MR.IsOpen() || s.MR.Draft {
 		return nil
@@ -389,9 +352,6 @@ func changesRequestedBy(s MergeRequestSnapshot) []User {
 	for _, r := range s.Reviewers {
 		if r.State != ReviewStateRequestedChanges {
 			continue
-		}
-		if !r.LastActivityAt.IsZero() && s.LastPushAt.After(r.LastActivityAt) {
-			continue // superseded by a push; the reviewer owes the next look
 		}
 		out = append(out, r.User)
 	}

@@ -273,51 +273,10 @@ func (l *snapshotLoader) buildReviewers(fullPath string, detail *gitlab.MergeReq
 	return out
 }
 
-// lastActivityAt is when a user last engaged with the MR: their most recent
-// ordinary note, or — only when they wrote none at all — their most recent
-// system note that predates lastPushAt.
-//
-// The system-note fallback exists because a reviewer can deliver a verdict
-// without typing anything. GitLab records a click on "Request changes" as a
-// *system* note ("requested changes"), exactly as it records approvals and
-// un-approvals, and mergeRequestInteraction.reviewState carries no timestamp of
-// its own. Counting ordinary notes only left that reviewer at the zero time
-// forever, which NeedsHumanReview reads as "the verdict cannot be dated" and
-// hands to the author — permanently. The author's push could never give the MR
-// back, so the reviewer was never nudged again and the author read "changes
-// requested by X" for the rest of the MR's life.
-//
-// The lastPushAt clamp is the whole safety of that fallback, and it is not an
-// optimisation: **a system note may only ever establish that a verdict predates
-// the last push, never that the reviewer acted after it.** GitLab credits a user
-// with every event it records for them — "added ~label", "assigned to @x",
-// "requested review from @y", "added 3 commits", "marked this merge request as
-// ready", "mentioned in merge request !999" — so an unclamped fallback let one
-// unrelated click after the author's push read as a re-review. That parks the MR
-// in the *author's* list as "changes requested by R" and leaves it there until
-// the next push, which the author has no reason to make, having already pushed
-// the fix: the re-look is lost for the life of the MR, which is strictly worse
-// than the zero-time bug this fallback fixes. Clamped, the states come out right
-// without any assumption about note bodies:
-//
-//   - verdict newer than the last push, nothing since → unusable → zero → the
-//     author keeps the MR (the documented undatable residual);
-//   - author pushes after the verdict → the note now predates the push, is used,
-//     and the push is later still → the reviewer owes the next look;
-//   - a stray event after that push → newer than the push → ignored → the
-//     reviewer still owes it.
-//
-// Matching the body prefix instead ("requested changes" / "approved" /
-// "unapproved") would be semantically sharper, and is rejected twice over: this
-// repository has never verified GitLab's wording against a live instance, and a
-// *second* uncommented verdict would still date itself after the push and evict
-// the reviewer. The positional rule needs neither the vocabulary nor the luck.
-//
-// Ordinary notes are not clamped and still win outright, even when a system note
-// is newer: a comment is a human act, and it is the evidence the rule was written
-// for. A lastPushAt of zero (no diff versions were read) discards every system
-// note, which is observationally identical to the old behaviour — NeedsHumanReview
-// cannot conclude anything from an unknown push time either.
+// lastActivityAt records snapshot metadata from the latest ordinary note. When
+// there is none, it uses the latest system note at or before the last push;
+// unrelated newer system events must not overwrite that metadata. Review-state
+// classification does not use this timestamp to clear a pending change request.
 func lastActivityAt(discussions []domain.Discussion, u domain.User, lastPushAt time.Time) time.Time {
 	var ordinary, system time.Time
 	for _, d := range discussions {
@@ -326,8 +285,8 @@ func lastActivityAt(discussions []domain.Discussion, u domain.User, lastPushAt t
 				continue
 			}
 			if n.System {
-				// Strictly after the push: a note at the push instant is kept, the
-				// same tie-break the push-aware classifier uses.
+				// A note at the push instant is kept; only strictly newer notes
+				// are discarded.
 				if n.CreatedAt.After(lastPushAt) {
 					continue
 				}

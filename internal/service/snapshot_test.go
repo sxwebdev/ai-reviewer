@@ -388,21 +388,8 @@ func TestSnapshotRESTFallbackUsesApprovalsAndNotes(t *testing.T) {
 	})
 }
 
-// TestSnapshotDatesAnUncommentedRequestedChangesVerdict walks the progression a
-// reviewer who clicks "Request changes" and writes nothing goes through.
-//
-// It used to dead-end. LastActivityAt counted non-system notes only, so such a
-// reviewer had none at all, and NeedsHumanReview answers false for an undated
-// verdict — which is correct while the ball is with the author but never stops
-// being true. The author's own push could not hand the MR back, so the reviewer
-// was never nudged again and the author read "changes requested by X" forever:
-// the stalled-MR-nobody-chases outcome the pairing was meant to prevent. The
-// partition itself held (the author kept the MR), which is why no existing test
-// caught it — both sides of the partition were tested, the *progression* was not.
-//
-// Every stage runs on the GraphQL path (reviewState REQUESTED_CHANGES), which is
-// the one where LastActivityAt decides anything: the REST fallback re-scans the
-// discussions and skips system notes outright, so it cannot show these bugs.
+// Snapshot activity metadata must never override a pending change request,
+// whether the reviewer commented or only clicked Request changes.
 func TestSnapshotDatesAnUncommentedRequestedChangesVerdict(t *testing.T) {
 	t.Parallel()
 	reviewer := gitlab.User{ID: 42, Username: "reviewer"}
@@ -481,28 +468,19 @@ func TestSnapshotDatesAnUncommentedRequestedChangesVerdict(t *testing.T) {
 		}
 	})
 
-	t.Run("the author's push dates the verdict and hands the MR back", func(t *testing.T) {
+	t.Run("the author's push dates the verdict but keeps the action with the author", func(t *testing.T) {
 		t.Parallel()
 		snap := load(t, []gitlab.MergeRequestVersion{firstPush, fixPush}, verdictNote)
 		if got := snap.Reviewers[0].LastActivityAt; !got.Equal(verdict) {
 			t.Errorf("LastActivityAt = %v, want the verdict's system note at %v", got, verdict)
 		}
-		if !claim(t, snap) {
-			t.Error("the author pushed after the verdict, so the reviewer owes the next look")
+		if claim(t, snap) {
+			t.Error("a push must not override a pending change request")
 		}
 	})
 
-	// The regression the first version of this fix introduced: any event GitLab
-	// credits to the reviewer dated the "verdict", so one stray act after the
-	// author's push parked the MR back in the author's list as "changes requested
-	// by R" — where it stayed until the next push, which the author has no reason
-	// to make. Work silently lost, and worse than the old behaviour, which at least
-	// kept the reviewer in "Reviews needed".
-	//
-	// The bodies below are real GitLab system notes. None of them is parsed: the
-	// rule is positional (newer than the last push ⇒ unusable), so it holds for
-	// wording this list does not contain.
-	t.Run("a later system note cannot take the MR back from the reviewer", func(t *testing.T) {
+	// Unrelated system events must not alter the owner of a pending request.
+	t.Run("a later system note keeps the pending request with the author", func(t *testing.T) {
 		t.Parallel()
 		for _, body := range []string{
 			"added ~123 label",
@@ -524,8 +502,8 @@ func TestSnapshotDatesAnUncommentedRequestedChangesVerdict(t *testing.T) {
 					t.Errorf("LastActivityAt = %v, want the verdict at %v: a later system note is not a re-review",
 						got, verdict)
 				}
-				if !claim(t, snap) {
-					t.Errorf("%q after the push must not clear the reviewer — the re-look would be lost", body)
+				if claim(t, snap) {
+					t.Errorf("%q after the push must not return the action to the reviewer", body)
 				}
 			})
 		}
