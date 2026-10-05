@@ -199,6 +199,11 @@ example — it is why `internal/service` never imports River).
   validator's own and the engine's final cut). A cap that silently truncated left
   `raw_findings: 40, validated: 2, suppressed: ""`, which is the exact question the
   field exists to answer.
+- **Conflicts and failed current-head pipelines are author blockers.** Suppress
+  every reviewer reminder while either blocker is confirmed, and retain the
+  matching author action. Unknown mergeability and stale or inconclusive pipeline
+  results leave the ordinary review queue active. Unresolved threads alone do not
+  suppress reviewers.
 - **Pending change requests belong to the author.** While a reviewer's state is
   `REQUESTED_CHANGES`, `NeedsHumanReview` returns false and
   `ClassifyAuthorActions.ChangesRequestedBy` includes them regardless of pushes

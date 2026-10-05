@@ -112,6 +112,17 @@ func NeedsHumanReview(s MergeRequestSnapshot, r Reviewer) bool {
 		return false
 	}
 
+	// Confirmed conflicts and a failed current-head pipeline are author work.
+	// ClassifyAuthorActions reports the same blockers, so suppressing reviewers
+	// never removes the merge request from the digest. Unknown or stale results
+	// cannot establish a blocker and leave the ordinary review queue active.
+	if conflict, known := HasMergeConflicts(s); known && conflict {
+		return false
+	}
+	if _, failed, known := FailedPipeline(s); known && failed {
+		return false
+	}
+
 	switch r.State {
 	case ReviewStateReviewed, ReviewStateApproved:
 		return false

@@ -842,3 +842,41 @@ func TestDraftsAreNeverAnAuthorAction(t *testing.T) {
 		}
 	}
 }
+
+func TestNeedsHumanReviewWaitsForAuthorBlockers(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		mergeability Mergeability
+		pipeline     Pipeline
+		wantReview   bool
+	}{
+		{name: "confirmed conflicts", mergeability: Mergeability{Known: true, HasConflicts: true}},
+		{name: "conflict status", mergeability: Mergeability{Known: true, DetailedStatus: "conflict"}},
+		{name: "failed head pipeline", pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "failed"}},
+		{name: "both blockers", mergeability: Mergeability{Known: true, HasConflicts: true}, pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "failed"}},
+		{name: "conflicts still being computed", mergeability: Mergeability{Known: true, HasConflicts: true, DetailedStatus: "checking"}, wantReview: true},
+		{name: "unknown pipeline", pipeline: Pipeline{SHA: "aaa111", Status: "failed"}, wantReview: true},
+		{name: "stale failure", pipeline: Pipeline{Known: true, SHA: "older", Status: "failed"}, wantReview: true},
+		{name: "running pipeline", pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "running"}, wantReview: true},
+		{name: "canceled pipeline", pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "canceled"}, wantReview: true},
+		{name: "manual pipeline", pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "manual"}, wantReview: true},
+		{name: "blockers cleared", mergeability: Mergeability{Known: true, DetailedStatus: "mergeable"}, pipeline: Pipeline{Known: true, SHA: "aaa111", Status: "success"}, wantReview: true},
+	}
+	for _, state := range []ReviewState{ReviewStateUnreviewed, ReviewStateUnapproved, ReviewStateReviewStarted, ReviewStateUnknown} {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			for _, tt := range cases {
+				t.Run(tt.name, func(t *testing.T) {
+					t.Parallel()
+					s := openSnap()
+					s.Mergeability, s.Pipeline = tt.mergeability, tt.pipeline
+					r := Reviewer{User: reviewerUser, State: state}
+					if got := NeedsHumanReview(s, r); got != tt.wantReview {
+						t.Errorf("NeedsHumanReview = %v, want %v", got, tt.wantReview)
+					}
+				})
+			}
+		})
+	}
+}

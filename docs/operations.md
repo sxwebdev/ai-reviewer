@@ -278,6 +278,14 @@ Reading it:
   `verbatim: true` to prevent Slack from automatically converting text to
   mentions. Only the owner heading emits an explicit Slack mention.
 
+Confirmed merge conflicts or a failed pipeline for the current head commit suppress
+all reviewer reminders for that merge request. The author still receives the
+corresponding action to fix conflicts or the pipeline. Once those blockers clear,
+reviewer reminders follow the ordinary review-state and Linear rules again.
+Unknown mergeability, stale pipeline failures, and pipelines that are still
+running do not suppress reviewers. Unresolved discussions alone keep the ordinary
+review flow.
+
 A person who owes nothing is not listed. Without Linear, a digest with no
 actions is not posted; with Linear enabled, the healthy `In Review` aggregate
 is itself reportable and may produce a count-only digest.

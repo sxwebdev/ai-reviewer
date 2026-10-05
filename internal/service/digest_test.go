@@ -1452,8 +1452,8 @@ func TestTeamStateCountsEachMROnce(t *testing.T) {
 		Pipeline:     domain.Pipeline{SHA: "aaa", Status: "failed", Known: true},
 	}
 	got := teamState([]domain.MergeRequestSnapshot{snap}, linearDigestState{})
-	if got.WaitingHumanReview != 1 {
-		t.Errorf("WaitingHumanReview = %d, want 1 — two idle reviewers are still one MR",
+	if got.WaitingHumanReview != 0 {
+		t.Errorf("WaitingHumanReview = %d, want 0 while author blockers remain",
 			got.WaitingHumanReview)
 	}
 	if got.UnresolvedThreads != 1 || got.Conflicts != 1 || got.FailedPipeline != 1 {
@@ -1462,6 +1462,13 @@ func TestTeamStateCountsEachMROnce(t *testing.T) {
 	// This fixture never loaded approvals, so "unknown" is the honest count.
 	if got.ApprovalsUnknown != 1 {
 		t.Errorf("ApprovalsUnknown = %d, want 1", got.ApprovalsUnknown)
+	}
+	// Clearing author blockers restores the review queue, counted once per MR.
+	snap.Mergeability = domain.Mergeability{Known: true, DetailedStatus: "mergeable"}
+	snap.Pipeline.Status = "success"
+	ready := teamState([]domain.MergeRequestSnapshot{snap}, linearDigestState{})
+	if ready.WaitingHumanReview != 1 || ready.Conflicts != 0 || ready.FailedPipeline != 0 || ready.UnresolvedThreads != 1 {
+		t.Errorf("team state after blockers clear = %+v, want one MR awaiting review and one unresolved thread", ready)
 	}
 }
 
@@ -1911,6 +1918,77 @@ func TestDigestRequestedChangesWaitsForReRequest(t *testing.T) {
 			}
 			if tt.wantOwn == 1 && (len(person.Own[0].ChangesRequestedBy) != 1 || (person.Own[0].ChangesRequestedBy[0].SlackID != "" || person.Own[0].ChangesRequestedBy[0].Display != "Example Reviewer (reviewer)")) {
 				t.Error("author row must name the reviewer without pinging them")
+			}
+		})
+	}
+}
+
+func TestDigestKeepsAuthorBlockersOutOfReviewQueues(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name                      string
+		conflict, failed, threads bool
+		wantReviews               int
+	}{
+		{name: "conflicts", conflict: true},
+		{name: "failed pipeline", failed: true},
+		{name: "both blockers", conflict: true, failed: true},
+		{name: "blockers cleared", wantReviews: 2},
+		{name: "threads alone keep ordinary review flow", threads: true, wantReviews: 2},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, func(h *harness) {
+				h.matcher = stubMatcher{results: map[string]match.Result{
+					"author":         {Status: match.Matched, SlackID: "U01"},
+					"reviewer":       {Status: match.Matched, SlackID: "U42"},
+					"other-reviewer": {Status: match.Matched, SlackID: "U43"},
+				}}
+			})
+			snapshot := domain.MergeRequestSnapshot{
+				Project:      domain.Project{ID: 1, FullPath: "example/project"},
+				MR:           domain.MergeRequest{IID: 1, State: "opened", Author: domain.User{ID: 1, Username: "author"}},
+				HeadSHA:      "head",
+				Mergeability: domain.Mergeability{Known: true, HasConflicts: tt.conflict},
+				Pipeline:     domain.Pipeline{Known: true, SHA: "head", Status: "success", WebURL: "https://gitlab.example.com/pipeline/1"},
+				Reviewers: []domain.Reviewer{
+					{User: domain.User{ID: 42, Username: "reviewer"}, State: domain.ReviewStateUnreviewed},
+					{User: domain.User{ID: 43, Username: "other-reviewer"}, State: domain.ReviewStateUnknown},
+				},
+			}
+			if tt.failed {
+				snapshot.Pipeline.Status = "failed"
+			}
+			if tt.threads {
+				snapshot.Discussions = []domain.Discussion{{Notes: []domain.Note{{Resolvable: true}}}}
+			}
+			data, count := h.svc.digestData(t.Context(), testTeamConfig(), []domain.MergeRequestSnapshot{snapshot}, 0, linearDigestState{})
+			if count != 1 {
+				t.Fatalf("MR count = %d, want 1", count)
+			}
+			reviews, own := 0, 0
+			for _, person := range data.People {
+				reviews += len(person.ToReview)
+				for _, item := range person.Own {
+					own++
+					if person.Person.SlackID != "U01" || item.MergeConflicts != tt.conflict || item.PipelineFailed != tt.failed {
+						t.Errorf("author row lost its owner or blockers: %+v", person)
+					}
+				}
+			}
+			wantOwn := 0
+			if tt.conflict || tt.failed || tt.threads {
+				wantOwn = 1
+			}
+			if reviews != tt.wantReviews || own != wantOwn {
+				t.Errorf("review rows=%d, author rows=%d; want %d, %d", reviews, own, tt.wantReviews, wantOwn)
+			}
+			if tt.wantReviews == 0 {
+				body := renderedText(slack.BuildDigest(data)[0])
+				if !strings.Contains(body, "<@U01>") || strings.Contains(body, "<@U42>") || strings.Contains(body, "<@U43>") {
+					t.Errorf("only the author should be notified: %s", body)
+				}
 			}
 		})
 	}
