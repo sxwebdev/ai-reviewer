@@ -69,17 +69,44 @@ type ValidatedFinding struct {
 func (f ValidatedFinding) IsOverview() bool { return f.Position == nil }
 
 // Suppression stages: where in the pipeline a finding was dropped. Surfaced
-// read-only in the UI so a real-but-filtered concern is not silently lost.
+// read-only in the UI so a real-but-filtered concern is not silently lost, and
+// counted per stage so "raw_findings: 1, validated: 0" can be explained without
+// opening the database.
 const (
 	SuppressThreshold = "threshold" // below the severity threshold
 	SuppressDuplicate = "duplicate" // fingerprint of a prior finding / already raised
 	SuppressSkeptic   = "skeptic"   // skeptic refuted / marked a duplicate (non-blocking)
 	SuppressVerifier  = "verifier"  // a deterministic verifier refuted it (e.g. clean build)
+	// SuppressNotInDiff is the file-in-diff gate. The finding is still dropped —
+	// commenting on code the MR did not touch is the invariant, not a preference —
+	// but it used to be dropped invisibly, which made a review that returned
+	// nothing indistinguishable from a review that found nothing.
+	SuppressNotInDiff = "not_in_diff"
+	// SuppressEmpty is a finding with no title or no body: unactionable, and a
+	// signal the model returned something malformed rather than nothing.
+	SuppressEmpty = "empty"
+	// SuppressMaxComments is the max-comments cut. Unlike every other stage this
+	// one drops findings that passed every gate and were merely ranked too low,
+	// which is why it used to be a plain `findings = findings[:max]` counted under
+	// no stage at all: the log read "raw_findings: 30, validated: 12,
+	// suppressed: """ and a review that discarded eighteen real findings looked
+	// exactly like one that found twelve. It is also the only suppression an
+	// operator can undo, by raising review.max_comments — hence the stage is named
+	// after the setting.
+	SuppressMaxComments = "max_comments"
 )
 
 // SuppressedFinding is a finding the pipeline dropped, retained with the stage
 // and reason it was dropped so the UI can show it as informational context. It
 // never anchors to a diff line and is never publishable.
+//
+// The list is "what a human did not get to see", not a per-candidate journal:
+// there is exactly one outcome per fingerprint, so a concern that was published
+// never appears here even when the model also emitted a malformed or
+// below-threshold copy of it (`Validator.Validate` prunes those; a later stage
+// that drops a published finding records it under its own stage instead). That is
+// what lets the counts feeding ai_review_findings_suppressed_total mean what the
+// metric says — findings dropped, not findings considered.
 type SuppressedFinding struct {
 	Title    string `json:"title"`
 	Body     string `json:"body"`

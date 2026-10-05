@@ -2,13 +2,15 @@ package llm
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 func TestClaudeErrDetailSurfacesEnvelopeResult(t *testing.T) {
@@ -48,7 +50,14 @@ func TestClaudeErrDetailSurfacesSubtype(t *testing.T) {
 	}
 }
 
-func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+func testLogger() logger.Logger {
+	// Nothing below fatal is emitted, so test output stays clean while the
+	// client under test keeps a non-nil logger.
+	return logger.New(logger.WithConfig(logger.Config{
+		Level:  logger.LogLevelFatal,
+		Format: logger.LoggerFormatJSON,
+	}))
+}
 
 func writeFakeClaude(t *testing.T, script string) string {
 	t.Helper()
@@ -57,6 +66,140 @@ func writeFakeClaude(t *testing.T, script string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// fakeClaudeRecorder writes a fake `claude` that records the environment and
+// argv it was handed, then emits a valid success envelope. It is what makes the
+// subprocess's *actual* environment assertable — ClaudeAuth.Env is exhaustively
+// unit-tested, but nothing proved runOnce used the result.
+func fakeClaudeRecorder(t *testing.T) (bin, envFile, argsFile string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake shell-script binary is unix-only")
+	}
+	dir := t.TempDir()
+	envFile = filepath.Join(dir, "env.txt")
+	argsFile = filepath.Join(dir, "args.txt")
+	// /usr/bin/env by absolute path: the point of the test is that PATH may not
+	// be what this process has.
+	script := "#!/bin/sh\n" +
+		"/usr/bin/env > '" + envFile + "'\n" +
+		"for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '" + argsFile + "'\n" +
+		`printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"{\"summary\":\"ok\",\"findings\":[]}"}'` + "\n"
+	return writeFakeClaude(t, script), envFile, argsFile
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+}
+
+// TestInvokeUsesTheAuthEnvironment is the wired half of the §12.2 matrix: it
+// asserts on the environment the subprocess really received, not on what
+// ClaudeAuth.Env returned. Replacing `cmd.Env = subEnv` with `os.Environ()` —
+// the regression this exists for — leaves the whole rest of the suite green.
+func TestInvokeUsesTheAuthEnvironment(t *testing.T) {
+	const (
+		configured = "configured-oauth-token-wins-77aa11"
+		inherited  = "inherited-oauth-token-must-lose-9911"
+		gitlabPAT  = "glpat-clicaseserviceaccount0001"
+	)
+	// A shared node carrying a stray credential, plus this service's own secret
+	// the way `envFrom: secretRef` supplies it.
+	t.Setenv(EnvOAuthToken, inherited)
+	t.Setenv(EnvAPIKey, "sk-ant-inheritedmustnotsurvive1")
+	t.Setenv("AI_REVIEWER_GITLAB_TOKEN", gitlabPAT)
+	t.Setenv("AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN", "prefixed-secret-must-not-survive")
+
+	auth, err := NewClaudeAuth(AuthConfig{Mode: AuthOAuthToken, OAuthToken: configured})
+	if err != nil {
+		t.Fatalf("NewClaudeAuth: %v", err)
+	}
+
+	bin, envFile, _ := fakeClaudeRecorder(t)
+	c := NewClaudeCLI(ClaudeOptions{Bin: bin, Timeout: 30 * time.Second, Auth: auth}, testLogger())
+	if _, err := c.Review(context.Background(), Request{Prompt: "review"}); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, line := range readLines(t, envFile) {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			got[k] = v
+		}
+	}
+
+	if got[EnvOAuthToken] != configured {
+		t.Errorf("%s = %q, want the configured token — the subprocess is not using ClaudeAuth.Env",
+			EnvOAuthToken, got[EnvOAuthToken])
+	}
+	if v, present := got[EnvAPIKey]; present {
+		t.Errorf("%s survived as %q; the mode matrix is not applied to the subprocess", EnvAPIKey, v)
+	}
+	for _, k := range []string{"AI_REVIEWER_GITLAB_TOKEN", "AI_REVIEWER_CLAUDE_CODE_OAUTH_TOKEN"} {
+		if v, present := got[k]; present {
+			t.Errorf("service secret %s reached the claude subprocess as %q", k, v)
+		}
+	}
+	// The allowlist has to leave a working process behind.
+	if got["PATH"] == "" {
+		t.Error("PATH did not reach the subprocess")
+	}
+}
+
+// TestInvokeScopesToolRulesToTheWorktree pins the other half of the agent-mode
+// confinement: the rules that actually reach claude carry the worktree path.
+// Verified against claude 2.1.222 — a Read outside the rule's path is denied.
+func TestInvokeScopesToolRulesToTheWorktree(t *testing.T) {
+	bin, _, argsFile := fakeClaudeRecorder(t)
+	wt := t.TempDir()
+
+	c := NewClaudeCLI(ClaudeOptions{Bin: bin, Timeout: 30 * time.Second}, testLogger())
+	_, err := c.Review(context.Background(), Request{
+		Prompt:       "review",
+		WorkDir:      wt,
+		AgentMode:    true,
+		AllowedTools: []string{"Read(" + WorktreePlaceholder + "/**)", "Grep(" + WorktreePlaceholder + "/**)"},
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	args := readLines(t, argsFile)
+	i := slices.Index(args, "--allowedTools")
+	if i < 0 || i+1 >= len(args) {
+		t.Fatalf("--allowedTools was not passed: %q", args)
+	}
+	want := "Read(/" + wt + "/**),Grep(/" + wt + "/**)"
+	if args[i+1] != want {
+		t.Errorf("--allowedTools = %q, want %q", args[i+1], want)
+	}
+}
+
+// Agent mode without a worktree must not degrade into an unscoped grant.
+// claude's dontAsk mode denies every tool no allow rule covers, so passing no
+// --allowedTools is the fail-closed outcome (verified against 2.1.222).
+func TestInvokeDropsScopedRulesWithoutAWorktree(t *testing.T) {
+	bin, _, argsFile := fakeClaudeRecorder(t)
+
+	c := NewClaudeCLI(ClaudeOptions{Bin: bin, Timeout: 30 * time.Second}, testLogger())
+	_, err := c.Review(context.Background(), Request{
+		Prompt:       "review",
+		AgentMode:    true,
+		AllowedTools: []string{"Read(" + WorktreePlaceholder + "/**)"},
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	args := readLines(t, argsFile)
+	if i := slices.Index(args, "--allowedTools"); i >= 0 {
+		t.Errorf("--allowedTools was passed as %q with no worktree to scope it to", args[i+1:])
+	}
 }
 
 // A fake `claude` that fails with error_max_structured_output_retries whenever

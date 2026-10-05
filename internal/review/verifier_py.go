@@ -3,12 +3,14 @@ package review
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sxwebdev/ai-reviewer/internal/security"
+	"github.com/tkcrm/mx/logger"
 )
 
 const pyVerifyTimeout = 15 * time.Second
@@ -37,11 +39,11 @@ func claimsPySyntaxFailure(f ValidatedFinding) bool {
 // writes nothing into the read-only worktree (deliberately NOT py_compile,
 // which creates __pycache__). Safe as a default-on verifier.
 type pySyntaxVerifier struct {
-	log     *slog.Logger
+	log     logger.Logger
 	results map[string]int // file -> 0 parses, 1 syntax error, review lifetime
 }
 
-func newPySyntaxVerifier(log *slog.Logger) *pySyntaxVerifier {
+func newPySyntaxVerifier(log logger.Logger) *pySyntaxVerifier {
 	return &pySyntaxVerifier{log: log, results: map[string]int{}}
 }
 
@@ -91,7 +93,11 @@ func runPyParse(ctx context.Context, workDir, filePath string) int {
 	ctx, cancel := context.WithTimeout(ctx, pyVerifyTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, pyBin, "-c", pyParseSnippet, abs)
-	cmd.Env = os.Environ()
+	// Filtered like every other verifier even though this one only ast.parses:
+	// "which of these executes repository code" is a property that moves with a
+	// flag or a version, and deciding it per call site is how one ends up
+	// unfiltered.
+	cmd.Env = security.ToolchainEnv(os.Environ())
 	err = cmd.Run()
 	if ctx.Err() != nil {
 		return -1

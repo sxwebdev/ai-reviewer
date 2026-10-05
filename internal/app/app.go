@@ -1,126 +1,98 @@
-// Package app is the composition root: it wires configuration, logging, state,
-// clients, and the service layer together, and exposes lifecycle entrypoints
-// used by the CLI commands.
+// Package app is the composition root: it turns CLI input into a running
+// service. Configuration and logging are built here (app.go), the runtime graph
+// — Postgres pool, store, GitLab/Slack clients, review engine, git cache, the
+// service layer and the River client — in runtime.go, and the mx launcher that
+// owns their lifecycle in start.go. doctor.go holds the checks that need no
+// infrastructure; doctor_service.go those that do.
 package app
 
 import (
-	"fmt"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"sync"
-	"sync/atomic"
+	"context"
 
 	"github.com/sxwebdev/ai-reviewer/internal/config"
-	"github.com/sxwebdev/ai-reviewer/internal/security"
-	"github.com/sxwebdev/ai-reviewer/internal/server"
-	"github.com/sxwebdev/ai-reviewer/internal/service"
-	"github.com/sxwebdev/ai-reviewer/internal/state"
+	"github.com/tkcrm/mx/logger"
 )
 
-// App holds the wired dependencies shared across commands. Config and the
-// service bundle are held behind atomic pointers so the web UI can hot-apply
-// config changes (setup screen, header switches) without a restart.
+// Options are the process-wide switches the CLI's global flags map to.
+type Options struct {
+	// ConfigPaths are the YAML files to read, in order. Empty means
+	// config.DefaultConfigPath. Missing files are not an error: a deployment
+	// configured purely through env and Vault has none.
+	ConfigPaths []string
+	// Debug forces the log level to debug regardless of what the file says.
+	Debug bool
+}
+
+// App holds the wired dependencies shared across commands.
 type App struct {
-	Log *slog.Logger
-	DB  *state.DB
+	Config *config.Config
+	Log    logger.ExtendedLogger
 
-	// ConfigPath is the config file the app was loaded from (and that runtime
-	// changes are persisted to).
-	ConfigPath string
-
-	cfg     atomic.Pointer[config.Config]
-	bundle  atomic.Pointer[service.Bundle]
-	uiSnap  atomic.Pointer[server.UIConfig] // derived from cfg on every store; read per request
-	applyMu sync.Mutex                      // serializes patch-file → reload → rebuild
-
-	// overrides re-applies CLI flag mutations (e.g. serve --host/--port) after
-	// every config reload, so hot applies don't silently drop them.
-	overrides func(*config.Config)
-
-	// claudeProbe caches a successful claude-CLI lookup (bin → resolved path).
-	// Positive-only: a miss is re-probed every time so the setup Re-check flow
-	// sees a fresh install without a restart.
-	claudeProbe atomic.Pointer[claudeLookup]
+	cleanup func()
 }
 
-type claudeLookup struct{ bin, path string }
-
-// New constructs an App from an already-loaded config and logger. configPath
-// is where runtime config changes are persisted (empty = default path). It
-// registers resolved secrets with the redactor so they never appear in logs.
-func New(cfg *config.Config, configPath string, log *slog.Logger) (*App, error) {
-	if tok := cfg.GitLabToken(); tok != "" {
-		security.RegisterSecret(tok)
+// New loads the configuration and builds the application logger.
+//
+// boot is the bootstrap logger built in main before the CLI tree exists; it is
+// used only for events that happen during the load itself (Vault). Everything
+// afterwards uses App.Log, which is configured from the file/env/Vault result.
+func New(ctx context.Context, boot logger.Logger, opts Options) (*App, error) {
+	paths := opts.ConfigPaths
+	if len(paths) == 0 {
+		paths = []string{config.DefaultConfigPath}
 	}
-	if configPath == "" {
-		configPath = config.DefaultConfigPath()
-	}
-	a := &App{Log: log, ConfigPath: configPath}
-	a.storeConfig(cfg)
-	return a, nil
-}
 
-// Config returns the current runtime config. Until a hot apply happens this is
-// the pointer passed to New, so pre-start CLI flag mutations are visible.
-func (a *App) Config() *config.Config { return a.cfg.Load() }
-
-// storeConfig swaps the runtime config and refreshes the derived UI snapshot.
-func (a *App) storeConfig(cfg *config.Config) {
-	a.cfg.Store(cfg)
-	ui := uiConfigFrom(cfg)
-	a.uiSnap.Store(&ui)
-}
-
-// SetOverrides registers CLI flag overrides: fn is applied to the current
-// config immediately and re-applied after every hot config reload.
-func (a *App) SetOverrides(fn func(*config.Config)) {
-	a.overrides = fn
-	if fn != nil {
-		cfg := a.Config()
-		fn(cfg)
-		a.storeConfig(cfg)
-	}
-}
-
-// Bundle returns the current service bundle. Nil until Services() has run.
-func (a *App) Bundle() *service.Bundle { return a.bundle.Load() }
-
-// OpenState creates the data, cache, and database directories, then opens and
-// migrates the SQLite database, caching the handle on the App. It is
-// idempotent. This is what makes every entrypoint self-initializing — there is
-// no separate init command.
-func (a *App) OpenState() (*state.DB, error) {
-	if a.DB != nil {
-		return a.DB, nil
-	}
-	cfg := a.Config()
-	for _, dir := range []string{cfg.App.DataDir, cfg.Storage.CacheDir, filepath.Dir(cfg.Storage.DBPath)} {
-		if dir == "" {
-			continue
-		}
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("create dir %s: %w", dir, err)
-		}
-	}
-	db, err := state.Open(cfg.Storage.DBPath)
+	cfg, err := config.Default()
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Migrate(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+	res, err := config.Load(ctx, boot, cfg, paths)
+	if err != nil {
+		return nil, err
 	}
-	a.DB = db
-	return db, nil
+
+	// The flag wins over the file: --debug exists precisely for the case where
+	// the configured level is hiding what you need to see.
+	if opts.Debug {
+		cfg.Log.Level = logger.LogLevelDebug
+	}
+
+	return &App{
+		Config:  cfg,
+		Log:     NewLogger(cfg.Log),
+		cleanup: res.Cleanup,
+	}, nil
 }
 
-// Close releases resources (DB handle, etc.). Safe to call multiple times.
+// Minimal builds an App with default configuration and a real logger, without
+// reading or validating anything.
+//
+// It exists for `migrations up --dsn …`, which runs from an init container that
+// has a database URL and nothing else: no GitLab token, no Slack token, no
+// teams. Requiring the full config there would make applying the schema depend
+// on credentials the schema never touches.
+func Minimal(opts Options) (*App, error) {
+	cfg, err := config.Default()
+	if err != nil {
+		return nil, err
+	}
+	if opts.Debug {
+		cfg.Log.Level = logger.LogLevelDebug
+	}
+	return &App{Config: cfg, Log: NewLogger(cfg.Log)}, nil
+}
+
+// Close releases resources acquired during the load (the Vault client and its
+// token renewer). Safe to call more than once.
 func (a *App) Close() error {
-	if a.DB != nil {
-		err := a.DB.Close()
-		a.DB = nil
-		return err
+	if a.cleanup != nil {
+		a.cleanup()
+		a.cleanup = nil
+	}
+	if a.Log != nil {
+		// Flushing is best-effort: on a plain terminal Sync returns EINVAL for
+		// stdout, which is noise, not a failure.
+		_ = a.Log.Sync()
 	}
 	return nil
 }

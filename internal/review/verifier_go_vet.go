@@ -2,11 +2,12 @@ package review
 
 import (
 	"context"
-	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 const vetVerifyTimeout = 120 * time.Second
@@ -20,11 +21,11 @@ var vetDiagPathRe = regexp.MustCompile(`([^\s:]+\.go):\d+`)
 // file, the note tells the human reviewer a deterministic tool agrees
 // something is off. Monorepo-aware: the module root is resolved per finding.
 type goVetVerifier struct {
-	log      *slog.Logger
+	log      logger.Logger
 	vetFiles map[string]map[string]bool // root\x00pkgDir -> root-relative files with diagnostics
 }
 
-func newGoVetVerifier(log *slog.Logger) *goVetVerifier {
+func newGoVetVerifier(log logger.Logger) *goVetVerifier {
 	return &goVetVerifier{log: log, vetFiles: map[string]map[string]bool{}}
 }
 

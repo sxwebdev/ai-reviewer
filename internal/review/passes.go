@@ -1,6 +1,6 @@
 package review
 
-import "log/slog"
+import "github.com/tkcrm/mx/logger"
 
 // Builtin pass names.
 const (
@@ -34,14 +34,14 @@ func BuiltinPasses() map[string]PassSpec {
 // with a warning, never fatal. Exactly one pass ends up primary: "general"
 // when present, otherwise the first resolved pass (so custom pass lists
 // without "general" still produce a summary).
-func ResolvePasses(names []string, log *slog.Logger) []PassSpec {
+func ResolvePasses(names []string, log logger.Logger) []PassSpec {
 	builtin := BuiltinPasses()
 	var specs []PassSpec
 	seen := map[string]bool{}
 	for _, n := range names {
 		spec, ok := builtin[n]
 		if !ok {
-			log.Warn("unknown review pass skipped", "pass", n)
+			log.Warnw("unknown review pass skipped", "pass", n)
 			continue
 		}
 		if seen[n] {

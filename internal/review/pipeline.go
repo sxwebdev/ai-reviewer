@@ -111,14 +111,13 @@ func (e *Engine) runPasses(ctx context.Context, in ReviewInput, specs []PassSpec
 				WorkDir:      in.WorkDir,
 				AgentMode:    in.AgentMode,
 				AllowedTools: in.AllowedTools,
-				Skills:       in.Skills,
 				JSONSchema:   llm.ReviewJSONSchema,
 			})
 			outcomes[i] = passOutcome{spec: spec, resp: resp, err: err}
 			rep := PassReport{Name: spec.Name, DurationMS: time.Since(start).Milliseconds()}
 			if err != nil {
 				rep.Err = err.Error()
-				e.log.Warn("review pass failed", "pass", spec.Name, "err", err)
+				e.log.Warnw("review pass failed", "pass", spec.Name, "err", err)
 			} else {
 				rep.CostUSD = resp.CostUSD
 				rep.RawFindings = len(resp.Findings)

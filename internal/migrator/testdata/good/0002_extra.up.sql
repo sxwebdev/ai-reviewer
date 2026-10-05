@@ -1,0 +1,1 @@
+ALTER TABLE mig_probe ADD COLUMN extra int NOT NULL DEFAULT 0;

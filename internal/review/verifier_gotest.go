@@ -2,9 +2,10 @@ package review
 
 import (
 	"context"
-	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/tkcrm/mx/logger"
 )
 
 const testVerifyTimeout = 180 * time.Second
@@ -17,11 +18,11 @@ const testVerifyTimeout = 180 * time.Second
 // commands over the user's own MR, but still an explicit choice.
 // Monorepo-aware: the module root is resolved per finding.
 type goTestVerifier struct {
-	log        *slog.Logger
+	log        logger.Logger
 	testFailed map[string]bool // root\x00pkgDir -> tests failed
 }
 
-func newGoTestVerifier(log *slog.Logger) *goTestVerifier {
+func newGoTestVerifier(log logger.Logger) *goTestVerifier {
 	return &goTestVerifier{log: log, testFailed: map[string]bool{}}
 }
 

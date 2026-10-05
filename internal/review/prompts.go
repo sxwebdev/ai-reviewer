@@ -7,15 +7,6 @@ import (
 	"github.com/sxwebdev/ai-reviewer/internal/coverage"
 )
 
-// MemoryRule is a repo/global rule injected into the prompt. The service maps
-// persisted review_memory rows to this lightweight type to keep the engine
-// decoupled from the state package.
-type MemoryRule struct {
-	Type  string
-	Title string
-	Body  string
-}
-
 // BuildSystemPrompt renders the reviewer persona and hard output rules.
 func BuildSystemPrompt(p *Profile) string {
 	if p == nil {
@@ -113,27 +104,6 @@ func BuildUserPrompt(in ReviewInput) string {
 		}
 	}
 
-	if len(in.Memory) > 0 {
-		b.WriteString("\n## Project rules and review memory (apply these)\n")
-		for _, m := range in.Memory {
-			fmt.Fprintf(&b, "- [%s] %s: %s\n", m.Type, m.Title, m.Body)
-		}
-	}
-
-	if strings.TrimSpace(in.UserContext) != "" {
-		b.WriteString("\n## Reviewer-supplied context for this review (weight this heavily)\n")
-		b.WriteString(strings.TrimSpace(in.UserContext))
-		b.WriteByte('\n')
-	}
-
-	if len(in.Skills) > 0 && in.AgentMode {
-		b.WriteString("\n## Skills available for this review\n")
-		b.WriteString("Invoke the following skills where they apply to the changed code:\n")
-		for _, sk := range in.Skills {
-			fmt.Fprintf(&b, "- /%s\n", sk)
-		}
-	}
-
 	writeRiskSection(&b, in.Risk)
 
 	writeCoverageSection(&b, in.Coverage)
@@ -141,13 +111,6 @@ func BuildUserPrompt(in ReviewInput) string {
 	writePriorReviewSection(&b, in.PriorReview)
 
 	writeInvestigationSection(&b, in)
-
-	if len(in.RelatedFiles) > 0 && in.AgentMode && in.WorkDir != "" {
-		b.WriteString("\n## Possibly related files (investigate with Read/Grep before asserting cross-file claims)\n")
-		for _, rf := range in.RelatedFiles {
-			fmt.Fprintf(&b, "- %s (%s)\n", rf.Path, rf.Reason)
-		}
-	}
 
 	if len(in.FileContexts) > 0 {
 		b.WriteString("\n## Full content of changed files (reference only — comment only on changed lines)\n")
@@ -278,18 +241,14 @@ func writePriorReviewSection(b *strings.Builder, pr *PriorReview) {
 	if len(pr.Findings) > 0 {
 		b.WriteString("\nPrior findings and their dispositions:\n")
 		for _, f := range pr.Findings {
-			fmt.Fprintf(b, "- [%s/%s] %s:%d — %s", f.Severity, f.Status, f.FilePath, f.Line, f.Title)
-			if f.RejectionReason != "" {
-				fmt.Fprintf(b, " (rejected: %s)", f.RejectionReason)
-			}
-			b.WriteByte('\n')
+			fmt.Fprintf(b, "- [%s/%s] %s:%d — %s\n", f.Severity, f.Status, f.FilePath, f.Line, f.Title)
 		}
 	}
 	b.WriteString(`
 Rules for this re-review:
 - Focus on what changed since the previous review (interdiff below when available).
-- Do not re-raise rejected findings (their rejection reasons above tell you why) or
-  findings already approved/published.
+- Do not re-raise a finding listed above as published: it is already on the merge
+  request, and the discussion notes show what the team said about it.
 - Re-raise a previously reported issue only if the new changes made it worse.
 `)
 	if pr.Interdiff != "" {

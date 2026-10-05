@@ -1,7 +1,12 @@
 // Package cli is the thin urfave/cli v3 launcher. It parses flags, loads
-// config, builds the application, and dispatches to the app's lifecycle
-// entrypoints. Business logic lives in internal/app and the service layer, not
-// here.
+// config, builds the application, and dispatches. Business logic lives in
+// internal/app, internal/jobs and the service layer, not here.
+//
+// The shape of the command set follows §15: with the single exception of
+// `review --local`, the CLI *enqueues* work rather than doing it, and a running
+// `start` executes it. That keeps one implementation of every operation and
+// makes a manual run subject to the same uniqueness, retries and metrics as a
+// scheduled one.
 package cli
 
 import (
@@ -9,158 +14,127 @@ import (
 	"fmt"
 
 	"github.com/sxwebdev/ai-reviewer/internal/app"
-	"github.com/sxwebdev/ai-reviewer/internal/config"
+	"github.com/sxwebdev/ai-reviewer/internal/jobs"
 	"github.com/sxwebdev/ai-reviewer/internal/version"
+	"github.com/tkcrm/mx/logger"
 	"github.com/urfave/cli/v3"
 )
 
-// NewApp builds the root command tree.
-func NewApp() *cli.Command {
+// NewApp builds the root command tree. boot is the bootstrap logger built in
+// main before any command runs; commands pass it to app.New, which uses it for
+// events that happen while the real logger's configuration is still being
+// resolved.
+func NewApp(boot logger.ExtendedLogger) *cli.Command {
 	return &cli.Command{
-		Name:    "ai-reviewer",
-		Usage:   "Local AI code review for GitLab merge requests",
+		Name:    app.AppName,
+		Usage:   "Team AI code review for GitLab merge requests",
 		Version: version.String(),
+		Suggest: true,
 		Flags: []cli.Flag{
-			&cli.StringFlag{
+			&cli.StringSliceFlag{
 				Name:    "config",
 				Aliases: []string{"c"},
-				Usage:   "Path to config file (default ~/.ai-reviewer/config.yaml)",
+				Usage:   "Config file(s), applied in order (default config.yaml)",
 				Sources: cli.EnvVars("AI_REVIEWER_CONFIG"),
 			},
 			&cli.BoolFlag{
 				Name:  "debug",
-				Usage: "Enable debug logging",
+				Usage: "Force debug-level logging regardless of log.level",
 			},
 		},
 		Commands: []*cli.Command{
-			serveCommand(),
-			daemonCommand(),
-			syncCommand(),
-			reviewCommand(),
-			doctorCommand(),
+			startCommand(boot),
+			scanCommand(boot),
+			reviewCommand(boot),
+			digestCommand(boot),
+			doctorCommand(boot),
+			migrationsCommand(boot),
 		},
 	}
 }
 
-// bootstrap loads config (with CLI overrides) and constructs the App + logger.
-// There is no init step: directories and the database are created on first
-// use, and the web UI walks the user through the required settings.
-func bootstrap(cmd *cli.Command) (*app.App, error) {
-	path := cmd.String("config")
-	cfg, err := config.Load(path)
+// options maps the global flags to app.Options.
+func options(cmd *cli.Command) app.Options {
+	return app.Options{
+		ConfigPaths: cmd.StringSlice("config"),
+		Debug:       cmd.Bool("debug"),
+	}
+}
+
+// open loads the config and builds the App. Every command except `doctor` and
+// `migrations --dsn` starts here: a config that does not validate is a hard
+// failure, because the alternative is a service that runs against a half-read
+// configuration and reviews the wrong repositories.
+func open(ctx context.Context, boot logger.ExtendedLogger, cmd *cli.Command) (*app.App, error) {
+	a, err := app.New(ctx, boot, options(cmd))
 	if err != nil {
-		shown := path
-		if shown == "" {
-			shown = config.DefaultConfigPath()
-		}
-		// With `init --force` gone this is the only recovery hint for a broken
-		// config file — without it every command dies here before any UI.
-		return nil, fmt.Errorf("%w\nfix or delete %s, then run 'ai-reviewer serve' to reconfigure via the web UI", err, shown)
+		return nil, err
 	}
-	log := app.NewLogger(cmd.Bool("debug"))
-	return app.New(cfg, path, log)
+	return a, nil
 }
 
-func serveCommand() *cli.Command {
+// teamFlag is shared by `scan` and `digest`.
+func teamFlag() *cli.StringFlag {
+	return &cli.StringFlag{
+		Name:  "team",
+		Usage: "Limit the operation to one configured team",
+	}
+}
+
+func startCommand(boot logger.ExtendedLogger) *cli.Command {
 	return &cli.Command{
-		Name:    "serve",
-		Usage:   "Start the local web UI and background worker",
-		Aliases: []string{"start"},
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "host", Usage: "Bind host"},
-			&cli.IntFlag{Name: "port", Usage: "Bind port (0 = random)", Value: -1},
-			&cli.BoolFlag{Name: "open", Usage: "Open the browser", Value: true},
-			&cli.BoolFlag{Name: "daemon", Usage: "Run the background worker", Value: true},
-		},
+		Name:  "start",
+		Usage: "Run the service: River workers, periodic jobs and the ops server",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			a, err := bootstrap(cmd)
+			a, err := open(ctx, boot, cmd)
 			if err != nil {
 				return err
 			}
-			defer a.Close()
-			// Registered as overrides (not one-off mutations) so hot config
-			// reloads triggered from the web UI keep the flag values.
-			a.SetOverrides(func(cfg *config.Config) {
-				if h := cmd.String("host"); h != "" {
-					cfg.App.BindHost = h
+			defer func() { _ = a.Close() }()
+			return a.Start(ctx)
+		},
+	}
+}
+
+func scanCommand(boot logger.ExtendedLogger) *cli.Command {
+	return &cli.Command{
+		Name:  "scan",
+		Usage: "Enqueue a scan pass (a running `start` executes it)",
+		Flags: []cli.Flag{teamFlag()},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			a, err := open(ctx, boot, cmd)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = a.Close() }()
+
+			team := cmd.String("team")
+			if team != "" {
+				if _, ok := app.TeamByName(a.Config, team); !ok {
+					return fmt.Errorf("no configured team named %q", team)
 				}
-				if p := cmd.Int("port"); p >= 0 {
-					cfg.App.Port = p
-				}
-				cfg.App.OpenBrowser = cmd.Bool("open")
-			})
-			return a.Serve(ctx, app.ServeOptions{RunWorker: cmd.Bool("daemon")})
-		},
-	}
-}
+			}
 
-func daemonCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "daemon",
-		Usage: "Run the background watch/review worker without the web UI",
-		Flags: []cli.Flag{
-			&cli.DurationFlag{Name: "interval", Usage: "Watch interval"},
-			&cli.BoolFlag{Name: "foreground", Usage: "Run in foreground", Value: true},
-			&cli.BoolFlag{Name: "auto-review", Usage: "Auto-run review (local report only)", Value: true},
-			&cli.BoolFlag{Name: "auto-draft", Usage: "Allow auto-create of GitLab draft notes"},
-			&cli.BoolFlag{Name: "auto-publish", Usage: "DANGER: allow auto-publish"},
-			&cli.IntFlag{Name: "max-parallel", Usage: "Max parallel jobs", Value: -1},
-		},
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			a, err := bootstrap(cmd)
+			pg, q, err := a.Queue(ctx)
 			if err != nil {
 				return err
 			}
-			defer a.Close()
-			a.SetOverrides(func(cfg *config.Config) { applyDaemonFlags(cfg, cmd) })
-			return a.RunDaemon(ctx)
-		},
-	}
-}
+			defer func() { _ = pg.Stop(ctx) }()
 
-func applyDaemonFlags(cfg *config.Config, cmd *cli.Command) {
-	if d := cmd.Duration("interval"); d > 0 {
-		cfg.Watch.Interval = d
-	}
-	if n := cmd.Int("max-parallel"); n > 0 {
-		cfg.Watch.MaxParallel = n
-	}
-	cfg.Review.AutoReview = cmd.Bool("auto-review")
-	cfg.Review.AutoDraft = cmd.Bool("auto-draft")
-	cfg.Review.AutoPublish = cmd.Bool("auto-publish")
-}
-
-func syncCommand() *cli.Command {
-	return &cli.Command{
-		Name:  "sync",
-		Usage: "One-shot sync of merge requests assigned to you for review",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			a, err := bootstrap(cmd)
+			res, err := q.EnqueueScan(ctx, jobs.ScanArgs{Team: team})
 			if err != nil {
 				return err
 			}
-			defer a.Close()
-			return a.SyncOnce(ctx)
-		},
-	}
-}
-
-func reviewCommand() *cli.Command {
-	return &cli.Command{
-		Name:      "review",
-		Usage:     "One-shot review of a single MR (local report by default)",
-		ArgsUsage: "<mr-url | project-path!iid | project-id:iid>",
-		Action: func(ctx context.Context, cmd *cli.Command) error {
-			ref := cmd.Args().First()
-			if ref == "" {
-				return cli.Exit("missing MR reference argument", 2)
+			if res.Deduplicated {
+				// §6.2 keys scan uniqueness on the kind alone, so a team-scoped
+				// request collapses into a full pass that is already running.
+				// Saying so is the difference between "your narrower scan was
+				// dropped" and a silent success.
+				fmt.Printf("a scan is already in flight (job %d); this request was folded into it\n", res.ID())
+				return nil
 			}
-			a, err := bootstrap(cmd)
-			if err != nil {
-				return err
-			}
-			defer a.Close()
-			return a.ReviewOnce(ctx, ref)
+			fmt.Printf("queued scan job %d\n", res.ID())
+			return nil
 		},
 	}
 }

@@ -2,7 +2,6 @@ package review
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path"
@@ -11,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sxwebdev/ai-reviewer/internal/security"
 	"github.com/sxwebdev/ai-reviewer/internal/toolchain"
+	"github.com/tkcrm/mx/logger"
 )
 
 const tscVerifyTimeout = 120 * time.Second
@@ -53,11 +54,11 @@ type tscOutcome struct {
 // it executes the repository's own tsc binary (node_modules/.bin) — the same
 // trust level as the go_test verifier.
 type tscVerifier struct {
-	log     *slog.Logger
+	log     logger.Logger
 	results map[string]tscOutcome // per tsconfig root, review lifetime
 }
 
-func newTSCVerifier(log *slog.Logger) *tscVerifier {
+func newTSCVerifier(log logger.Logger) *tscVerifier {
 	return &tscVerifier{log: log, results: map[string]tscOutcome{}}
 }
 
@@ -111,7 +112,10 @@ func runTSC(ctx context.Context, workDir, root string) tscOutcome {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, tscBin, "--noEmit", "--pretty", "false", "-p", absRoot)
 	cmd.Dir = absRoot
-	cmd.Env = os.Environ()
+	// tscBin comes from the merge request's own node_modules, so this is
+	// attacker-supplied code by construction — it must not see the service's
+	// secrets.
+	cmd.Env = security.ToolchainEnv(os.Environ())
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return tscOutcome{} // timeout → environmental, not judgeable

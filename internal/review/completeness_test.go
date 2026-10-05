@@ -14,6 +14,9 @@ func completenessInput(t *testing.T) ReviewInput {
 	in := testInput(t, PipelineConfig{Completeness: CompletenessAuto})
 	in.Description = "Implements refund processing:\n- validate amounts\n- write audit log"
 	in.Commits = []CommitInfo{{ShortSHA: "c1", Title: "feat: refunds", Message: "adds ProcessRefund"}}
+	// Present so the "audit prompt stays narrow" assertion below has something
+	// to detect if the review prompt's sections ever leak into it.
+	in.Discussions = []DiscussionNote{{Author: "carol", Body: "please add a test"}}
 	return in
 }
 
@@ -28,8 +31,11 @@ func TestCompletenessAuditViaEngine(t *testing.T) {
 		if !strings.Contains(req.Prompt, "validate amounts") || !strings.Contains(req.Prompt, "adds ProcessRefund") {
 			t.Errorf("completeness prompt missing intent text:\n%s", req.Prompt)
 		}
-		if strings.Contains(req.Prompt, "Project rules") {
-			t.Error("completeness prompt must not carry memory rules")
+		// The audit gets intent + diffs only, never the full review context:
+		// it is a cheap side-call, and the extra sections would both cost tokens
+		// and pull it towards code review.
+		if strings.Contains(req.Prompt, "Existing discussions on this MR") {
+			t.Error("completeness prompt must not carry the review prompt's context sections")
 		}
 		v, _ := json.Marshal(llm.CompletenessResponse{Criteria: []llm.CompletenessCriterion{
 			{Criterion: "validate amounts", Status: "done", Evidence: "validateAmount in pay.go"},

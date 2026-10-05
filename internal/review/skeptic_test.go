@@ -3,15 +3,21 @@ package review
 import (
 	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/sxwebdev/ai-reviewer/internal/llm"
+	"github.com/tkcrm/mx/logger"
 )
 
-func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+// discardLog is a logger that emits nothing below fatal, so test output stays
+// clean while the code under test keeps a non-nil logger.
+func discardLog() logger.Logger {
+	return logger.New(logger.WithConfig(logger.Config{
+		Level:  logger.LogLevelFatal,
+		Format: logger.LoggerFormatJSON,
+	}))
+}
 
 func vf(sev, title string, conf float64) ValidatedFinding {
 	return ValidatedFinding{
