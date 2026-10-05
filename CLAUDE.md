@@ -205,7 +205,9 @@ example — it is why `internal/service` never imports River).
   or activity timestamps. Explicitly re-requesting review resets GitLab's state
   to `UNREVIEWED` and returns the action to the reviewer. Name change-requesting
   reviewers in the author row without Slack mentions so only the author is pinged
-  for the pending request.
+  for the pending request. Context names must contain no `@` trigger; all
+  mrkdwn blocks set `verbatim: true` to prevent automatic Slack mention parsing.
+  Only the owner heading may emit `<@SlackID>`.
 - **Every digest row names its action, in the imperative.** `review !1369`,
   `your MR !1366`, `add a reviewer`, `resolve 3 threads`, `fix merge conflicts`,
   `fix the failed pipeline`, `move TASK-184 to In Review`, `close this MR` for

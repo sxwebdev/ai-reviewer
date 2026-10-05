@@ -60,10 +60,13 @@ func TestPreviewNamesEveryMention(t *testing.T) {
 	t.Parallel()
 
 	out := preview(t, previewFixture(), false)
-	for _, want := range []string{"@Rita Reviewer", "@Bob Bobson", "Ann Author (@ann)"} {
+	for _, want := range []string{"@Rita Reviewer", "Bob Bobson", "Ann Author (@ann)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("%q missing from the preview:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "@Bob Bobson") {
+		t.Errorf("a context user must appear without a mention in the preview:\n%s", out)
 	}
 	if strings.Contains(out, "<@U") {
 		t.Errorf("a raw Slack id survived into the rendered preview:\n%s", out)
@@ -87,6 +90,9 @@ func TestPreviewJSONIsTheUntouchedPayload(t *testing.T) {
 	out := preview(t, previewFixture(), true)
 	if !strings.Contains(out, "<@U42>") {
 		t.Errorf("--json must print the payload Slack gets, mentions included:\n%s", out)
+	}
+	if strings.Contains(out, "<@U9>") {
+		t.Errorf("the Slack payload must not mention a context user:\n%s", out)
 	}
 	if strings.Contains(out, "@Rita Reviewer") {
 		t.Errorf("--json must not rewrite the payload:\n%s", out)

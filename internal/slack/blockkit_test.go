@@ -611,7 +611,7 @@ func TestAuthorFlagOrderIsFixed(t *testing.T) {
 			Person: slack.Mention{SlackID: "U1"},
 			Own: []slack.AuthorItem{{
 				IID: 1, Title: "T", WebURL: "https://gl/1",
-				ChangesRequestedBy: []slack.Mention{{SlackID: "U9"}, {Display: "Jane Doe (@jane)"}},
+				ChangesRequestedBy: []slack.Mention{{SlackID: "U9", Display: "Example Reviewer (@example-reviewer)"}, {Display: "Jane Doe (@jane)"}},
 				UnresolvedThreads:  1, MergeConflicts: true, PipelineFailed: true,
 				PipelineWebURL: "https://gl/p/9",
 			}},
@@ -620,7 +620,7 @@ func TestAuthorFlagOrderIsFixed(t *testing.T) {
 	body := blockTexts(t, slack.BuildDigest(d)[0].Blocks)[1]
 
 	// An unmatched reviewer is named without a ping, exactly like everywhere else.
-	if !strings.Contains(body, "🔁 address changes requested by <@U9>, Jane Doe (@jane)") {
+	if !strings.Contains(body, "🔁 address changes requested by Example Reviewer (example-reviewer), Jane Doe (jane)") {
 		t.Errorf("changes-requested flag missing or misrendered:\n%s", body)
 	}
 	wantOrder := []string{"🔁 address changes requested by", "💬 resolve 1 thread", "⚠️ fix merge conflicts", "❌ "}
@@ -678,7 +678,7 @@ func TestUnmatchedAndAmbiguousPeopleStillAppear(t *testing.T) {
 	if !strings.Contains(texts, "*John Smith (@john)* · to review 1 · your MRs 1") {
 		t.Errorf("unmatched person missing:\n%s", texts)
 	}
-	if !strings.Contains(texts, "Ann Lee (@ann) ❓") {
+	if !strings.Contains(texts, "Ann Lee (ann) ❓") {
 		t.Errorf("ambiguous person is not marked:\n%s", texts)
 	}
 	if strings.Contains(texts, "<@>") {
@@ -1423,5 +1423,66 @@ func TestAddReviewerRowStandsAlone(t *testing.T) {
 	row := strings.Split(body, "\n")[1]
 	if !strings.Contains(row, "your MR ") || !strings.Contains(row, "add a reviewer") {
 		t.Errorf("row = %q, want it to name the MR as the author's and the action to take", row)
+	}
+}
+
+// Only the owner of a person's block can be mentioned. Context users are names,
+// even if a caller provides resolved Slack IDs or raw handles.
+func TestDigestMentionsOnlyBlockOwner(t *testing.T) {
+	t.Parallel()
+	for _, reviewer := range []slack.Mention{
+		{SlackID: "U42", Display: "Example Reviewer (@example-reviewer)"},
+		{Display: "@example-reviewer"},
+		{SlackID: "U42"},
+		{Display: "Example <@U42> @here"},
+		{Display: "Example Reviewer (@example-reviewer)", Ambiguous: true},
+	} {
+		t.Run(fmt.Sprintf("%+v", reviewer), func(t *testing.T) {
+			t.Parallel()
+			messages := slack.BuildDigest(slack.DigestData{
+				Team: "example-team",
+				People: []slack.PersonDigest{{
+					Person: slack.Mention{SlackID: "U01"},
+					Own:    []slack.AuthorItem{{IID: 1, Title: "TASK-121 notify @example-reviewer <@U42>", ChangesRequestedBy: []slack.Mention{reviewer}}},
+				}},
+			})
+			if len(messages) != 1 {
+				t.Fatalf("messages = %d, want 1", len(messages))
+			}
+			body := strings.Join(blockTexts(t, messages[0].Blocks), "\n")
+			if strings.Count(body, "<@") != 1 || !strings.Contains(body, "<@U01>") {
+				t.Errorf("only the block owner may have an explicit mention: %s", body)
+			}
+			flag := strings.Split(strings.Split(body, "address changes requested by ")[1], " — ")[0]
+			if strings.Contains(flag, "@") {
+				t.Errorf("context name contains a mention trigger: %s", flag)
+			}
+			raw, err := json.Marshal(messages[0].Post("C123"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Blocks []struct {
+					Text *struct {
+						Type     string `json:"type"`
+						Verbatim *bool  `json:"verbatim"`
+					} `json:"text"`
+				} `json:"blocks"`
+			}
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			for _, block := range payload.Blocks {
+				if block.Text == nil {
+					continue
+				}
+				if block.Text.Type == "mrkdwn" && (block.Text.Verbatim == nil || !*block.Text.Verbatim) {
+					t.Error("Slack payload must disable automatic mention parsing in mrkdwn blocks")
+				}
+				if block.Text.Type == "plain_text" && block.Text.Verbatim != nil {
+					t.Error("verbatim is only valid for mrkdwn text")
+				}
+			}
+		})
 	}
 }

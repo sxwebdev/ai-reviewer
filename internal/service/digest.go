@@ -816,9 +816,9 @@ func (s *Service) digestData(
 		// requests stand, only the author owes an action on those requests.
 		var requested []slack.Mention
 		for _, u := range actions.ChangesRequestedBy {
-			requested = append(requested, slack.Mention{Display: match.Fallback(match.GitLabUser{
+			requested = append(requested, slack.Mention{Display: strings.ReplaceAll(match.Fallback(match.GitLabUser{
 				Username: u.Username, Name: u.Name,
-			})})
+			}), "@", "")})
 		}
 		p := at(snap.MR.Author)
 		p.Own = append(p.Own, slack.AuthorItem{

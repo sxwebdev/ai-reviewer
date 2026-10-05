@@ -1891,7 +1891,7 @@ func TestDigestRequestedChangesWaitsForReRequest(t *testing.T) {
 			snap := domain.MergeRequestSnapshot{
 				Project:    domain.Project{ID: testProjectID, FullPath: "backend/payments"},
 				MR:         domain.MergeRequest{IID: testMRIID, State: "opened", Author: domain.User{ID: 1, Username: "author"}},
-				Reviewers:  []domain.Reviewer{{User: domain.User{ID: 42, Username: "reviewer"}, State: tt.state, LastActivityAt: testNow.Add(-time.Hour)}},
+				Reviewers:  []domain.Reviewer{{User: domain.User{ID: 42, Username: "reviewer", Name: "Example Reviewer"}, State: tt.state, LastActivityAt: testNow.Add(-time.Hour)}},
 				LastPushAt: tt.push,
 			}
 			data, count := h.svc.digestData(t.Context(), testTeamConfig(), []domain.MergeRequestSnapshot{snap}, 0, linearDigestState{})
@@ -1906,10 +1906,10 @@ func TestDigestRequestedChangesWaitsForReRequest(t *testing.T) {
 			if !strings.Contains(body, "<@"+tt.wantOwner+">") {
 				t.Errorf("digest must ping its action owner: %s", body)
 			}
-			if tt.wantOwn == 1 && strings.Contains(body, "<@U42>") {
+			if tt.wantOwn == 1 && (strings.Contains(body, "<@U42>") || strings.Contains(body, "@reviewer")) {
 				t.Errorf("pending changes must not ping the reviewer: %s", body)
 			}
-			if tt.wantOwn == 1 && (len(person.Own[0].ChangesRequestedBy) != 1 || (person.Own[0].ChangesRequestedBy[0].SlackID != "" || !strings.Contains(person.Own[0].ChangesRequestedBy[0].Display, "reviewer"))) {
+			if tt.wantOwn == 1 && (len(person.Own[0].ChangesRequestedBy) != 1 || (person.Own[0].ChangesRequestedBy[0].SlackID != "" || person.Own[0].ChangesRequestedBy[0].Display != "Example Reviewer (reviewer)")) {
 				t.Error("author row must name the reviewer without pinging them")
 			}
 		})

@@ -134,7 +134,7 @@ type AuthorItem struct {
 	// ChangesRequestedBy are the reviewers whose "Request changes" verdict still
 	// stands. Ahead of a thread count, and it used to be invisible — the author
 	// saw "3 unresolved threads" and no mention that somebody had formally asked
-	// for changes.
+	// for changes. These are always rendered as text, even with SlackID set.
 	ChangesRequestedBy []Mention
 	UnresolvedThreads  int
 	MergeConflicts     bool
@@ -220,9 +220,10 @@ type Block struct {
 
 // Text is a Block Kit composition object.
 type Text struct {
-	Type  string `json:"type"` // "mrkdwn" or "plain_text"
-	Text  string `json:"text"`
-	Emoji *bool  `json:"emoji,omitempty"`
+	Type     string `json:"type"` // "mrkdwn" or "plain_text"
+	Text     string `json:"text"`
+	Emoji    *bool  `json:"emoji,omitempty"`
+	Verbatim bool   `json:"verbatim,omitempty"`
 }
 
 // Builder builds digest messages. The zero value uses Slack's real limits;
@@ -526,6 +527,18 @@ func (m Mention) render() string {
 	return d
 }
 
+// renderName names a context user without creating a mention. Only the owner
+// heading may emit an explicit Slack mention.
+func (m Mention) renderName() string {
+	name := strings.TrimSpace(m.Display)
+	if name == "" {
+		name = strings.TrimSpace(m.SlackID)
+	}
+	m.Display = strings.ReplaceAll(name, "@", "")
+	m.SlackID = ""
+	return m.render()
+}
+
 // Age markers. Nothing is filtered on them — every merge request is still
 // listed; they only let a reader see at a glance which end of the list is
 // urgent, which a bare "waiting 4d" on every row does not.
@@ -627,7 +640,7 @@ func authorEntry(mr AuthorItem, withProject bool) string {
 	if len(mr.ChangesRequestedBy) > 0 {
 		names := make([]string, 0, len(mr.ChangesRequestedBy))
 		for _, m := range mr.ChangesRequestedBy {
-			names = append(names, m.render())
+			names = append(names, m.renderName())
 		}
 		flags = append(flags, "🔁 address changes requested by "+strings.Join(names, ", "))
 	}
@@ -758,7 +771,7 @@ func headerBlock(text string) Block {
 }
 
 func sectionBlock(text string) Block {
-	return Block{Type: "section", Text: &Text{Type: "mrkdwn", Text: text}}
+	return Block{Type: "section", Text: &Text{Type: "mrkdwn", Text: text, Verbatim: true}}
 }
 
 // link renders a Slack mrkdwn link. label must already be escaped.

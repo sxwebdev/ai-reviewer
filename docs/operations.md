@@ -274,7 +274,9 @@ Reading it:
   A pending change request stays with the author even after a push. Explicitly
   re-requesting review resets the reviewer state to `UNREVIEWED` and returns the
   review to their queue. The author row names change-requesting reviewers without
-  pinging them.
+  pinging them. Context names contain no `@` prefix; mrkdwn blocks use
+  `verbatim: true` to prevent Slack from automatically converting text to
+  mentions. Only the owner heading emits an explicit Slack mention.
 
 A person who owes nothing is not listed. Without Linear, a digest with no
 actions is not posted; with Linear enabled, the healthy `In Review` aggregate
